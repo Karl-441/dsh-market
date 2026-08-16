@@ -1975,19 +1975,39 @@ export function MarketSection(props: MarketSectionProps) {
                                   )}
                                 </div>
                                 <span className={css.grow} />
-                                {toggleable && (
-                                  <button
-                                    type="button"
-                                    role="switch"
-                                    aria-checked={!off}
-                                    aria-label={(off ? t('enable') : t('disable')) + ' ' + name}
-                                    className={off ? css.switch : `${css.switch} ${css.switchOn}`}
-                                    disabled={togglingName !== null || busyUrl !== null || updatingName !== null || removingName !== null}
-                                    onClick={() => doToggle(name, off)}
-                                  >
-                                    <span className={css.switchKnob} />
-                                  </button>
-                                )}
+                                {toggleable && (name === 'dsh-market' || name === 'dshmarket'
+                                  ? (
+                                      // The market itself never toggles: show a
+                                      // disabled switch with an explanation instead
+                                      // of bouncing a rejected request off the API.
+                                      <Tooltip label={t('marketNoToggle')} side="top">
+                                        <span>
+                                          <button
+                                            type="button"
+                                            role="switch"
+                                            aria-checked={true}
+                                            aria-label={t('marketNoToggle')}
+                                            className={`${css.switch} ${css.switchOn}`}
+                                            disabled
+                                          >
+                                            <span className={css.switchKnob} />
+                                          </button>
+                                        </span>
+                                      </Tooltip>
+                                    )
+                                  : (
+                                      <button
+                                        type="button"
+                                        role="switch"
+                                        aria-checked={!off}
+                                        aria-label={(off ? t('enable') : t('disable')) + ' ' + name}
+                                        className={off ? css.switch : `${css.switch} ${css.switchOn}`}
+                                        disabled={togglingName !== null || busyUrl !== null || updatingName !== null || removingName !== null}
+                                        onClick={() => doToggle(name, off)}
+                                      >
+                                        <span className={css.switchKnob} />
+                                      </button>
+                                    ))}
                                 {repoUrl !== null && <a className={css.src} href={repoUrl + '#readme'} target="_blank" rel="noreferrer">{t('readme')}</a>}
                                 {entry !== undefined && entry.deprecated === true && entry.replacement !== undefined && (() => {
                                   const replacement = data?.plugins.find(r => r.name === entry.replacement)

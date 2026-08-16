@@ -466,6 +466,29 @@ describe('#60 enable/disable switches in the Installed tab', () => {
     expect(screen.getByText(en.stateBroken)).toBeTruthy()
     expect(screen.queryByRole('switch')).toBeNull()
   })
+
+  it('the market row shows a disabled switch with an explanation instead of calling the API', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { dshmarket: '^1.5.0' },
+        live: ['dshmarket'],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        activation: { dshmarket: { state: 'live', reasons: [], bundle: true, hot: true } },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    const sw = await screen.findByRole('switch', { name: en.marketNoToggle })
+    expect(screen.getByText('dshmarket')).toBeTruthy()
+    expect((sw as HTMLButtonElement).disabled).toBe(true)
+    expect(sw.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(sw)
+    // A disabled control never bounces a rejected request off the server.
+    expect(fetchCalls.some(c => c.path === '/dsh-market/toggle')).toBe(false)
+  })
 })
 
 describe('#60 catalog deprecation', () => {
@@ -676,10 +699,17 @@ describe('#60 groups view', () => {
     await waitFor(() => {
       expect(screen.getByRole('switch', { name: en.disable + ' work' }).getAttribute('aria-checked')).toBe('true')
     })
+    // The batch enable lands in every member row: dsh-loop is back on.
+    await waitFor(() => {
+      expect(screen.getByRole('switch', { name: en.disable + ' dsh-loop' }).getAttribute('aria-checked')).toBe('true')
+    })
     // And switching it off disables every member at once.
     fireEvent.click(screen.getByRole('switch', { name: en.disable + ' work' }))
     await waitFor(() => {
       expect(screen.getByRole('switch', { name: en.enable + ' work' }).getAttribute('aria-checked')).toBe('false')
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('switch', { name: en.enable + ' dsh-loop' }).getAttribute('aria-checked')).toBe('false')
     })
   })
 

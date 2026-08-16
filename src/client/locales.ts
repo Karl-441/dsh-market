@@ -156,6 +156,7 @@ export const zh = {
   groupAdd: '加入插件',
   groupAddTheme: '加入主题',
   groupAddEmpty: '所有已安装插件都已在该组中',
+  marketNoToggle: '市场自身不能停用',
 }
 
 /** A dictionary key; zh is the source of truth, en mirrors it 1:1. */
@@ -317,4 +318,5 @@ export const en: Record<MarketKey, string> = {
   groupAdd: 'Add plugin',
   groupAddTheme: 'Add theme',
   groupAddEmpty: 'Every installed plugin is already in this group',
+  marketNoToggle: 'The market itself cannot be disabled',
 }
