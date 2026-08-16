@@ -67,6 +67,16 @@ dsh plugin --profile web add dshmarket
 
 实时来自 [awesome-dsh-plugin.com/plugins.json](https://awesome-dsh-plugin.com/plugins.json)——精选条目、npm 映射、star 数由 CI 每日刷新——内置快照做离线兜底。
 
+## 友情链接
+
+### modlens
+
+[modlens](https://github.com/liustack/modlens)——全网第一个 DeepSeek Harness 视觉插件，为 DeepSeek、GLM 等纯文本模型外挂视觉能力，粘贴图片即得结构化 JSON 证据（OCR、版面、语义）。本市场内即可直接安装：
+
+```sh
+dsh plugin --profile web add @liustack/modlens
+```
+
 ## 许可
 
 MIT · [dshmarket.com](https://dshmarket.com)

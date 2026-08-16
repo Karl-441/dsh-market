@@ -67,6 +67,16 @@ Installs prefer npm tarballs over full-repo GitHub downloads whenever a plugin p
 
 Live from [awesome-dsh-plugin.com/plugins.json](https://awesome-dsh-plugin.com/plugins.json) — curated entries, npm mapping, and star counts refreshed daily by CI — with a bundled snapshot as offline fallback.
 
+## Friends
+
+### modlens
+
+[modlens](https://github.com/liustack/modlens) — the first vision plugin for DeepSeek Harness: bolts visual understanding onto text-only models like DeepSeek and GLM. Paste an image, get structured JSON evidence back — OCR, layout, semantics. Available right in this market:
+
+```sh
+dsh plugin --profile web add @liustack/modlens
+```
+
 ## License
 
 MIT · [dshmarket.com](https://dshmarket.com)
