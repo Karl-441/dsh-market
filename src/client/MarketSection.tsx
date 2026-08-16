@@ -621,6 +621,7 @@ export function MarketSection(props: MarketSectionProps) {
     })
       .then(res => res.json().then(body => ({ status: res.status, body })))
       .then(({ status, body }) => {
+        setBusyUrl(null)
         sessionStorage.removeItem('dshm-pending')
         if (status === 200 && body.ok && body.hot && plugin.category === 'theme') {
           // Themes auto-activate on install; reload straight into the Themes
@@ -669,11 +670,17 @@ export function MarketSection(props: MarketSectionProps) {
           setInstallError(t('installFail') + ': ' + plugin.name + ' — ' + detail.trim().slice(-600))
         }
       })
-      .catch(error => {
-        sessionStorage.removeItem('dshm-pending')
-        setInstallError(t('installFail') + ': ' + String(error))
+      .catch(() => {
+        // #100: a long install can outlive its HTTP response (loopback
+        // stacks and proxies reset idle connections) while pnpm keeps
+        // working server-side — declaring failure here produced a false
+        // "install failed, export the log" with an EMPTY log (the route
+        // only logs when it finishes), followed by the plugin quietly
+        // appearing minutes later. Keep dshm-pending and the busy button
+        // instead, and let the status poll decide: its recovery path marks
+        // success once the plugin lands (busy-aware since #91) and strikes
+        // out genuinely dead installs (#32).
       })
-      .finally(() => setBusyUrl(null))
   }, [refreshInstalled, t])
 
   /**
