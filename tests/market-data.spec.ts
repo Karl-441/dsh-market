@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  entryForDep, groupSwitchState, isInstalled, matchInstalledName, orderedCategories, pageItems, themePlugins, visiblePlugins,
+  entryForDep, extractReadmeImages, groupSwitchState, isInstalled, matchInstalledName, orderedCategories, pageItems, safeScreenshots, themePlugins, visiblePlugins,
 } from '../src/client/market-data.ts'
 import type { RegistryPlugin } from '../src/client/market-data.ts'
 
@@ -59,6 +59,30 @@ describe('matchInstalledName / isInstalled', () => {
       plugin({ name: 'dsh-loop', url: 'https://github.com/o/dsh-loop' }),
       { 'dsh-loop-extended': '^1.0.0' },
     )).toBe(false)
+  })
+
+  it('repo evidence beats a name coincidence — same-named entries from different repos never cross-match (#66)', () => {
+    // The curated registry really lists both: two distinct dsh-usage-stats.
+    const installed = { 'dsh-usage-stats': 'github:Make0209/dsh-usage-stats' }
+    expect(matchInstalledName(
+      plugin({ name: 'dsh-usage-stats', url: 'https://github.com/Make0209/dsh-usage-stats' }), installed,
+    )).toBe('dsh-usage-stats')
+    // The OTHER repo's card must not read as installed, despite the equal name.
+    expect(matchInstalledName(
+      plugin({ name: 'dsh-usage-stats', url: 'https://github.com/Ychris12138/dsh-usage-stats' }), installed,
+    )).toBeNull()
+    // …and the installed dep resolves back to the repo it came from.
+    const plugins = [
+      plugin({ name: 'dsh-usage-stats', url: 'https://github.com/Ychris12138/dsh-usage-stats' }),
+      plugin({ name: 'dsh-usage-stats', url: 'https://github.com/Make0209/dsh-usage-stats' }),
+    ]
+    expect(entryForDep(plugins, 'dsh-usage-stats', 'github:make0209/dsh-usage-stats')?.url)
+      .toBe('https://github.com/Make0209/dsh-usage-stats')
+    // An npm-installed dep carries no repo evidence — the name path stands (#15).
+    expect(matchInstalledName(
+      plugin({ name: 'dsh-usage-stats', url: 'https://github.com/Ychris12138/dsh-usage-stats' }),
+      { 'dsh-usage-stats': '^1.0.0' },
+    )).toBe('dsh-usage-stats')
   })
 })
 
@@ -161,5 +185,49 @@ describe('group switch derivation (#60)', () => {
     expect(groupSwitchState(['a', 'b'], new Set())).toBe('on')
     expect(groupSwitchState(['a', 'b'], new Set(['a', 'b']))).toBe('off')
     expect(groupSwitchState(['a', 'b'], new Set(['a']))).toBe('mixed')
+  })
+})
+
+describe('screenshots (#61)', () => {
+  it('safeScreenshots keeps only https GitHub-hosted raster images, deduped and capped', () => {
+    expect(safeScreenshots([
+      'https://raw.githubusercontent.com/o/r/main/a.png',
+      'https://raw.githubusercontent.com/o/r/main/a.png', // dupe
+      'https://user-images.githubusercontent.com/1/shot.gif',
+      'https://evil.example/track.png',                    // host not allowlisted
+      'http://raw.githubusercontent.com/o/r/main/b.png',   // not https
+      'https://raw.githubusercontent.com/o/r/main/logo.svg', // svg = logo/badge noise
+      42,
+    ])).toEqual([
+      'https://raw.githubusercontent.com/o/r/main/a.png',
+      'https://user-images.githubusercontent.com/1/shot.gif',
+    ])
+    expect(safeScreenshots(undefined)).toEqual([])
+    // capped at 6
+    const many = Array.from({ length: 9 }, (_, i) => `https://raw.githubusercontent.com/o/r/main/s${i}.png`)
+    expect(safeScreenshots(many)).toHaveLength(6)
+  })
+
+  it('extractReadmeImages handles markdown + html forms and resolves relative paths', () => {
+    const md = [
+      '# my-plugin',
+      '[![npm](https://img.shields.io/npm/v/x)](https://npmjs.com/x)', // badge → host filtered
+      '![demo](assets/demo.png)',
+      '![abs](/docs/abs.png)',
+      '<img src="./assets/two.png" width="600">',
+      '![ext](https://user-images.githubusercontent.com/1/ext.png)',
+      '![logo](assets/logo.svg)', // svg filtered
+    ].join('\n')
+    expect(extractReadmeImages(md, 'o', 'r', null)).toEqual([
+      'https://raw.githubusercontent.com/o/r/HEAD/assets/demo.png',
+      'https://raw.githubusercontent.com/o/r/HEAD/docs/abs.png',
+      'https://raw.githubusercontent.com/o/r/HEAD/assets/two.png',
+      'https://user-images.githubusercontent.com/1/ext.png',
+    ])
+    // Monorepo subpath README: relative paths resolve against the subdir.
+    expect(extractReadmeImages('![s](shot.png)', 'o', 'r', 'packages/plug-a')).toEqual([
+      'https://raw.githubusercontent.com/o/r/HEAD/packages/plug-a/shot.png',
+    ])
+    expect(extractReadmeImages('no images here', 'o', 'r', null)).toEqual([])
   })
 })

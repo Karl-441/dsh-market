@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { findInstalledAlias, installTargetFor, parseSourceUrl, repoOf } from '../src/sources.ts'
+import { findInstalledAlias, gitAllowBuildsKey, installTargetFor, parseSourceUrl, repoOf } from '../src/sources.ts'
 
 describe('parseSourceUrl', () => {
   it('accepts github repo urls, plain or with a /tree/<branch>/<subpath> suffix', () => {
@@ -38,12 +38,40 @@ describe('installTargetFor', () => {
   })
 })
 
+describe('gitAllowBuildsKey (#68/#69)', () => {
+  it('derives the stable git+https key pnpm actually matches for github specs', () => {
+    expect(gitAllowBuildsKey('dsh-github-intelligence', 'github:zoahdev/dsh-github-intelligence'))
+      .toBe('dsh-github-intelligence@git+https://github.com/zoahdev/dsh-github-intelligence.git')
+    // Subpath and ref suffixes belong to the install selector, not the repo.
+    expect(gitAllowBuildsKey('plug-a', 'github:m/mono#path:/packages/plug-a'))
+      .toBe('plug-a@git+https://github.com/m/mono.git')
+    expect(gitAllowBuildsKey('x', 'github:o/r.git')).toBe('x@git+https://github.com/o/r.git')
+  })
+  it('returns null for non-github specs — npm ranges, links, tarballs', () => {
+    expect(gitAllowBuildsKey('dsh-loop', '^1.2.0')).toBeNull()
+    expect(gitAllowBuildsKey('dsh-loop', 'link:../dev')).toBeNull()
+    expect(gitAllowBuildsKey('dsh-loop', '')).toBeNull()
+  })
+})
+
 describe('findInstalledAlias (#27 duplicate guard)', () => {
   it('finds the same plugin installed under another name, by repo or npm identity', () => {
     const alias = { name: '@dsh-external/dsh-share', url: 'https://github.com/h/dsh-share' }
     expect(findInstalledAlias(alias, { 'dsh-share': 'github:h/dsh-share' })).toBe('dsh-share')
     expect(findInstalledAlias({ name: 'x', npm: 'dsh-share', url: 'https://github.com/h/other' }, { 'dsh-share': '^0.2.0' })).toBe('dsh-share')
     expect(findInstalledAlias(alias, {})).toBeNull()
+  })
+
+  it('never treats a same-named plugin from a DIFFERENT repo as an alias (#66)', () => {
+    const installed = { 'dsh-usage-stats': 'github:Make0209/dsh-usage-stats' }
+    // Same name, different repo → distinct plugin, not an alias.
+    expect(findInstalledAlias(
+      { name: 'dsh-usage-stats', url: 'https://github.com/Ychris12138/dsh-usage-stats' }, installed,
+    )).toBeNull()
+    // Same repo → the entry's own plugin, matched case-insensitively.
+    expect(findInstalledAlias(
+      { name: 'dsh-usage-stats', url: 'https://github.com/make0209/dsh-usage-stats' }, installed,
+    )).toBe('dsh-usage-stats')
   })
 
   it('keeps monorepo siblings independent but matches the exact subpackage', () => {

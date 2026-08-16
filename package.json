@@ -1,7 +1,7 @@
 {
   "name": "dshmarket",
   "description": "Visual plugin market inside DeepSeek Harness — browse, search, and one-click install community plugins. · DSH 可视化插件市场：逛一逛，点一下，装好。",
-  "version": "1.5.0",
+  "version": "1.8.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -70,7 +70,8 @@
   ],
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-ui-primitives": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.6",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^26.2.0",
     "@types/react": "~18.3.1",

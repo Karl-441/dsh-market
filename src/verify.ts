@@ -36,10 +36,10 @@ export interface ActivationResult {
 }
 
 /** The profile manifest's `dsh.profile.bundles` — what the CLI reconciled. */
-function readBundles(profile: string): Set<string> {
+function readBundles(profile: string, explicitDir?: string): Set<string> {
   try {
     const manifest = JSON.parse(
-      readFileSync(join(profileDir(profile), 'package.json'), 'utf8'),
+      readFileSync(join(profileDir(profile, explicitDir), 'package.json'), 'utf8'),
     ) as { dsh?: { profile?: { bundles?: unknown } } }
     const bundles = manifest.dsh?.profile?.bundles
     return new Set(Array.isArray(bundles) ? bundles.filter((n): n is string => typeof n === 'string') : [])
@@ -53,10 +53,28 @@ interface PkgDsh {
   client?: unknown
 }
 
-function readPkgDsh(profile: string, name: string): PkgDsh | null {
+/**
+ * True when `live` contains the package itself or a subpath entry of it.
+ *
+ * The live set (see `liveNames` in routes.ts) holds loader entry names — the
+ * `name:` field of each bundle patch row. Bundles usually name the bare
+ * package (`dshmarket`, `@scope/pkg`), but may point at a subpath entry
+ * (`@vectorize-io/hindsight-coding-agents/dsh`, `aegis/extensions/dsh/index.js`).
+ * Either form means the package's fiber is up and it must read as live;
+ * a different package sharing a name prefix (`@scope/pkg2` vs `@scope/pkg`)
+ * must not — the `/` bound keeps the match a real subpath.
+ */
+function liveIncludes(live: ReadonlySet<string>, packageName: string): boolean {
+  if (live.has(packageName)) return true
+  const prefix = `${packageName}/`
+  for (const name of live) if (name.startsWith(prefix)) return true
+  return false
+}
+
+function readPkgDsh(profile: string, name: string, explicitDir?: string): PkgDsh | null {
   try {
     const manifest = JSON.parse(
-      readFileSync(join(profileDir(profile), 'node_modules', name, 'package.json'), 'utf8'),
+      readFileSync(join(profileDir(profile, explicitDir), 'node_modules', name, 'package.json'), 'utf8'),
     ) as { dsh?: PkgDsh }
     return manifest.dsh ?? {}
   } catch {
@@ -64,9 +82,9 @@ function readPkgDsh(profile: string, name: string): PkgDsh | null {
   }
 }
 
-function patchTextOf(profile: string, name: string): string | null {
+function patchTextOf(profile: string, name: string, explicitDir?: string): string | null {
   try {
-    return readFileSync(join(profileDir(profile), 'node_modules', name, 'cordis.patch.yml'), 'utf8')
+    return readFileSync(join(profileDir(profile, explicitDir), 'node_modules', name, 'cordis.patch.yml'), 'utf8')
   } catch {
     return null
   }
@@ -81,16 +99,18 @@ export function verifyActivation(
   profile: string,
   name: string,
   live: ReadonlySet<string> = new Set(listHotMounts()),
+  explicitDir?: string,
 ): ActivationResult {
-  const bundles = readBundles(profile)
+  const activeProfileDir = profileDir(profile, explicitDir)
+  const bundles = readBundles(profile, activeProfileDir)
   const inBundles = bundles.has(name)
-  const dsh = readPkgDsh(profile, name)
+  const dsh = readPkgDsh(profile, name, activeProfileDir)
 
   if (dsh === null) {
     return { state: 'missing', reasons: ['未安装 / not installed'], bundle: inBundles, hot: false }
   }
 
-  const dir = join(profileDir(profile), 'node_modules', name)
+  const dir = join(activeProfileDir, 'node_modules', name)
   if (!hasDshManifest(dir)) {
     return {
       state: 'broken',
@@ -110,7 +130,7 @@ export function verifyActivation(
     }
   }
 
-  if (live.has(name)) {
+  if (liveIncludes(live, name)) {
     const clientOnly = dsh.bundle === undefined && dsh.client !== undefined
     return {
       state: 'live',
@@ -125,7 +145,7 @@ export function verifyActivation(
   }
 
   if (inBundles) {
-    const patch = patchTextOf(profile, name)
+    const patch = patchTextOf(profile, name, activeProfileDir)
     const complex = patch !== null && parseSimplePatch(patch) === null
     return {
       state: 'restart',

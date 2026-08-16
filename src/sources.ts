@@ -31,6 +31,22 @@ export function repoOf(url: string): string | null {
 }
 
 /**
+ * The allowBuilds key that actually authorizes a git-hosted dependency's
+ * build scripts. Verified against pnpm 11.21 (#68 by @yzr278892): for a
+ * `github:owner/repo` install, a bare `name: true` entry does NOT match —
+ * pnpm's own hint names a commit-pinned codeload URL that changes on every
+ * push; the stable form that matches is `name@git+https://github.com/owner/repo.git`.
+ * @param name - installed package name.
+ * @param spec - the dependency spec from package.json, or the install target.
+ * @returns the stable key, or null when the spec is not github-hosted.
+ */
+export function gitAllowBuildsKey(name: string, spec: string): string | null {
+  const m = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?(?:#.*)?$/.exec(spec)
+  if (m === null) return null
+  return `${name}@git+https://github.com/${m[1]}.git`
+}
+
+/**
  * The pnpm install target for a registry entry. Registry tarballs beat
  * full-repo GitHub downloads: smaller, prebuilt, and CDN/mirror served. The
  * npm name comes from our curated registry, which only maps repo-verified
@@ -62,13 +78,14 @@ export function findInstalledAlias(
   installed: Record<string, string>,
 ): string | null {
   const source = parseSourceUrl(entry.url)
+  const entryRepoId = source === null
+    ? null
+    : source.subpath === null
+      ? source.repo.toLowerCase()
+      : `${source.repo.toLowerCase()}#path:/${source.subpath.toLowerCase()}`
   const ids = new Set<string>([entry.name.toLowerCase()])
   if (typeof entry.npm === 'string' && entry.npm !== '') ids.add(entry.npm.toLowerCase())
-  if (source !== null) {
-    ids.add(source.subpath === null
-      ? source.repo.toLowerCase()
-      : `${source.repo.toLowerCase()}#path:/${source.subpath.toLowerCase()}`)
-  }
+  if (entryRepoId !== null) ids.add(entryRepoId)
   for (const [name, spec] of Object.entries(installed)) {
     const dep = new Set<string>([name.toLowerCase()])
     const scoped = /^@([^/]+)\/(.+)$/.exec(name)
@@ -77,6 +94,14 @@ export function findInstalledAlias(
     if (m !== null) {
       dep.add(m[1].toLowerCase())
       if (m[2] !== undefined) dep.add(`${m[1].toLowerCase()}#path:/${m[2].toLowerCase()}`)
+      // Repo evidence on both sides is decisive (#66): the curated registry
+      // lists distinct plugins under one name (both dsh-usage-stats, four
+      // dsh-memory…), so a github-installed dependency is the entry's plugin
+      // only if the REPOS agree — a bare name coincidence must not count.
+      if (entryRepoId !== null) {
+        if (dep.has(entryRepoId)) return name
+        continue
+      }
     }
     for (const id of dep) if (ids.has(id)) return name
   }

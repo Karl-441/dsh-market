@@ -65,3 +65,27 @@ describe('withHoistRecovery', () => {
     expect(result.stderr).toMatch(/重建|rebuilt/)
   })
 })
+
+describe('transient network retry (#83)', () => {
+  const TRANSIENT: InstallResult = {
+    exitCode: 1, timedOut: false, stdout: '', cancelled: false,
+    stderr: 'WARN  GET https://codeload.github.com/KinGao294/dsh-skin/tar.gz/abc error (ERR_PNPM_FETCH_502). Will retry in 10 seconds.\nFetchError: request to https://codeload.github.com/KinGao294/dsh-skin/tar.gz/abc failed, reason: socket hang up',
+  }
+
+  it('retries once when pnpm trips over a momentary network failure, and succeeds silently', async () => {
+    const { calls, run } = scriptedRunner([TRANSIENT, OK])
+    const result = await withHoistRecovery(run, 'web', ['add', 'dsh-deepseek-billing'])
+    expect(result.exitCode).toBe(0)
+    expect(calls).toEqual([['add', 'dsh-deepseek-billing'], ['add', 'dsh-deepseek-billing']])
+  })
+
+  it('gives up after one retry with the bilingual replay explanation — no loops', async () => {
+    const { calls, run } = scriptedRunner([TRANSIENT, TRANSIENT, TRANSIENT])
+    const result = await withHoistRecovery(run, 'web', ['add', 'dsh-deepseek-billing'])
+    expect(result.exitCode).toBe(1)
+    expect(calls).toHaveLength(2)
+    // The message tells the user the failing dep is not necessarily the
+    // plugin they were installing (#83's core confusion).
+    expect(result.stderr).toContain('重放整个依赖树')
+  })
+})

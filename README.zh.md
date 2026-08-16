@@ -27,9 +27,11 @@ dsh plugin --profile web add dshmarket
 
 ## 你会得到
 
-- **逛与搜**——完整社区目录（300+ 插件，每天在涨），分类筛选、star 数、最热/最新排序，中英描述跟随界面语言
+- **逛与搜**——完整社区目录（800+ 插件，每天在涨），分类筛选、star 数、最热/最新排序，中英描述跟随界面语言
+- **截图展示**——安装弹窗内 App Store 式截图：作者可在 registry 里策展，没有则自动从 README 抽取；图片仅从 GitHub 图床加载，且只在你打开弹窗后才发请求
 - **主题**——独立主题页：装完立即生效，点一下切换（主题互斥、选择跨重启保留），卸载即恢复
 - **一键安装**——确认来源，实时进度；多数插件刷新页面即可用，无需重启
+- **备份与恢复**——把 profile 的插件清单与配置导出为可读 JSON，换机导入，或存到 WebDAV 并每日自动备份；恢复前校验、失败自动回滚
 - **更新**——逐插件检测（npm 版本或锁定 commit 对比 HEAD），一键更新或全部更新；市场自己也走同一通道升级
 - **卸载**——两步确认防误触；本次会话装的插件即点即卸
 - **按需重启**——无法热加载的变更会在待重启提示旁显示一键重启；操作仅接受本机同源请求
@@ -46,6 +48,7 @@ dsh plugin --profile web add dshmarket
 - 构建脚本默认禁止执行（pnpm ≥10）,放行与否由你按包显式决定
 - 终端/命令行类插件装进网页版前会被明确提醒
 - 安装接口只接受同源 POST;市场不会向任何地方上报数据
+- 备份可能包含 profile 配置里的密钥——导出与上传前 UI 会明确提醒;WebDAV 同步仅限 https、拒绝内网地址,且密码永不落盘浏览器
 - 重启接口还要求客户端直接来自环回地址（拒绝代理转发请求），并使用原入口、参数、环境和工作目录重新启动 DSH
 - 一键重启会启动脱离终端的替代进程。若 DSH 由 systemd、launchd、pm2 等进程管理器托管，请设置插件选项 `allowRestart: false`，交由管理器负责重启；待重启提示仍会显示，但按钮会隐藏
 - 从终端启动时，替代进程脱离原终端，关闭原终端后仍会继续运行
@@ -63,14 +66,6 @@ dsh plugin --profile web add dshmarket
 ## 数据源
 
 实时来自 [awesome-dsh-plugin.com/plugins.json](https://awesome-dsh-plugin.com/plugins.json)——精选条目、npm 映射、star 数由 CI 每日刷新——内置快照做离线兜底。
-
-## 友情链接
-
-### DeepSeek Harness Desktop
-
-[DeepSeek Harness Desktop](https://github.com/anywhere-labs/deepseek-harness-desktop) 是一款为 DeepSeek Harness 生态打造的现代化桌面端，让用户无需配置 Node.js 或执行命令，即可启动和管理本地 Harness 服务。项目后续还将支持插件市场、移动端远程控制和 IM Channels。
-
-[访问官网](https://www.dshdesktop.cn) · [GitHub](https://github.com/anywhere-labs/deepseek-harness-desktop)
 
 ## 许可
 

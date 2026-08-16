@@ -59,4 +59,32 @@ describe('classifyPnpmFailure', () => {
     // Unrecognized output → null, the raw text is then surfaced as-is.
     expect(classifyPnpmFailure('some other failure')).toBeNull()
   })
+
+  it('recognizes an unresolvable dependency and names it, decoding the scoped-URL form (#65)', () => {
+    const missing = classifyPnpmFailure('[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/@deepseek-ai%2Fdsh-client-ui-theme-toggle: Not Found - 404\n\nThis error happened while installing a direct dependency of /home/u/.dsh/profiles/web')
+    expect(missing?.code).toBe('fetch-404')
+    expect(missing?.message).toContain('@deepseek-ai/dsh-client-ui-theme-toggle')
+    expect(missing?.message).toContain('幽灵依赖')
+    // Unscoped form, no encoding involved.
+    expect(classifyPnpmFailure('[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/some-ghost: Not Found - 404')?.message).toContain('some-ghost')
+  })
+
+  it('recognizes momentary network failures — and only those — as transient (#83)', () => {
+    const flake = classifyPnpmFailure('FetchError: request to https://codeload.github.com/o/r/tar.gz/abc failed, reason: socket hang up')
+    expect(flake?.code).toBe('transient-network')
+    expect(flake?.message).toContain('重放整个依赖树')
+    expect(classifyPnpmFailure('GET https://registry.npmjs.org/x error (ERR_PNPM_FETCH_503)')?.code).toBe('transient-network')
+    expect(classifyPnpmFailure('connect ETIMEDOUT 140.82.112.10:443')?.code).toBe('transient-network')
+    // Permanent shapes must NOT read as transient: retrying doubles the pain.
+    expect(classifyPnpmFailure('[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/ghost: Not Found - 404')?.code).toBe('fetch-404')
+  })
+
+  it('recognizes both build-script blocks: ignored builds (#69) and the git-prepare fetcher rejection (#68)', () => {
+    const ignored = classifyPnpmFailure('[ERR_PNPM_IGNORED_BUILDS]\nIgnored build scripts: dsh-github-intelligence@https://codeload.github.com/z/r/tar.gz/abc.')
+    expect(ignored?.code).toBe('ignored-builds')
+    expect(ignored?.message).toContain('允许构建脚本并重试')
+    const prepare = classifyPnpmFailure('[ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED] Failed to prepare git-hosted package fetched from "https://codeload.github.com/z/r/tar.gz/abc": The git-hosted package "r@2.8.0" needs to execute build scripts but is not in the "allowBuilds" allowlist.')
+    expect(prepare?.code).toBe('git-prepare-not-allowed')
+    expect(prepare?.message).toContain('允许构建脚本并重试')
+  })
 })

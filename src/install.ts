@@ -8,7 +8,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { InstallResult, PluginRunner } from './dsh-cli.ts'
-import { classifyPnpmFailure } from './pnpm-compat.ts'
+import { classifyPnpmFailure, isTransientPnpmFailure } from './pnpm-compat.ts'
 import { entryArtifactExists, hasDshManifest, pluginSubdirs, profileDir, readInstalled } from './profile.ts'
 import { logEvent } from './log.ts'
 
@@ -49,6 +49,15 @@ export async function withHoistRecovery(run: PluginRunner, profile: string, plug
     ) {
       logEvent('warn', 'install', `a too-young release blocks pnpm's lockfile verification (#39) — retrying once with ${RELEASE_AGE_OVERRIDE}`)
       result = await run(profile, [pluginArgs[0], RELEASE_AGE_OVERRIDE, ...pluginArgs.slice(1)])
+    } else if (
+      failure?.code === 'transient-network'
+      && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')
+    ) {
+      // #83: pnpm replays the whole tree, so any existing dependency's
+      // momentary network hiccup fails the run — and a plain retry succeeds.
+      // Do that retry ourselves instead of reporting a false failure.
+      logEvent('warn', 'install', `transient network failure while pnpm replayed the dependency tree (#83) — retrying once`)
+      result = await run(profile, pluginArgs)
     }
   }
   if (!ok(result) && !result.cancelled) {
@@ -67,18 +76,19 @@ export async function withHoistRecovery(run: PluginRunner, profile: string, plug
  * @returns overall success (true when nothing needed retargeting).
  */
 export async function retargetCollections(
-  run: PluginRunner, profile: string, before: Set<string>, target: string,
+  run: PluginRunner, profile: string, before: Set<string>, target: string, explicitDir?: string,
 ): Promise<boolean> {
   if (!target.startsWith('github:')) return true
-  const junk = Object.keys(readInstalled(profile)).filter((name) => {
+  const dir = profileDir(profile, explicitDir)
+  const junk = Object.keys(readInstalled(profile, dir)).filter((name) => {
     if (before.has(name)) return false
-    const root = join(profileDir(profile), 'node_modules', name)
+    const root = join(dir, 'node_modules', name)
     if (!existsSync(join(root, 'package.json'))) return true
     return !hasDshManifest(root)
   })
   let allOk = true
   for (const name of junk) {
-    const root = join(profileDir(profile), 'node_modules', name)
+    const root = join(dir, 'node_modules', name)
     const candidates = pluginSubdirs(root)
     logEvent('info', 'install', `${name}: collection repo (root declares no dsh manifest); plugins inside: ${candidates.join(', ') || 'none'}`)
     await run(profile, ['remove', name])
@@ -106,14 +116,15 @@ export async function retargetCollections(
  * @returns names kept and names removed as broken.
  */
 export async function validateAddedPlugins(
-  run: PluginRunner, profile: string, before: Set<string>,
+  run: PluginRunner, profile: string, before: Set<string>, explicitDir?: string,
 ): Promise<{ keep: string[]; removedBroken: string[] }> {
-  const addedNow = Object.keys(readInstalled(profile)).filter(n => !before.has(n))
+  const dir = profileDir(profile, explicitDir)
+  const addedNow = Object.keys(readInstalled(profile, dir)).filter(n => !before.has(n))
   const keep: string[] = []
   const removedBroken: string[] = []
   for (const n of addedNow) {
-    const dir = join(profileDir(profile), 'node_modules', n)
-    if (hasDshManifest(dir) && entryArtifactExists(dir)) {
+    const packageDir = join(dir, 'node_modules', n)
+    if (hasDshManifest(packageDir) && entryArtifactExists(packageDir)) {
       keep.push(n)
     } else {
       removedBroken.push(n)
@@ -139,6 +150,22 @@ export function isStaleUpdate(check: {
   return check.isGit
     ? check.beforeCommit !== null && check.afterCommit === check.beforeCommit
     : check.beforeVersion !== null && check.afterVersion === check.beforeVersion
+}
+
+/**
+ * The package pnpm's fetcher refused to prepare because its build script is
+ * not allowlisted — `The git-hosted package "name@2.8.0" needs to execute
+ * build scripts but is not in the "allowBuilds" allowlist.` Null when the
+ * output is not this failure. Unlike ignored-builds, the package is NOT in
+ * node_modules yet (the fetcher rejects before materialization, #68).
+ */
+export function parsePrepareNotAllowed(stdout: string, stderr: string): string | null {
+  const m = /git-hosted package "([^"]+)" needs to execute build scripts/.exec(`${stdout}\n${stderr}`)
+  if (m === null) return null
+  // Strip the trailing @version — the name itself may be scoped (@scope/pkg).
+  const raw = m[1].trim()
+  const at = raw.lastIndexOf('@')
+  return at > 0 ? raw.slice(0, at) : raw
 }
 
 /**
