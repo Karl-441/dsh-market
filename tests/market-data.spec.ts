@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  entryForDep, isInstalled, matchInstalledName, orderedCategories, pageItems, themePlugins, visiblePlugins,
+  entryForDep, groupSwitchState, isInstalled, matchInstalledName, orderedCategories, pageItems, themePlugins, visiblePlugins,
 } from '../src/client/market-data.ts'
 import type { RegistryPlugin } from '../src/client/market-data.ts'
 
@@ -151,5 +151,15 @@ describe('discover pager (pageItems)', () => {
     expect(pageItems(1, 17)).toEqual([1, 2, 3, 4, 5, '…', 17])
     expect(pageItems(9, 17)).toEqual([1, '…', 8, 9, 10, '…', 17])
     expect(pageItems(17, 17)).toEqual([1, '…', 13, 14, 15, 16, 17])
+  })
+})
+
+describe('group switch derivation (#60)', () => {
+  it('derives on/off/mixed/empty from members vs the disable list', () => {
+    expect(groupSwitchState([], new Set())).toBe('empty')
+    expect(groupSwitchState(undefined, new Set(['a']))).toBe('empty')
+    expect(groupSwitchState(['a', 'b'], new Set())).toBe('on')
+    expect(groupSwitchState(['a', 'b'], new Set(['a', 'b']))).toBe('off')
+    expect(groupSwitchState(['a', 'b'], new Set(['a']))).toBe('mixed')
   })
 })

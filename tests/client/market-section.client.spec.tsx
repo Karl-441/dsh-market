@@ -6,7 +6,7 @@
  * endpoints, stubbed with fixture payloads.
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MarketSection } from '../../src/client/MarketSection.tsx'
 import { en } from '../../src/client/locales.ts'
@@ -21,18 +21,28 @@ const REGISTRY = {
   ],
 }
 
+/** Every fetch the component made, for asserting request payloads. */
+let fetchCalls: Array<{ path: string; method: string; body: unknown }> = []
+
 function stubFetch(overrides: Record<string, unknown> = {}): void {
-  vi.stubGlobal('fetch', (url: string) => {
-    const path = String(url).split('?')[0]
+  fetchCalls = []
+  vi.stubGlobal('fetch', (input: unknown, init?: RequestInit) => {
+    const path = String(input).split('?')[0]
+    const method = (init?.method ?? 'GET').toUpperCase()
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined
+    fetchCalls.push({ path, method, body })
     const payload =
       path === '/dsh-market/registry' ? { source: 'snapshot', registry: REGISTRY }
-      : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [] }
+      : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [], disabled: [], groups: {}, groupOrder: [] }
       : path === '/dsh-market/status' ? { active: false, pnpm: true, boot: 'boot-1', restart: true, installed: {} }
       : path === '/dsh-market/updates' ? { updates: {} }
+      : path === '/dsh-market/toggle' ? { ok: true, disabled: [], live: [], activation: {} }
+      : path === '/dsh-market/groups' ? { ok: true, groups: {}, groupOrder: [], disabled: [] }
       : null
     const merged = overrides[path] ?? payload
-    if (merged === null) return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
-    return Promise.resolve(new Response(JSON.stringify(merged), { status: 200 }))
+    if (merged === null) return Promise.reject(new Error(`unstubbed fetch: ${String(input)}`))
+    const result = typeof merged === 'function' ? (merged as (requestBody?: unknown) => unknown)(body) : merged
+    return Promise.resolve(new Response(JSON.stringify(result), { status: 200 }))
   })
 }
 
@@ -288,5 +298,376 @@ describe('P0-2 activation states in the Installed tab', () => {
     expect(screen.getByText(en.stateLive)).toBeTruthy()
     // The reason is behind a disclosure; the chip itself must not claim success.
     expect(screen.getByText(en.stateRestart).textContent).toContain(en.stateRestart)
+  })
+})
+
+describe('#60 enable/disable switches in the Installed tab', () => {
+  function installedStub(overrides: Record<string, unknown>): void {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-loop': '^1.0.0' },
+        live: [],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        activation: {
+          'dsh-loop': { state: 'live', reasons: [], bundle: true, hot: true },
+        },
+        ...overrides,
+      },
+    })
+  }
+
+  it('renders an on switch for a live plugin and posts the disable toggle', async () => {
+    installedStub({})
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    const sw = await screen.findByRole('switch', { name: en.disable + ' dsh-loop' })
+    expect(sw.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(sw)
+    await waitFor(() => {
+      const toggle = fetchCalls.find(c => c.path === '/dsh-market/toggle')
+      expect(toggle?.body).toEqual({ name: 'dsh-loop', enabled: false })
+    })
+  })
+
+  it('shows the disabled state with an off switch and hides the restart label', async () => {
+    installedStub({
+      live: [],
+      disabled: ['dsh-loop'],
+      activation: {
+        'dsh-loop': { state: 'restart', reasons: ['in the bundle layer but not hot-mounted'], bundle: true, hot: false },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    expect(await screen.findByText(en.disabledState)).toBeTruthy()
+    const sw = screen.getByRole('switch', { name: en.enable + ' dsh-loop' })
+    expect(sw.getAttribute('aria-checked')).toBe('false')
+    // The disabled chip replaces the misleading "restart to apply" label.
+    expect(screen.queryByText(en.stateRestart)).toBeNull()
+  })
+
+  it('omits switches for inert and broken plugins', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-loop': '^1.0.0', 'whale-skin': '^1.0.0' },
+        live: [],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        activation: {
+          'dsh-loop': { state: 'inert', reasons: ['no dsh.bundle'], bundle: false, hot: false },
+          'whale-skin': { state: 'broken', reasons: ['no dsh metadata'], bundle: false, hot: false },
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    expect(await screen.findByText(en.stateInert)).toBeTruthy()
+    expect(screen.getByText(en.stateBroken)).toBeTruthy()
+    expect(screen.queryByRole('switch')).toBeNull()
+  })
+})
+
+describe('#60 catalog deprecation', () => {
+  const DEPRECATED_REGISTRY = {
+    updated: '', count: 3,
+    categories: { tools: { en: 'Tools', zh: '工具' } },
+    plugins: [
+      { name: 'dsh-old', owner: 'alice', url: 'https://github.com/alice/dsh-old', category: 'tools', npm: 'dsh-old', stars: 5, added: '2026-01-01', description: { en: 'Legacy runner', zh: '旧插件' }, install: '', deprecated: true, replacement: 'dsh-new' },
+      { name: 'dsh-new', owner: 'bob', url: 'https://github.com/bob/dsh-new', category: 'tools', npm: 'dsh-new', stars: 20, added: '2026-08-01', description: { en: 'Modern runner', zh: '新插件' }, install: '' },
+      { name: 'dsh-plain', owner: 'carol', url: 'https://github.com/carol/dsh-plain', category: 'tools', npm: null, stars: 3, added: '2026-07-01', description: { en: 'Plain plugin', zh: '普通插件' }, install: '' },
+    ],
+  }
+  const contains = (text: string) => (content: string) => content.includes(text)
+
+  it('shows the deprecated badge on the discover card and warns in the install dialog', async () => {
+    stubFetch({ '/dsh-market/registry': { source: 'snapshot', registry: DEPRECATED_REGISTRY } })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-old')
+    expect(screen.getByText(en.deprecatedBadge)).toBeTruthy()
+    expect(screen.getByText(contains(en.deprecatedWarn))).toBeTruthy()
+    // Open dsh-old's own install dialog: it carries the deprecation warning
+    // plus the replacement name/link.
+    const oldCard = screen.getByText('dsh-old').closest('[class*="card"]') as HTMLElement
+    fireEvent.click(within(oldCard).getByRole('button', { name: en.install }))
+    expect(await screen.findByText('Install dsh-old?')).toBeTruthy()
+    expect(screen.getAllByText(contains(en.deprecatedWarn)).length).toBeGreaterThan(0)
+    // The card behind the modal and the modal itself both carry the link.
+    expect(screen.getAllByText(en.replacementHint + ' dsh-new').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getByRole('button', { name: en.cancel }))
+  })
+
+  it('installed rows warn and offer view/install replacement entries', async () => {
+    stubFetch({
+      '/dsh-market/registry': { source: 'snapshot', registry: DEPRECATED_REGISTRY },
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-old': '^1.0.0' },
+        live: ['dsh-old'],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        activation: { 'dsh-old': { state: 'live', reasons: [], bundle: true, hot: true } },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-old')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    expect(await screen.findByText(contains(en.deprecatedWarn))).toBeTruthy()
+    expect(screen.getByText(en.deprecatedBadge)).toBeTruthy()
+    // View replacement jumps to the Discover tab with the new plugin focused.
+    fireEvent.click(screen.getByRole('button', { name: en.viewReplacement }))
+    await waitFor(() => expect(screen.getByText('dsh-new')).toBeTruthy())
+    expect((screen.getByPlaceholderText(en.searchPh) as HTMLInputElement).value).toBe('dsh-new')
+  })
+
+  it('install replacement opens the confirm dialog for the new plugin', async () => {
+    stubFetch({
+      '/dsh-market/registry': { source: 'snapshot', registry: DEPRECATED_REGISTRY },
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-old': '^1.0.0' },
+        live: ['dsh-old'],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        activation: { 'dsh-old': { state: 'live', reasons: [], bundle: true, hot: true } },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-old')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    const installReplacement = await screen.findByRole('button', { name: en.installReplacement })
+    fireEvent.click(installReplacement)
+    expect(await screen.findByText('Install dsh-new?')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: en.cancel }))
+  })
+})
+
+describe('#60 groups view', () => {
+  /** Stateful fake: mirrors the server-side group/toggle semantics in memory. */
+  function makeFake(installed: Record<string, string>) {
+    const state = { disabled: [] as string[], groups: {} as Record<string, string[]>, groupOrder: [] as string[] }
+    const activation: Record<string, unknown> = {}
+    for (const name of Object.keys(installed)) {
+      activation[name] = { state: 'live', reasons: [], bundle: true, hot: true }
+    }
+    stubFetch({
+      '/dsh-market/installed': () => ({
+        profile: 'web',
+        installed,
+        live: [],
+        disabled: [...state.disabled],
+        groups: JSON.parse(JSON.stringify(state.groups)),
+        groupOrder: [...state.groupOrder],
+        activation,
+      }),
+      '/dsh-market/toggle': (body: any) => {
+        const index = state.disabled.indexOf(body.name)
+        if (body.enabled === true && index !== -1) state.disabled.splice(index, 1)
+        if (body.enabled === false && index === -1) state.disabled.push(body.name)
+        return { ok: true, disabled: [...state.disabled], live: [], activation: {} }
+      },
+      '/dsh-market/groups': (body: any) => {
+        if (body.action === 'create') { state.groups[body.name] = []; state.groupOrder.push(body.name) }
+        if (body.action === 'rename') {
+          state.groups[body.newName] = state.groups[body.name] ?? []
+          delete state.groups[body.name]
+          const index = state.groupOrder.indexOf(body.name)
+          if (index !== -1) state.groupOrder[index] = body.newName
+        }
+        if (body.action === 'delete') {
+          delete state.groups[body.name]
+          state.groupOrder = state.groupOrder.filter(g => g !== body.name)
+        }
+        if (body.action === 'set-members') {
+          state.groups[body.name] = body.members.filter((m: string) => installed[m] !== undefined && m !== 'dshmarket')
+        }
+        if (body.action === 'toggle') {
+          for (const member of state.groups[body.name] ?? []) {
+            const index = state.disabled.indexOf(member)
+            if (body.enabled === true && index !== -1) state.disabled.splice(index, 1)
+            if (body.enabled === false && index === -1) state.disabled.push(member)
+          }
+        }
+        return {
+          ok: true,
+          groups: JSON.parse(JSON.stringify(state.groups)),
+          groupOrder: [...state.groupOrder],
+          disabled: [...state.disabled],
+        }
+      },
+    })
+    return state
+  }
+
+  async function openGroupsView(): Promise<void> {
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    fireEvent.click(await screen.findByRole('button', { name: en.tabGroups }))
+  }
+
+  it('creates, assigns, removes, renames and deletes groups through the route', async () => {
+    makeFake({ 'dsh-loop': '^1.0.0', 'dsh-notify': '^1.0.0' })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await openGroupsView()
+    expect(await screen.findByText(en.noGroups)).toBeTruthy()
+
+    // Create.
+    fireEvent.click(screen.getByRole('button', { name: en.groupNew }))
+    fireEvent.change(screen.getByPlaceholderText(en.groupNamePh), { target: { value: 'work' } })
+    fireEvent.click(screen.getByRole('button', { name: en.groupCreate }))
+    expect(await screen.findByText('work')).toBeTruthy()
+
+    // Assign dsh-loop into the group from the ungrouped list.
+    const loopRow = screen.getByText('dsh-loop').closest('[class*="irow"]') as HTMLElement
+    fireEvent.click(within(loopRow).getByRole('button', { name: en.groupAssign }))
+    fireEvent.change(within(loopRow).getByRole('combobox'), { target: { value: 'work' } })
+    fireEvent.click(within(loopRow).getByRole('button', { name: en.groupAssign }))
+    await waitFor(() => {
+      const row = screen.getByText('dsh-loop').closest('[class*="groupMember"]') as HTMLElement | null
+      expect(row).not.toBeNull()
+    })
+
+    // Remove it again.
+    const memberRow = screen.getByText('dsh-loop').closest('[class*="groupMember"]') as HTMLElement
+    fireEvent.click(within(memberRow).getByRole('button', { name: en.groupRemove }))
+    await waitFor(() => expect(screen.getByText(en.groupEmpty)).toBeTruthy())
+
+    // Rename.
+    const groupRow = screen.getByText('work').closest('[class*="groupRow"]') as HTMLElement
+    fireEvent.click(within(groupRow).getByRole('button', { name: en.groupRename }))
+    fireEvent.change(within(groupRow).getByPlaceholderText(en.groupNamePh), { target: { value: 'daily' } })
+    fireEvent.click(within(groupRow).getByRole('button', { name: en.groupRename }))
+    expect(await screen.findByText('daily')).toBeTruthy()
+    expect(screen.queryByText('work')).toBeNull()
+
+    // Delete.
+    const dailyRow = screen.getByText('daily').closest('[class*="groupRow"]') as HTMLElement
+    fireEvent.click(within(dailyRow).getByRole('button', { name: en.groupDelete }))
+    fireEvent.click(within(dailyRow).getByRole('button', { name: en.groupConfirmDelete }))
+    expect(await screen.findByText(en.noGroups)).toBeTruthy()
+  })
+
+  it('group switch derives mixed from members and batch-toggles the group', async () => {
+    const state = makeFake({ 'dsh-loop': '^1.0.0', 'dsh-notify': '^1.0.0' })
+    state.groups['work'] = ['dsh-loop', 'dsh-notify']
+    state.groupOrder.push('work')
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await openGroupsView()
+    const groupSwitch = await screen.findByRole('switch', { name: en.disable + ' work' })
+    expect(groupSwitch.getAttribute('aria-checked')).toBe('true')
+
+    // Toggle one member off in the list view → the group reads mixed.
+    fireEvent.click(screen.getByRole('button', { name: en.tabList }))
+    fireEvent.click(await screen.findByRole('switch', { name: en.disable + ' dsh-loop' }))
+    await waitFor(() => {
+      const toggle = fetchCalls.find(c => c.path === '/dsh-market/toggle')
+      expect(toggle?.body).toEqual({ name: 'dsh-loop', enabled: false })
+    })
+    fireEvent.click(screen.getByRole('button', { name: en.tabGroups }))
+    const mixed = await screen.findByRole('switch', { name: en.enable + ' work' })
+    expect(mixed.getAttribute('aria-checked')).toBe('mixed')
+    expect(screen.getByText(en.groupMixed)).toBeTruthy()
+
+    // Clicking the mixed switch enables the whole group.
+    fireEvent.click(mixed)
+    await waitFor(() => {
+      expect(screen.getByRole('switch', { name: en.disable + ' work' }).getAttribute('aria-checked')).toBe('true')
+    })
+    // And switching it off disables every member at once.
+    fireEvent.click(screen.getByRole('switch', { name: en.disable + ' work' }))
+    await waitFor(() => {
+      expect(screen.getByRole('switch', { name: en.enable + ' work' }).getAttribute('aria-checked')).toBe('false')
+    })
+  })
+
+  it('group member rows carry a live switch that toggles the member', async () => {
+    const state = makeFake({ 'dsh-loop': '^1.0.0', 'dsh-notify': '^1.0.0' })
+    state.groups['work'] = ['dsh-loop', 'dsh-notify']
+    state.groupOrder.push('work')
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await openGroupsView()
+
+    const memberSwitch = await screen.findByRole('switch', { name: en.disable + ' dsh-loop' })
+    expect(memberSwitch.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(memberSwitch)
+    await waitFor(() => {
+      const toggle = fetchCalls.find(c => c.path === '/dsh-market/toggle' && c.body?.name === 'dsh-loop')
+      expect(toggle?.body).toEqual({ name: 'dsh-loop', enabled: false })
+    })
+    // The stateful fake persists the choice; the member row flips to off.
+    await waitFor(() => {
+      expect(screen.getByRole('switch', { name: en.enable + ' dsh-loop' }).getAttribute('aria-checked')).toBe('false')
+    })
+    expect(screen.getByText(en.disabledState)).toBeTruthy()
+  })
+
+  it('the Add plugin button lists installed plugins and adds them via set-members', async () => {
+    const state = makeFake({ 'dsh-loop': '^1.0.0', 'dsh-notify': '^1.0.0' })
+    state.groups['work'] = ['dsh-loop']
+    state.groupOrder.push('work')
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await openGroupsView()
+
+    // Only dsh-notify is a candidate: dsh-loop is already a member.
+    fireEvent.click(await screen.findByRole('button', { name: en.groupAdd }))
+    const addButtons = screen.getAllByRole('button', { name: en.groupAdd })
+    expect(addButtons.length).toBe(2) // header toggle + the candidate row
+    fireEvent.click(addButtons[1])
+    await waitFor(() => {
+      const set = fetchCalls.find(c => c.path === '/dsh-market/groups' && c.body?.action === 'set-members')
+      expect(set?.body).toEqual({ action: 'set-members', name: 'work', members: ['dsh-loop', 'dsh-notify'] })
+    })
+    // The added plugin now renders inside the group's member list.
+    await waitFor(() => {
+      const row = screen.getByText('dsh-notify').closest('[class*="groupMember"]') as HTMLElement | null
+      expect(row).not.toBeNull()
+    })
+  })
+
+  it('disables Add theme when the group already holds a theme', async () => {
+    const state = makeFake({ 'dsh-loop': '^1.0.0', 'whale-skin': '^1.0.0' })
+    state.groups['looks'] = ['whale-skin']
+    state.groupOrder.push('looks')
+    render(<MarketSection {...props()} />)
+    await screen.findByText('whale-skin')
+    await openGroupsView()
+    const addTheme = await screen.findByRole('button', { name: en.groupAddTheme })
+    expect((addTheme as HTMLButtonElement).disabled).toBe(true)
+    // Ordinary plugin adds stay available.
+    expect((screen.getByRole('button', { name: en.groupAdd }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('Add theme lists installed theme plugins and adds one via set-members', async () => {
+    const state = makeFake({ 'dsh-loop': '^1.0.0', 'whale-skin': '^1.0.0' })
+    state.groups['looks'] = ['dsh-loop']
+    state.groupOrder.push('looks')
+    render(<MarketSection {...props()} />)
+    await screen.findByText('whale-skin')
+    await openGroupsView()
+
+    fireEvent.click(await screen.findByRole('button', { name: en.groupAddTheme }))
+    const themeAddButtons = screen.getAllByRole('button', { name: en.groupAddTheme })
+    expect(themeAddButtons.length).toBe(2) // header toggle + the theme candidate
+    fireEvent.click(themeAddButtons[1])
+    await waitFor(() => {
+      const set = fetchCalls.find(c => c.path === '/dsh-market/groups' && c.body?.action === 'set-members')
+      expect(set?.body).toEqual({ action: 'set-members', name: 'looks', members: ['dsh-loop', 'whale-skin'] })
+    })
+    // Once the group holds a theme, the Add theme button disables.
+    await waitFor(() => {
+      expect((screen.getByRole('button', { name: en.groupAddTheme }) as HTMLButtonElement).disabled).toBe(true)
+    })
   })
 })

@@ -8,6 +8,8 @@
  * its input files live under `<profile>/.dsh-market/` and are wiped on every
  * boot, so a crash can never leave a file that collides with the bundle layer
  * (inserting an id the bundle layer also inserts is a hard boot failure).
+ * `state.json` in the same directory is the market's own durable state
+ * (disable list + custom groups) and deliberately survives the wipe.
  *
  * The Include subclass suppresses `write()` — the loader otherwise persists
  * tree changes back to the file it read (see dsh's agent-presets PresetTree
@@ -124,7 +126,7 @@ export function parseSimplePatch(patchText: string): HotRow[] | null {
 
 /**
  * Wipe leftover hot-mount inputs; call once when the market host starts.
- * `state.json` (skin enable/disable choices) deliberately survives.
+ * `state.json` (disable choices + groups) deliberately survives.
  */
 export function cleanHotDir(profileDir: string): void {
   const dir = join(profileDir, HOT_DIR)
@@ -143,19 +145,89 @@ function stateFile(profileDir: string): string {
   return join(profileDir, HOT_DIR, 'state.json')
 }
 
-/** Themes the user switched away from; skipped by the boot re-mount. */
-export function readDisabledThemes(profileDir: string): Set<string> {
+/** Persisted market state: the generic disable list plus custom groups. */
+export interface MarketState {
+  /** Plugins the user switched off; replayed at every boot. */
+  disabled: Set<string>
+  /** User-defined plugin groups: group name → member package names. */
+  groups: Record<string, string[]>
+  /** Display order of group names; "ungrouped" is implicit and never listed. */
+  groupOrder: string[]
+}
+
+/** Unique non-empty strings in `value`, order preserved. */
+function uniqueStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item === '' || seen.has(item)) continue
+    seen.add(item)
+    out.push(item)
+  }
+  return out
+}
+
+/**
+ * Read the whole market state. Legacy `disabledSkins` (the pre-#60
+ * theme-only key) still loads; every new write uses the generic `disabled`
+ * key (#60).
+ */
+export function readMarketState(profileDir: string): MarketState {
   try {
-    const state = JSON.parse(readFileSync(stateFile(profileDir), 'utf8')) as { disabledSkins?: string[] }
-    return new Set(Array.isArray(state.disabledSkins) ? state.disabledSkins : [])
+    const state = JSON.parse(readFileSync(stateFile(profileDir), 'utf8')) as {
+      disabled?: unknown
+      disabledSkins?: unknown
+      groups?: unknown
+      groupOrder?: unknown
+    }
+    const disabled = uniqueStrings(state.disabled !== undefined ? state.disabled : state.disabledSkins)
+    const groups: Record<string, string[]> = {}
+    if (state.groups !== null && typeof state.groups === 'object' && !Array.isArray(state.groups)) {
+      for (const [name, members] of Object.entries(state.groups)) {
+        groups[name] = uniqueStrings(members)
+      }
+    }
+    return {
+      disabled: new Set(disabled),
+      groups,
+      groupOrder: uniqueStrings(state.groupOrder),
+    }
   } catch {
-    return new Set()
+    return { disabled: new Set(), groups: {}, groupOrder: [] }
   }
 }
 
-export function writeDisabledThemes(profileDir: string, disabled: Set<string>): void {
+/** Persist the whole market state; `disabled` is the single written key. */
+export function writeMarketState(profileDir: string, state: MarketState): void {
   mkdirSync(join(profileDir, HOT_DIR), { recursive: true, mode: 0o700 })
-  writeFileSync(stateFile(profileDir), JSON.stringify({ disabledSkins: [...disabled] }))
+  writeFileSync(stateFile(profileDir), JSON.stringify({
+    disabled: [...state.disabled],
+    groups: state.groups,
+    groupOrder: state.groupOrder,
+  }))
+}
+
+/** Plugins the user switched off; skipped by the boot re-mount. */
+export function readDisabled(profileDir: string): Set<string> {
+  return readMarketState(profileDir).disabled
+}
+
+/** Persist just the disable list, preserving groups and order. */
+export function writeDisabled(profileDir: string, disabled: Set<string>): void {
+  const state = readMarketState(profileDir)
+  state.disabled = new Set(disabled)
+  writeMarketState(profileDir, state)
+}
+
+/** @deprecated theme-specific alias — kept for pre-#60 callers. */
+export function readDisabledThemes(profileDir: string): Set<string> {
+  return readDisabled(profileDir)
+}
+
+/** @deprecated theme-specific alias — kept for pre-#60 callers. */
+export function writeDisabledThemes(profileDir: string, disabled: Set<string>): void {
+  writeDisabled(profileDir, disabled)
 }
 
 /** Package names currently live through a market hot mount (patch or shim). */
@@ -288,7 +360,7 @@ export async function mountClientOnlyDeps(ctx: HotContext, profileDir: string): 
   } catch {
     return []
   }
-  const disabled = readDisabledThemes(profileDir)
+  const disabled = readDisabled(profileDir)
   const userManaged = readUserPatchControls(profileDir)
   const mounted: string[] = []
   for (const name of deps) {

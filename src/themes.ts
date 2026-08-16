@@ -6,7 +6,7 @@
  */
 
 import { loadRegistry } from './registry.ts'
-import { hotMount, hotUnmount, listHotMounts, writeDisabledThemes } from './hot.ts'
+import { hotMount, hotUnmount, listHotMounts, writeDisabled } from './hot.ts'
 import { logEvent } from './log.ts'
 import { profileDir, readInstalled } from './profile.ts'
 import { repoOf } from './sources.ts'
@@ -110,7 +110,7 @@ export function createThemeManager(host: ThemeHost, profile: string, disabledThe
       }
     }
     disabledThemes.delete(name)
-    writeDisabledThemes(dir, disabledThemes)
+    writeDisabled(dir, disabledThemes)
     if (listHotMounts().includes(name)) return true
     if (await setEntryDisabled(name, false)) return true
     return (await hotMount(host, dir, name)).ok

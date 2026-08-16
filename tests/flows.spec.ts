@@ -154,11 +154,25 @@ vi.mock('../src/dsh-cli.ts', () => {
 })
 
 // ---------------------------------------------------------------- fake hot layer
-const hot = vi.hoisted(() => ({ mounts: [] as string[], disabled: new Set<string>(), failNext: false }))
+const hot = vi.hoisted(() => ({
+  mounts: [] as string[],
+  disabled: new Set<string>(),
+  groups: {} as Record<string, string[]>,
+  groupOrder: [] as string[],
+  failNext: false,
+}))
 vi.mock('../src/hot.ts', () => ({
   cleanHotDir: () => {},
   readDisabledThemes: () => hot.disabled,
   writeDisabledThemes: (_dir: string, set: Set<string>) => { hot.disabled = new Set(set) },
+  readDisabled: () => hot.disabled,
+  writeDisabled: (_dir: string, set: Set<string>) => { hot.disabled = new Set(set) },
+  readMarketState: () => ({ disabled: hot.disabled, groups: hot.groups, groupOrder: hot.groupOrder }),
+  writeMarketState: (_dir: string, state: { disabled: Set<string>; groups: Record<string, string[]>; groupOrder: string[] }) => {
+    hot.disabled = new Set(state.disabled)
+    hot.groups = state.groups
+    hot.groupOrder = state.groupOrder
+  },
   listHotMounts: () => [...hot.mounts],
   hotMount: (_ctx: unknown, _dir: string, name: string) => {
     if (hot.failNext) {
@@ -294,6 +308,8 @@ beforeEach(() => {
   restartCalls.count = 0
   hot.mounts = []
   hot.disabled = new Set()
+  hot.groups = {}
+  hot.groupOrder = []
   hot.failNext = false
   bed = createTestbed()
 })
@@ -741,5 +757,259 @@ describe('bundle-layer uninstall live-disable (#37)', () => {
     expect(entry.options.disabled).toBe(true)
     expect(entry.fiber).toBeUndefined()
     expect(r.json.hot).toBe(true)
+  })
+})
+
+describe('generic enable/disable toggle (#60)', () => {
+  function installNpm(name: string, dsh: Record<string, unknown> = {}): Promise<void> {
+    fake.npm[name] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    return bed.dispatch('POST', '/dsh-market/install', { url: `https://github.com/o/${name}` }).then(() => undefined)
+  }
+
+  it('toggles a hot-mounted plugin off and back on, persisting the disable list', async () => {
+    await installNpm('dsh-loop')
+    expect(hot.mounts).toEqual(['dsh-loop'])
+
+    const off = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    expect(off.status).toBe(200)
+    expect(off.json.ok).toBe(true)
+    expect(hot.mounts).toEqual([])
+    expect(hot.disabled.has('dsh-loop')).toBe(true)
+    expect(off.json.disabled).toContain('dsh-loop')
+
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.disabled).toContain('dsh-loop')
+    expect(listed.json.activation['dsh-loop'].state).not.toBe('live')
+
+    const on = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: true })
+    expect(on.status).toBe(200)
+    expect(hot.mounts).toEqual(['dsh-loop'])
+    expect(hot.disabled.has('dsh-loop')).toBe(false)
+    expect(on.json.activation['dsh-loop'].state).toBe('live')
+  })
+
+  it('toggles a bundle-layer entry through setEntryDisabled', async () => {
+    fake.repos['github:o/blue-whale'] = {
+      name: 'dsh-blue-whale',
+      manifest: { dsh: { bundle: { patch: './x.yml' } }, main: 'lib/index.js' },
+      artifacts: ['lib/index.js'],
+    }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/blue-whale' })
+    hot.mounts = [] // bundle-layer: loaded by the loader, never a hot mount
+    const entry = {
+      options: { id: 'dsh-blue-whale', name: 'dsh-blue-whale', disabled: null as boolean | null },
+      fiber: {} as unknown,
+      update: vi.fn(async (options: { disabled: boolean | null }) => {
+        entry.options.disabled = options.disabled
+        if (options.disabled === true) entry.fiber = undefined
+        else entry.fiber = {}
+      }),
+    }
+    bed.loaderEntries.push(entry)
+
+    const off = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-blue-whale', enabled: false })
+    expect(off.status).toBe(200)
+    expect(entry.options.disabled).toBe(true)
+    expect(entry.fiber).toBeUndefined()
+    expect(hot.disabled.has('dsh-blue-whale')).toBe(true)
+
+    const on = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-blue-whale', enabled: true })
+    expect(on.status).toBe(200)
+    expect(entry.options.disabled).toBeNull()
+    expect(entry.fiber).toBeDefined()
+    expect(hot.disabled.has('dsh-blue-whale')).toBe(false)
+  })
+
+  it('toggles a client-only shim (dsh.client without dsh.bundle) through the hot path', async () => {
+    await installNpm('dsh-loop', { client: './client.js' })
+    expect(hot.mounts).toEqual(['dsh-loop'])
+    const off = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    expect(off.status).toBe(200)
+    expect(hot.mounts).toEqual([])
+    expect(hot.disabled.has('dsh-loop')).toBe(true)
+    const on = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: true })
+    expect(on.status).toBe(200)
+    expect(hot.mounts).toEqual(['dsh-loop'])
+    expect(hot.disabled.has('dsh-loop')).toBe(false)
+  })
+
+  it('enabling a theme through the generic toggle keeps the Themes-page exclusivity', async () => {
+    for (const name of ['theme-a', 'theme-b']) {
+      fake.repos[`github:o/${name}`] = { name, manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'] }
+      await bed.dispatch('POST', '/dsh-market/install', { url: `https://github.com/o/${name}` })
+    }
+    expect(hot.mounts).toEqual(['theme-b'])
+    const r = await bed.dispatch('POST', '/dsh-market/toggle', { name: 'theme-a', enabled: true })
+    expect(r.status).toBe(200)
+    expect(hot.mounts).toEqual(['theme-a'])
+    expect(hot.disabled.has('theme-b')).toBe(true)
+    expect(hot.disabled.has('theme-a')).toBe(false)
+  })
+
+  it('rejects the market itself, unknown plugins, and cross-origin toggles', async () => {
+    expect((await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dshmarket', enabled: false })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/toggle', { name: 'ghost', enabled: true })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false }, { crossOrigin: true })).status).toBe(403)
+  })
+
+  it('uninstall clears the disable flag; a reinstall starts enabled', async () => {
+    await installNpm('dsh-loop')
+    await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    expect(hot.disabled.has('dsh-loop')).toBe(true)
+    const uninstall = await bed.dispatch('POST', '/dsh-market/uninstall', { name: 'dsh-loop' })
+    expect(uninstall.status).toBe(200)
+    expect(hot.disabled.has('dsh-loop')).toBe(false)
+    const reinstall = await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    expect(reinstall.status).toBe(200)
+    expect(hot.disabled.has('dsh-loop')).toBe(false)
+    expect(hot.mounts).toEqual(['dsh-loop'])
+  })
+})
+
+describe('disable-list replay at boot (#60)', () => {
+  it('re-applies persisted disables to bundle-layer entries after the boot shim resolves', async () => {
+    // A previous session left theme-a disabled; the replay must put the
+    // bundle-layer entry back down (client-only shims are skipped inside
+    // mountClientOnlyDeps, covered by the real-module spec).
+    hot.disabled = new Set(['theme-a'])
+    const entry = {
+      options: { id: 'theme-a', name: 'theme-a', disabled: null as boolean | null },
+      fiber: {} as unknown,
+      update: vi.fn(async (options: { disabled: boolean | null }) => {
+        entry.options.disabled = options.disabled
+        if (options.disabled === true) entry.fiber = undefined
+      }),
+    }
+    const bed2 = createTestbed()
+    bed2.loaderEntries.push(entry)
+    // mountClientOnlyDeps resolves immediately; flush the replay microtask.
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 0))
+    expect(entry.options.disabled).toBe(true)
+    expect(entry.fiber).toBeUndefined()
+    bed2.dispose()
+  })
+})
+
+describe('custom groups (#60)', () => {
+  async function seedMembers(): Promise<void> {
+    fake.npm['dsh-loop'] = {
+      latest: '1.0.0',
+      versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } },
+    }
+    fake.npm['dsh-share'] = {
+      latest: '0.2.0',
+      versions: { '0.2.0': { manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'] } },
+    }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/h/dsh-share' })
+  }
+
+  it('create/rename/delete lifecycle keeps groups and groupOrder consistent', async () => {
+    const created = await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'work' })
+    expect(created.status).toBe(200)
+    expect(created.json.groups).toEqual({ work: [] })
+    expect(created.json.groupOrder).toEqual(['work'])
+
+    expect((await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'work' })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: '../evil' })).status).toBe(400)
+
+    const renamed = await bed.dispatch('POST', '/dsh-market/groups', { action: 'rename', name: 'work', newName: 'daily' })
+    expect(renamed.status).toBe(200)
+    expect(renamed.json.groups).toEqual({ daily: [] })
+    expect(renamed.json.groupOrder).toEqual(['daily'])
+
+    const deleted = await bed.dispatch('POST', '/dsh-market/groups', { action: 'delete', name: 'daily' })
+    expect(deleted.status).toBe(200)
+    expect(deleted.json.groups).toEqual({})
+    expect(deleted.json.groupOrder).toEqual([])
+    expect((await bed.dispatch('POST', '/dsh-market/groups', { action: 'delete', name: 'ghost' })).status).toBe(400)
+    expect((await bed.dispatch('POST', '/dsh-market/groups', { action: 'explode' })).status).toBe(400)
+  })
+
+  it('set-members keeps only installed plugins and uninstall prunes membership', async () => {
+    await seedMembers()
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'work' })
+    const set = await bed.dispatch('POST', '/dsh-market/groups', {
+      action: 'set-members', name: 'work', members: ['dsh-loop', 'dsh-share', 'ghost', 'dshmarket'],
+    })
+    expect(set.status).toBe(200)
+    expect(set.json.groups.work.sort()).toEqual(['dsh-loop', 'dsh-share'])
+    expect(set.json.groups.work).not.toContain('dshmarket')
+
+    await bed.dispatch('POST', '/dsh-market/uninstall', { name: 'dsh-loop' })
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+    expect(listed.json.groups.work).toEqual(['dsh-share'])
+  })
+
+  it('group toggle enables/disables every member as a batch', async () => {
+    await seedMembers()
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'work' })
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'set-members', name: 'work', members: ['dsh-loop', 'dsh-share'] })
+
+    const off = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'work', enabled: false })
+    expect(off.status).toBe(200)
+    expect(off.json.disabled.sort()).toEqual(['dsh-loop', 'dsh-share'])
+    expect(hot.mounts).toEqual([])
+
+    const on = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'work', enabled: true })
+    expect(on.status).toBe(200)
+    expect(on.json.disabled).toEqual([])
+    expect(hot.mounts.sort()).toEqual(['dsh-loop', 'dsh-share'])
+  })
+
+  it('group switch matches individually toggled plugins (mixed then all-off)', async () => {
+    await seedMembers()
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'work' })
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'set-members', name: 'work', members: ['dsh-loop', 'dsh-share'] })
+    // One member off individually → the group is mixed (derived, not stored).
+    await bed.dispatch('POST', '/dsh-market/toggle', { name: 'dsh-loop', enabled: false })
+    expect(hot.disabled).toEqual(new Set(['dsh-loop']))
+    // Group off = same outcome as toggling each member individually.
+    const off = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'work', enabled: false })
+    expect(off.json.disabled.sort()).toEqual(['dsh-loop', 'dsh-share'])
+    const on = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'work', enabled: true })
+    expect(on.json.disabled).toEqual([])
+  })
+
+  it('rejects a second theme in one group', async () => {
+    for (const name of ['theme-a', 'theme-b']) {
+      fake.repos[`github:o/${name}`] = { name, manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'] }
+      await bed.dispatch('POST', '/dsh-market/install', { url: `https://github.com/o/${name}` })
+    }
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'looks' })
+    const both = await bed.dispatch('POST', '/dsh-market/groups', {
+      action: 'set-members', name: 'looks', members: ['theme-a', 'theme-b'],
+    })
+    expect(both.status).toBe(400)
+    expect(String(both.json.error)).toMatch(/at most one theme/)
+    const one = await bed.dispatch('POST', '/dsh-market/groups', {
+      action: 'set-members', name: 'looks', members: ['theme-a'],
+    })
+    expect(one.status).toBe(200)
+    expect(one.json.groups.looks).toEqual(['theme-a'])
+  })
+
+  it('group toggle enables a theme member with global exclusivity', async () => {
+    for (const name of ['theme-a', 'theme-b']) {
+      fake.repos[`github:o/${name}`] = { name, manifest: { dsh: {}, main: 'index.js' }, artifacts: ['index.js'] }
+      await bed.dispatch('POST', '/dsh-market/install', { url: `https://github.com/o/${name}` })
+    }
+    expect(hot.mounts).toEqual(['theme-b']) // later install auto-activated
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'create', name: 'looks' })
+    await bed.dispatch('POST', '/dsh-market/groups', { action: 'set-members', name: 'looks', members: ['theme-a'] })
+
+    const on = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'looks', enabled: true })
+    expect(on.status).toBe(200)
+    // Enabling the group's theme deactivates the previously active theme-b.
+    expect(hot.mounts).toEqual(['theme-a'])
+    expect(hot.disabled.has('theme-b')).toBe(true)
+    expect(hot.disabled.has('theme-a')).toBe(false)
+
+    const off = await bed.dispatch('POST', '/dsh-market/groups', { action: 'toggle', name: 'looks', enabled: false })
+    expect(off.status).toBe(200)
+    expect(hot.disabled.has('theme-a')).toBe(true)
   })
 })

@@ -17,6 +17,13 @@ export interface RegistryPlugin {
   stars?: number
   added?: string
   install?: string
+  /**
+   * Catalog-side deprecation flags (#60): absent for every normal entry, so
+   * catalogs without the fields render exactly as before.
+   */
+  deprecated?: boolean
+  /** Catalog name of the suggested replacement plugin, when deprecated. */
+  replacement?: string
 }
 
 /** The catalog payload under `registry` in /dsh-market/registry. */
@@ -63,6 +70,39 @@ export interface ActivationInfo {
   reasons: string[]
   bundle: boolean
   hot: boolean
+}
+
+/** The /dsh-market/installed payload (fields the market UI consumes). */
+export interface InstalledPayload {
+  profile?: string
+  installed: InstalledMap
+  activation?: Record<string, ActivationInfo>
+  live?: string[]
+  /** Plugins the user switched off; persisted across restarts (#60). */
+  disabled?: string[]
+  /** Custom plugin groups: group name → member package names. */
+  groups?: Record<string, string[]>
+  /** Display order of group names. */
+  groupOrder?: string[]
+}
+
+/**
+ * A group's derived switch state: all members enabled / all disabled /
+ * mixed / no members. Pure — the UI renders exactly this and the group
+ * switch itself is never persisted (#60).
+ */
+export type GroupSwitchState = 'on' | 'off' | 'mixed' | 'empty'
+
+export function groupSwitchState(members: string[] | undefined, disabled: ReadonlySet<string>): GroupSwitchState {
+  const list = members ?? []
+  if (list.length === 0) return 'empty'
+  let anyOn = false
+  let anyOff = false
+  for (const member of list) {
+    if (disabled.has(member)) anyOff = true
+    else anyOn = true
+  }
+  return anyOn && anyOff ? 'mixed' : anyOff ? 'off' : 'on'
 }
 
 /** Registered theme definition surfaced by the theme service snapshot. */

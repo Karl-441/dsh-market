@@ -16,6 +16,14 @@ export interface RegistryPlugin {
   stars?: number | null
   install: string
   added: string
+  /**
+   * Catalog-side deprecation flags (#60): supplied by awesome-dsh-plugin,
+   * absent for every normal entry — the market only consumes them, so a
+   * catalog without the fields behaves exactly as before.
+   */
+  deprecated?: boolean
+  /** Catalog name of the suggested replacement plugin, when deprecated. */
+  replacement?: string
 }
 
 export interface Registry {

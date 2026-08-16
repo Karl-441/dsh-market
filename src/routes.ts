@@ -14,8 +14,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { loadRegistry } from './registry.ts'
 import {
   cleanHotDir, hotMount, hotUnmount, listHotMounts,
-  mountClientOnlyDeps, readDisabledThemes,
+  mountClientOnlyDeps, readMarketState, writeMarketState,
 } from './hot.ts'
+import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
 import { exportLogs, logEvent } from './log.ts'
 import { BOOT_ID, cancelActive, probePnpm, progress, provisionPnpm, runDshPlugin } from './dsh-cli.ts'
 import { profileDir, readInstalled, readInstalledVersion, readLockCommits, setAllowBuilds } from './profile.ts'
@@ -68,29 +69,35 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
   // Boot-time wipe: stale hot-mount inputs from a previous session must never
   // survive into a composition where the bundle layer already covers them.
   cleanHotDir(profileDir(config.profile))
-  // The user's persisted theme choice; activateTheme mutates and writes it.
-  const disabledThemes = readDisabledThemes(profileDir(config.profile))
-  const themes = createThemeManager(host, config.profile, disabledThemes)
+  // The user's persisted choices: the generic disable list (legacy
+  // disabledSkins loads transparently) plus custom groups. Every toggle,
+  // group, install and uninstall mutates this shared state and persists it.
+  const marketState = readMarketState(profileDir(config.profile))
+  const disabled = marketState.disabled
+  const groups = marketState.groups
+  const groupOrder = marketState.groupOrder
+  const themes = createThemeManager(host, config.profile, disabled)
 
   // Client-only packages (dsh.client without dsh.bundle) are invisible to the
   // bundle layer in every boot; the market shim-mounts them so their client
   // bundles are actually served.
   void mountClientOnlyDeps(host, profileDir(config.profile)).then(async (mounted) => {
     if (mounted.length > 0) logEvent('info', 'boot', `client-only shims mounted: ${mounted.join(', ')}`)
-    // Replay the user's theme choice: bundle-layer themes they switched away
-    // from get live-disabled again (bundle trees are in-memory, so the
-    // disable never persists on its own).
-    for (const name of disabledThemes) {
-      if (await themes.setEntryDisabled(name, true)) logEvent('info', 'boot', `theme kept off: ${name}`)
+    // Replay the persisted disable list: bundle-layer plugins the user
+    // switched away from get live-disabled again (bundle trees are
+    // in-memory, so the disable never persists on its own). Client-only
+    // shims for disabled plugins were already skipped by mountClientOnlyDeps.
+    for (const name of disabled) {
+      if (await themes.setEntryDisabled(name, true)) logEvent('info', 'boot', `plugin kept off: ${name}`)
     }
   })
 
   // Self-healing guard: dsh's own patch overlay can re-update entries during
-  // activation and wipe the runtime disabled flag — whenever a fiber comes up
-  // for a theme the user switched off, put it back down.
+  // activation and wipe the runtime disabled flag — whenever a fiber comes
+  // up for a plugin the user switched off, put it back down.
   host.on?.('internal/plugin', (fiber) => {
     const name = fiber.entry?.options?.name
-    if (name !== undefined && disabledThemes.has(name)) void themes.setEntryDisabled(name, true)
+    if (name !== undefined && disabled.has(name)) void themes.setEntryDisabled(name, true)
   })
   let installing = false
   let restarting = false
@@ -102,6 +109,41 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
     for (const [name, spec] of Object.entries(now)) if (before[name] !== spec) changed.add(name)
     for (const name of Object.keys(before)) if (now[name] === undefined) changed.add(name)
     return { changed: [...changed], partial: changed.size > 0 }
+  }
+
+  /**
+   * Apply one enable/disable request: persist the choice in state.json, then
+   * drive the live composition. Covers every mount form — hot mounts and
+   * client-only shims go through hotUnmount/hotMount, bundle-layer entries
+   * through setEntryDisabled. Enabling a THEME goes through the caller's
+   * activateTheme instead so the Themes tab's exclusivity stays intact.
+   */
+  async function setPluginEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; reason?: string }> {
+    const dir = profileDir(config.profile)
+    if (enabled) disabled.delete(name)
+    else disabled.add(name)
+    let ok: boolean
+    let reason: string | undefined
+    if (enabled) {
+      if (listHotMounts().includes(name)) {
+        ok = true
+      } else if (await themes.setEntryDisabled(name, false)) {
+        ok = true
+      } else {
+        const result = await hotMount(host, dir, name)
+        ok = result.ok
+        reason = result.reason ?? undefined
+      }
+    } else {
+      ok = await hotUnmount(name) || await themes.setEntryDisabled(name, true)
+      if (!ok) {
+        // Nothing was live (boot-skipped client shim, user-patch-managed
+        // entry, or already off): the persisted flag is the contract.
+        ok = true
+      }
+    }
+    writeMarketState(dir, { disabled, groups, groupOrder })
+    return { ok, reason }
   }
 
   /**
@@ -173,6 +215,9 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
           installed,
           activation,
           live: listHotMounts(),
+          disabled: [...disabled],
+          groups,
+          groupOrder,
         })
       },
     }),
@@ -205,6 +250,144 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           logEvent('error', 'use-skin', `route error: ${message}`)
+          sendJson(response, 500, { error: message })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/toggle',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          const body = (await readJsonBody(request)) as { name?: unknown; enabled?: unknown }
+          const name = typeof body.name === 'string' ? body.name : ''
+          const enabled = body.enabled === true
+          if (name === 'dsh-market' || name === 'dshmarket') {
+            sendJson(response, 400, { error: 'the market cannot be disabled from its own page; use the dsh CLI' })
+            return
+          }
+          if (readInstalled(config.profile)[name] === undefined) {
+            sendJson(response, 400, { error: 'plugin is not installed' })
+            return
+          }
+          let ok: boolean
+          let reason: string | undefined
+          if (enabled && (await themes.installedThemeNames()).has(name)) {
+            // Theme exclusivity stays a Themes-page concern: enabling a theme
+            // deactivates the previously active one, so only the last-enabled
+            // theme is live (same semantics as use-skin).
+            ok = await themes.activateTheme(name)
+            if (!ok) reason = 'theme activation failed — restart required / 主题启用失败，需要重启'
+          } else {
+            const result = await setPluginEnabled(name, enabled)
+            ok = result.ok
+            reason = result.reason
+          }
+          logEvent(ok ? 'info' : 'error', 'toggle', `${name}: ${enabled ? 'on' : 'off'} ok=${String(ok)}`)
+          sendJson(response, ok ? 200 : 502, {
+            ok,
+            name,
+            enabled,
+            disabled: [...disabled],
+            live: listHotMounts(),
+            activation: { [name]: verifyActivation(config.profile, name, liveNames()) },
+            reason,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          logEvent('error', 'toggle', `route error: ${message}`)
+          sendJson(response, 500, { error: message })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/groups',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          const body = (await readJsonBody(request)) as {
+            action?: unknown
+            name?: unknown
+            newName?: unknown
+            members?: unknown
+            enabled?: unknown
+          }
+          const action = typeof body.action === 'string' ? body.action : ''
+          const known = action === 'create' || action === 'rename' || action === 'delete'
+            || action === 'set-members' || action === 'toggle'
+          if (!known) {
+            sendJson(response, 400, { ok: false, error: 'unknown group action' })
+            return
+          }
+          const installed = new Set(Object.keys(readInstalled(config.profile)))
+          // Theme members follow the global one-active-theme rule: a group
+          // holds at most one, and enabling one deactivates every other.
+          const themeNames = await themes.installedThemeNames()
+          let ok = true
+          let error: string | undefined
+          if (action === 'toggle') {
+            const name = typeof body.name === 'string' ? body.name : ''
+            const enabled = body.enabled === true
+            if (groups[name] === undefined) {
+              sendJson(response, 400, { ok: false, error: 'group not found / 分组不存在' })
+              return
+            }
+            // Batch toggle: on = every installed member enabled, off = every
+            // member disabled. Each member keeps its own persisted flag, so
+            // later individual toggles still work (the group switch itself is
+            // derived state and never stored).
+            const failures: string[] = []
+            for (const member of groups[name]) {
+              if (!installed.has(member)) continue
+              const result = enabled && themeNames.has(member)
+                ? { ok: await themes.activateTheme(member), reason: undefined }
+                : await setPluginEnabled(member, enabled)
+              if (!result.ok) failures.push(member)
+            }
+            ok = failures.length === 0
+            if (!ok) error = `failed to ${enabled ? 'enable' : 'disable'}: ${failures.join(', ')}`
+          } else {
+            const state = { groups, groupOrder }
+            const result = action === 'create' ? createGroup(state, body.name)
+              : action === 'rename' ? renameGroup(state, body.name, body.newName)
+              : action === 'delete' ? deleteGroup(state, body.name)
+              : setGroupMembers(state, body.name, body.members, installed, themeNames)
+            ok = result.ok
+            error = result.error
+          }
+          if (ok) writeMarketState(profileDir(config.profile), { disabled, groups, groupOrder })
+          logEvent(ok ? 'info' : 'warn', 'groups',
+            `${action}${typeof body.name === 'string' ? ' ' + body.name : ''}${ok ? '' : ` — ${error ?? ''}`}`)
+          sendJson(response, ok ? 200 : 400, {
+            ok,
+            error,
+            groups,
+            groupOrder,
+            disabled: [...disabled],
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          logEvent('error', 'groups', `route error: ${message}`)
           sendJson(response, 500, { error: message })
         }
       },
@@ -564,6 +747,12 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
               // @1123762794). Live-disable the entry so the refresh composes
               // without it; after a real restart the entry is gone anyway.
               if (!hot) hot = await themes.setEntryDisabled(name, true)
+              // The disable list must not keep a removed plugin: a later
+              // reinstall starts enabled. Group memberships follow the same
+              // rule so no group toggle ever targets a ghost member.
+              disabled.delete(name)
+              removeFromGroups({ groups, groupOrder }, name)
+              writeMarketState(profileDir(config.profile), { disabled, groups, groupOrder })
             }
             logEvent(ok || cancelled ? 'info' : 'error', 'uninstall',
               `${name} exit=${String(result.exitCode)}${cancelled ? ' CANCELLED' : ''}${ok ? ` live-removed=${String(hot)}` : cancelled ? '' : ` stderr=${result.stderr.slice(-300)}`}`)
@@ -677,6 +866,11 @@ export function mountMarketRoutes(host: MarketHost, config: MarketConfig): () =>
             if (ok) {
               const added = Object.keys(installed).filter(name => !before.has(name))
               if (added.length > 0) {
+                // Fresh installs start enabled: drop any stale disable flag
+                // (e.g. reinstall after an uninstall while this process kept
+                // running) and persist before the activation loop.
+                for (const name of added) disabled.delete(name)
+                writeMarketState(profileDir(config.profile), { disabled, groups, groupOrder })
                 // Theme installs auto-activate (and deactivate the previous
                 // theme) so the result is visible right after the refresh.
                 hot = true

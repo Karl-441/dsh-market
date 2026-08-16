@@ -7,7 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, use
 import { Button, IconChevronDownOutline14, IconChevronUpOutline14, IconSearchOutline16, Input, Modal, Pill, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import css from './Market.module.css'
 import {
-  avatarColor, entryForDep, isInstalled, looksTerminal, matchInstalledName, orderedCategories,
+  avatarColor, entryForDep, groupSwitchState, isInstalled, looksTerminal, matchInstalledName, orderedCategories,
   pageItems, readSession, repoOf, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins,
 } from './market-data.ts'
 import type {
@@ -164,6 +164,24 @@ export function MarketSection(props: MarketSectionProps) {
   const [progressLine, setProgressLine] = useState<string | null>(null)
   /** Per-package activation states from /dsh-market/installed + operations. */
   const [activations, setActivations] = useState<Record<string, ActivationInfo>>({})
+  /** #60: persisted disable list + custom groups, straight from /installed. */
+  const [disabledNames, setDisabledNames] = useState<string[]>([])
+  const [groups, setGroups] = useState<Record<string, string[]>>({})
+  const [groupOrder, setGroupOrder] = useState<string[]>([])
+  /** Installed-tab sub-view: flat list or groups (All-plugins was removed —
+   * it duplicated the Discover tab). */
+  const [installedView, setInstalledView] = useState<'list' | 'groups'>('list')
+  const [togglingName, setTogglingName] = useState<string | null>(null)
+  // Group editor state (create / rename / delete / assign).
+  const [creatingGroup, setCreatingGroup] = useState(false)
+  const [newGroupName, setNewGroupName] = useState('')
+  const [renamingGroup, setRenamingGroup] = useState<string | null>(null)
+  const [renamingValue, setRenamingValue] = useState('')
+  const [deletingGroup, setDeletingGroup] = useState<string | null>(null)
+  /** Open group picker: which group and whether it adds plugins or themes. */
+  const [addPanel, setAddPanel] = useState<{ group: string; kind: 'plugin' | 'theme' } | null>(null)
+  const [assignFor, setAssignFor] = useState<string | null>(null)
+  const [assignTarget, setAssignTarget] = useState('')
   /** Structured progress from pnpm ndjson (P1-6). */
   const [progressPhase, setProgressPhase] = useState<MarketStatus['phase']>(null)
   const [progressCurrent, setProgressCurrent] = useState<string | null>(null)
@@ -206,6 +224,9 @@ export function MarketSection(props: MarketSectionProps) {
       .then(body => {
         setInstalled(body.installed || {})
         setSkins(body.live || [])
+        if (Array.isArray(body.disabled)) setDisabledNames(body.disabled)
+        if (body.groups && typeof body.groups === 'object') setGroups(body.groups)
+        if (Array.isArray(body.groupOrder)) setGroupOrder(body.groupOrder)
         if (body.activation && typeof body.activation === 'object') setActivations(body.activation)
       })
       .catch(() => {})
@@ -214,6 +235,9 @@ export function MarketSection(props: MarketSectionProps) {
       .then(body => setUpdates(body.updates || {}))
       .catch(() => {})
   }, [])
+
+  /** Lookup set for the persisted disable list (#60). */
+  const disabledSet = useMemo(() => new Set(disabledNames), [disabledNames])
 
   useEffect(() => {
     fetch('/dsh-market/registry', { cache: 'no-store' })
@@ -602,6 +626,124 @@ export function MarketSection(props: MarketSectionProps) {
       .finally(() => setRemovingName(null))
   }, [refreshInstalled])
 
+  /** Live enable/disable of one installed plugin (#60). */
+  const doToggle = useCallback((name: string, enabled: boolean) => {
+    setTogglingName(name)
+    setInstallError(null)
+    return fetch('/dsh-market/toggle', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, enabled }),
+    })
+      .then(res => res.json().then(body => ({ status: res.status, body })))
+      .then(({ status, body }) => {
+        if (status === 200 && body.ok) {
+          if (Array.isArray(body.disabled)) setDisabledNames(body.disabled)
+          if (Array.isArray(body.live)) setSkins(body.live)
+          if (body.activation && typeof body.activation === 'object') {
+            setActivations(prev => ({ ...prev, ...body.activation }))
+          }
+          refreshInstalled()
+        } else {
+          const text = (v: unknown) => typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v)
+          setInstallError(text(body.error) || t('toggleFail'))
+        }
+      })
+      .catch(error => setInstallError(String(error)))
+      .finally(() => setTogglingName(null))
+  }, [refreshInstalled, t])
+
+  /** Adopt the groups payload returned by POST /dsh-market/groups. */
+  const setGroupPayload = useCallback((body: {
+    groups?: Record<string, string[]>
+    groupOrder?: string[]
+    disabled?: string[]
+  }) => {
+    if (body.groups && typeof body.groups === 'object') setGroups(body.groups)
+    if (Array.isArray(body.groupOrder)) setGroupOrder(body.groupOrder)
+    if (Array.isArray(body.disabled)) setDisabledNames(body.disabled)
+  }, [])
+
+  /** One POST /dsh-market/groups round trip (create/rename/delete/members/toggle). */
+  const doGroupAction = useCallback((payload: Record<string, unknown>): Promise<boolean> => {
+    setInstallError(null)
+    return fetch('/dsh-market/groups', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+      .then(res => res.json().then(body => ({ status: res.status, body })))
+      .then(({ status, body }) => {
+        if (status === 200 && body.ok) {
+          setGroupPayload(body)
+          refreshInstalled()
+          return true
+        }
+        const text = (v: unknown) => typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v)
+        setInstallError(text(body.error) || t('toggleFail'))
+        return false
+      })
+      .catch(error => { setInstallError(String(error)); return false })
+  }, [refreshInstalled, setGroupPayload, t])
+
+  const doGroupToggle = useCallback((name: string, enabled: boolean) => {
+    return doGroupAction({ action: 'toggle', name, enabled })
+  }, [doGroupAction])
+
+  const doCreateGroup = useCallback(() => {
+    const name = newGroupName.trim()
+    if (name === '') return
+    void doGroupAction({ action: 'create', name }).then(ok => {
+      if (ok) {
+        setCreatingGroup(false)
+        setNewGroupName('')
+      }
+    })
+  }, [doGroupAction, newGroupName])
+
+  const doRenameGroup = useCallback((name: string) => {
+    const newName = renamingValue.trim()
+    if (newName === '' || newName === name) {
+      setRenamingGroup(null)
+      return
+    }
+    void doGroupAction({ action: 'rename', name, newName }).then(ok => {
+      if (ok) {
+        setRenamingGroup(null)
+        setRenamingValue('')
+      }
+    })
+  }, [doGroupAction, renamingValue])
+
+  const doDeleteGroup = useCallback((name: string) => {
+    void doGroupAction({ action: 'delete', name }).then(ok => {
+      if (ok) setDeletingGroup(null)
+    })
+  }, [doGroupAction])
+
+  const doAssign = useCallback((name: string) => {
+    const group = assignTarget
+    if (group === '') return
+    const members = groups[group] ?? []
+    void doGroupAction({ action: 'set-members', name: group, members: [...members, name] }).then(ok => {
+      if (ok) {
+        setAssignFor(null)
+        setAssignTarget('')
+      }
+    })
+  }, [assignTarget, doGroupAction, groups])
+
+  const doRemoveMember = useCallback((group: string, name: string) => {
+    const members = (groups[group] ?? []).filter(member => member !== name)
+    void doGroupAction({ action: 'set-members', name: group, members })
+  }, [doGroupAction, groups])
+
+  /** Add one installed plugin to a group (picker stays open for batch adds). */
+  const doAddMember = useCallback((group: string, name: string) => {
+    const members = groups[group] ?? []
+    void doGroupAction({ action: 'set-members', name: group, members: [...members, name] })
+  }, [doGroupAction, groups])
+
   // The market itself stays out of the batch: its update reloads this page
   // mid-run, which would strand the remaining items.
   const selfName = installed['dshmarket'] !== undefined ? 'dshmarket' : 'dsh-market'
@@ -638,17 +780,27 @@ export function MarketSection(props: MarketSectionProps) {
 
   const themePlugins = data === null ? [] : themePluginsOf(data.plugins)
 
+  /** The catalog entry a deprecated plugin's `replacement` names, if any. */
+  const replacementOf = (p: RegistryPlugin): RegistryPlugin | undefined =>
+    p.deprecated === true && p.replacement !== undefined
+      ? data?.plugins.find(r => r.name === p.replacement)
+      : undefined
+
   const pluginCard = (p: RegistryPlugin) => {
     const desc = (p.description && (p.description[lang] || p.description.en)) || ''
     const done = doneUrls.includes(p.url) || hotUrls.includes(p.url)
     const already = isInstalled(p, installed)
     const busy = busyUrl === p.url
+    const replacement = replacementOf(p)
     return (
       <div key={p.url} className={css.card}>
         <div className={css.row1}>
           <OwnerAvatar name={p.name} owner={p.owner || ''} />
           <div style={{ minWidth: 0 }}>
-            <div className={css.nm}>{p.name}</div>
+            <div className={css.nm}>
+              {p.name}
+              {p.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
+            </div>
             <div className={css.owner}>
               {p.owner}
               {typeof p.stars === 'number' && <span className={css.star}>{' · ★ ' + p.stars}</span>}
@@ -659,6 +811,18 @@ export function MarketSection(props: MarketSectionProps) {
           <a className={css.src} href={p.url} target="_blank" rel="noreferrer" style={{ alignSelf: 'flex-start', flexShrink: 0 }}>{t('viewSource')}</a>
         </div>
         <div className={css.desc}>{desc}</div>
+        {p.deprecated === true && (
+          <div className={css.deprecate}>
+            <div className={css.depLine}>
+              <span>⚠️ {t('deprecatedWarn')}</span>
+              {replacement !== undefined && (
+                <a className={css.src} href={replacement.url} target="_blank" rel="noreferrer">
+                  {t('replacementHint') + ' ' + replacement.name}
+                </a>
+              )}
+            </div>
+          </div>
+        )}
         <div className={css.foot}>
           <span className={css.tag}>
             {(data!.categories[p.category] && (data!.categories[p.category]![lang] || data!.categories[p.category]!.en)) || p.category}
@@ -713,12 +877,16 @@ export function MarketSection(props: MarketSectionProps) {
     if (instName === null) return pluginCard(p)
     const mounted = skins.includes(instName) || bootEntries.some(e => e.id === instName)
     const desc = (p.description && (p.description[lang] || p.description.en)) || ''
+    const replacement = replacementOf(p)
     return (
       <div key={p.url} className={css.card}>
         <div className={css.row1}>
           <OwnerAvatar name={p.name} owner={p.owner || ''} />
           <div style={{ minWidth: 0 }}>
-            <div className={css.nm}>{p.name}</div>
+            <div className={css.nm}>
+              {p.name}
+              {p.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
+            </div>
             <div className={css.owner}>
               {p.owner}
               {typeof p.stars === 'number' && <span className={css.star}>{' · ★ ' + p.stars}</span>}
@@ -729,6 +897,18 @@ export function MarketSection(props: MarketSectionProps) {
           <a className={css.src} href={p.url} target="_blank" rel="noreferrer" style={{ alignSelf: 'flex-start', flexShrink: 0 }}>{t('viewSource')}</a>
         </div>
         <div className={css.desc}>{desc}</div>
+        {p.deprecated === true && (
+          <div className={css.deprecate}>
+            <div className={css.depLine}>
+              <span>⚠️ {t('deprecatedWarn')}</span>
+              {replacement !== undefined && (
+                <a className={css.src} href={replacement.url} target="_blank" rel="noreferrer">
+                  {t('replacementHint') + ' ' + replacement.name}
+                </a>
+              )}
+            </div>
+          </div>
+        )}
         <div className={css.foot}>
           <span className={css.grow} />
           {removingName === instName
@@ -794,6 +974,63 @@ export function MarketSection(props: MarketSectionProps) {
     // Reserve the tail slot of row two for the chevron itself.
     setVisibleCats(fits >= chips.length ? fits : Math.max(1, fits - 1))
   }, [catsOpen, visibleCats, data])
+
+  /** Shared pager markup for the Discover grid and the All-plugins view. */
+  const pager = (
+    <div className={css.pager}>
+      <div className={css.pagerPages}>
+        {totalPages > 1 && (
+          <>
+            <button type="button" className={css.pageBtn} disabled={currentPage === 1} onClick={() => goToPage(1)} aria-label={t('firstPage')}>«</button>
+            <button type="button" className={css.pageBtn} disabled={currentPage === 1} onClick={() => goToPage(currentPage - 1)}>{t('prevPage')}</button>
+            {pageItems(currentPage, totalPages).map((item, i) => (
+              item === '…'
+                ? <span key={'e' + i} className={css.pageEllipsis}>…</span>
+                : (
+                    <button
+                      key={item}
+                      type="button"
+                      className={item === currentPage ? `${css.pageBtn} ${css.pageOn}` : css.pageBtn}
+                      onClick={() => goToPage(item)}
+                    >{item}</button>
+                  )
+            ))}
+            <button type="button" className={css.pageBtn} disabled={currentPage === totalPages} onClick={() => goToPage(currentPage + 1)}>{t('nextPage')}</button>
+            <button type="button" className={css.pageBtn} disabled={currentPage === totalPages} onClick={() => goToPage(totalPages)} aria-label={t('lastPage')}>»</button>
+            <span className={css.pageInfo}>{t('pageInfo').replace('{0}', String(currentPage)).replace('{1}', String(totalPages))}</span>
+          </>
+        )}
+      </div>
+      <div className={css.pagerSize}>
+        <span className={css.sizeLabel}>{t('perPage')}</span>
+        {PAGE_SIZES.map(size => (
+          <button
+            key={size}
+            type="button"
+            className={size === pageSize ? `${css.sizeBtn} ${css.sizeOn}` : css.sizeBtn}
+            onClick={() => changePageSize(size)}
+          >{size}</button>
+        ))}
+      </div>
+    </div>
+  )
+
+  /** Installed plugins the market itself cannot group (#60). */
+  const groupableNames = Object.keys(installed).filter(name => name !== 'dsh-market' && name !== 'dshmarket')
+  /** Names already inside some group; everything else shows under "ungrouped". */
+  const groupedNames = useMemo(() => new Set(Object.values(groups).flat()), [groups])
+  const ungroupedNames = groupableNames.filter(name => !groupedNames.has(name))
+  /** Installed package names the catalog classifies as themes (client-side
+   * mirror of the server's classification; themes are exclusive per group). */
+  const installedThemeNames = useMemo(() => {
+    const names = new Set<string>()
+    if (data === null) return names
+    for (const [name, spec] of Object.entries(installed)) {
+      const entry = entryForDep(data.plugins, name, String(spec))
+      if (entry !== undefined && entry.category === 'theme') names.add(name)
+    }
+    return names
+  }, [data, installed])
 
   return (
     <div className={css.root}>
@@ -1031,42 +1268,7 @@ export function MarketSection(props: MarketSectionProps) {
                       : (
                           <>
                             <div className={css.grid}>{pagePlugins.map(pluginCard)}</div>
-                            <div className={css.pager}>
-                              <div className={css.pagerPages}>
-                                {totalPages > 1 && (
-                                  <>
-                                    <button type="button" className={css.pageBtn} disabled={currentPage === 1} onClick={() => goToPage(1)} aria-label={t('firstPage')}>«</button>
-                                    <button type="button" className={css.pageBtn} disabled={currentPage === 1} onClick={() => goToPage(currentPage - 1)}>{t('prevPage')}</button>
-                                    {pageItems(currentPage, totalPages).map((item, i) => (
-                                      item === '…'
-                                        ? <span key={'e' + i} className={css.pageEllipsis}>…</span>
-                                        : (
-                                            <button
-                                              key={item}
-                                              type="button"
-                                              className={item === currentPage ? `${css.pageBtn} ${css.pageOn}` : css.pageBtn}
-                                              onClick={() => goToPage(item)}
-                                            >{item}</button>
-                                          )
-                                    ))}
-                                    <button type="button" className={css.pageBtn} disabled={currentPage === totalPages} onClick={() => goToPage(currentPage + 1)}>{t('nextPage')}</button>
-                                    <button type="button" className={css.pageBtn} disabled={currentPage === totalPages} onClick={() => goToPage(totalPages)} aria-label={t('lastPage')}>»</button>
-                                    <span className={css.pageInfo}>{t('pageInfo').replace('{0}', String(currentPage)).replace('{1}', String(totalPages))}</span>
-                                  </>
-                                )}
-                              </div>
-                              <div className={css.pagerSize}>
-                                <span className={css.sizeLabel}>{t('perPage')}</span>
-                                {PAGE_SIZES.map(size => (
-                                  <button
-                                    key={size}
-                                    type="button"
-                                    className={size === pageSize ? `${css.sizeBtn} ${css.sizeOn}` : css.sizeBtn}
-                                    onClick={() => changePageSize(size)}
-                                  >{size}</button>
-                                ))}
-                              </div>
-                            </div>
+                            {pager}
                           </>
                         )}
                   </>
@@ -1092,107 +1294,322 @@ export function MarketSection(props: MarketSectionProps) {
                       : <div className={css.grid}>{themePlugins.map(themePluginCard)}</div>}
                 </>
               )
-            : Object.keys(installed).length === 0
-              ? <div className={css.empty}>{t('installedEmpty')}</div>
-              : Object.entries(installed).map(([name, spec]) => {
-                  const entry = data === null ? undefined : entryForDep(data.plugins, name, String(spec))
-                  const status = updates[name]
-                  const act = activations[name]
-                  const meta = act !== undefined ? activationMeta(act.state, t) : null
-                  const version = status && status.version ? 'v' + status.version : ''
-                  const specText = String(spec)
-                  const ghSpec = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:#|$)/.exec(specText)
-                  const repoUrl = entry !== undefined ? entry.url : ghSpec !== null ? 'https://github.com/' + ghSpec[1] : null
-                  return (
-                    <div key={name} className={css.irow}>
-                      <div style={{ minWidth: 0 }}>
-                        <div className={css.nm}>{name}{version && <span className={css.owner}>{' ' + version}</span>}</div>
-                        {repoUrl !== null
-                          ? <a className={`${css.spec} ${css.src}`} href={repoUrl} target="_blank" rel="noreferrer" style={{ display: 'inline-block' }}>{specText}</a>
-                          : <div className={css.spec}>{specText}</div>}
-                        {entry !== undefined && (
-                          <div className={`${css.desc} ${css.descTight}`}>
-                            {(entry.description && (entry.description[lang] || entry.description.en)) || ''}
-                          </div>
-                        )}
-                        {act !== undefined && meta !== null && (
-                          <div className={css.act}>
-                            <span
-                              className={meta.dot === 'done' ? css.actLive : meta.dot === 'error' ? css.actBroken : css.actWarn}
-                            >
-                              <StateDot state={meta.dot} size={7} />
-                              {meta.label}
-                            </span>
-                            {act.state !== 'live' && act.reasons.length > 0 && (
-                              <details className={css.actWhy}>
-                                <summary>{t('actWhy')}</summary>
-                                <div className={css.spec}>{act.reasons.join(' / ')}</div>
-                              </details>
-                            )}
-                          </div>
-                        )}
-                        {updatingName === name && (
-                          <div className={css.progress}>
-                            <span className={css.spin} />
-                            <code className={css.grow}>{progressText}</code>
-                            {progressPct !== null && <span className={css.pct}>{progressPct}%</span>}
-                            <button type="button" className={css.cancelBtn} disabled={cancelling} onClick={doCancel}>
-                              {cancelling ? t('cancelling') : t('cancelOp')}
-                            </button>
-                            <div className={css.bar}>
-                              <div
-                                className={progressPct !== null ? css.barFill : `${css.barFill} ${css.barWave}`}
-                                style={progressPct !== null ? { width: `${progressPct}%` } : undefined}
-                              />
+            : (
+                <>
+                  <div className={css.viewBar}>
+                    <button type="button" className={installedView === 'list' ? `${css.viewBtn} ${css.viewOn}` : css.viewBtn} onClick={() => setInstalledView('list')}>{t('tabList')}</button>
+                    <button type="button" className={installedView === 'groups' ? `${css.viewBtn} ${css.viewOn}` : css.viewBtn} onClick={() => setInstalledView('groups')}>{t('tabGroups')}</button>
+                  </div>
+                  {installedView === 'groups'
+                      ? (
+                          <>
+                            <div className={css.groupCreate}>
+                              {creatingGroup
+                                ? (
+                                    <>
+                                      <Input className={css.inlineInput} placeholder={t('groupNamePh')} value={newGroupName} onChange={e => setNewGroupName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') doCreateGroup() }} autoFocus />
+                                      <Button variant="primary" size="sm" onClick={doCreateGroup}>{t('groupCreate')}</Button>
+                                      <Button variant="ghost" size="sm" onClick={() => { setCreatingGroup(false); setNewGroupName('') }}>{t('cancel')}</Button>
+                                    </>
+                                  )
+                                : <Button variant="outline" size="sm" onClick={() => setCreatingGroup(true)}>{t('groupNew')}</Button>}
                             </div>
-                          </div>
-                        )}
-                      </div>
-                      <span className={css.grow} />
-                      {repoUrl !== null && <a className={css.src} href={repoUrl + '#readme'} target="_blank" rel="noreferrer">{t('readme')}</a>}
-                      {updatedNames.includes(name)
-                        ? <span className={css.okState}>{act?.state === 'live' ? t('updatedLive') : t('updated')}</span>
-                        : updatingName === name
-                          ? <Button variant="primary" size="sm" className={css.warnBtn} disabled>{t('updating')}</Button>
-                          : status && status.updateAvailable
-                            ? (
-                                <Button
-                                  variant="primary"
-                                  size="sm"
-                                  className={css.warnBtn}
-                                  disabled={updatingName !== null}
-                                  onClick={() => doUpdate(name)}
-                                >{t('update')}</Button>
-                              )
-                            : status && status.kind === 'linked'
-                              ? <span className={css.owner}>{t('linkedDev')}</span>
-                              : <span className={css.owner}>{t('upToDate')}</span>}
-                      {name !== 'dsh-market' && name !== 'dshmarket' && (
-                        removingName === name
-                          ? <Button variant="outline" size="sm" className={css.dangerBtn} disabled>{t('uninstalling')}</Button>
-                          : removeArmed === name
-                            ? (
-                                <Button
-                                  variant="primary"
-                                  size="sm"
-                                  className={css.dangerArmed}
-                                  onClick={() => doUninstall(name)}
-                                  onMouseLeave={() => setRemoveArmed(null)}
-                                >{t('confirmRemove')}</Button>
-                              )
-                            : (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className={css.dangerBtn}
-                                  disabled={removingName !== null || busyUrl !== null || updatingName !== null}
-                                  onClick={() => setRemoveArmed(name)}
-                                >{t('uninstall')}</Button>
-                              )
-                      )}
-                    </div>
-                  )
-                })}
+                            {groupOrder.length === 0
+                              ? <div className={css.empty}>{t('noGroups')}</div>
+                              : groupOrder.map(gid => {
+                                  const members = groups[gid] ?? []
+                                  const sw = groupSwitchState(members, disabledSet)
+                                  return (
+                                    <div className={css.groupRow} key={gid}>
+                                      <div className={css.groupHead}>
+                                        <button
+                                          type="button"
+                                          role="switch"
+                                          aria-checked={sw === 'on' ? true : sw === 'off' ? false : 'mixed'}
+                                          aria-label={(sw !== 'on' ? t('enable') : t('disable')) + ' ' + gid}
+                                          className={sw === 'on' ? `${css.switch} ${css.switchOn}` : sw === 'mixed' ? `${css.switch} ${css.switchMixed}` : css.switch}
+                                          disabled={togglingName !== null || sw === 'empty'}
+                                          onClick={() => doGroupToggle(gid, sw !== 'on')}
+                                        >
+                                          <span className={css.switchKnob} />
+                                        </button>
+                                        <span className={css.groupName}>{gid}</span>
+                                        {sw === 'mixed' && <span className={css.groupHint}>{t('groupMixed')}</span>}
+                                        <span className={css.grow} />
+                                        <div className={css.groupActions}>
+                                          {renamingGroup === gid
+                                            ? (
+                                                <>
+                                                  <Input className={css.inlineInput} placeholder={t('groupNamePh')} value={renamingValue} onChange={e => setRenamingValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') doRenameGroup(gid) }} autoFocus />
+                                                  <Button variant="primary" size="sm" onClick={() => doRenameGroup(gid)}>{t('groupRename')}</Button>
+                                                  <Button variant="ghost" size="sm" onClick={() => { setRenamingGroup(null); setRenamingValue('') }}>{t('cancel')}</Button>
+                                                </>
+                                              )
+                                            : <Button variant="ghost" size="sm" onClick={() => { setRenamingGroup(gid); setRenamingValue(gid) }}>{t('groupRename')}</Button>}
+                                          {deletingGroup === gid
+                                            ? <Button variant="primary" size="sm" className={css.dangerArmed} onClick={() => doDeleteGroup(gid)}>{t('groupConfirmDelete')}</Button>
+                                            : <Button variant="outline" size="sm" className={css.dangerBtn} onClick={() => setDeletingGroup(gid)}>{t('groupDelete')}</Button>}
+                                          <Button
+                                            variant="outline"
+                                            size="sm"
+                                            onClick={() => setAddPanel(
+                                              addPanel !== null && addPanel.group === gid && addPanel.kind === 'plugin'
+                                                ? null
+                                                : { group: gid, kind: 'plugin' },
+                                            )}
+                                          >{t('groupAdd')}</Button>
+                                          <Button
+                                            variant="outline"
+                                            size="sm"
+                                            disabled={members.some(member => installedThemeNames.has(member))}
+                                            onClick={() => setAddPanel(
+                                              addPanel !== null && addPanel.group === gid && addPanel.kind === 'theme'
+                                                ? null
+                                                : { group: gid, kind: 'theme' },
+                                            )}
+                                          >{t('groupAddTheme')}</Button>
+                                        </div>
+                                      </div>
+                                      {addPanel !== null && addPanel.group === gid && (() => {
+                                        const candidates = addPanel.kind === 'theme'
+                                          ? [...installedThemeNames].filter(name => !members.includes(name))
+                                          : groupableNames.filter(name => !members.includes(name) && !installedThemeNames.has(name))
+                                        return (
+                                          <div className={css.groupAddPanel}>
+                                            {candidates.length === 0
+                                              ? <div className={css.groupHint}>{t('groupAddEmpty')}</div>
+                                              : candidates.map(name => (
+                                                  <div className={css.groupMember} key={name}>
+                                                    <span className={css.nm}>{name}</span>
+                                                    {disabledSet.has(name) && <span className={css.spec}>{t('disabledState')}</span>}
+                                                    <span className={css.grow} />
+                                                    <Button variant="outline" size="sm" onClick={() => doAddMember(gid, name)}>
+                                                      {addPanel.kind === 'theme' ? t('groupAddTheme') : t('groupAdd')}
+                                                    </Button>
+                                                  </div>
+                                                ))}
+                                          </div>
+                                        )
+                                      })()}
+                                      <div className={css.groupMembers}>
+                                        {members.length === 0 && <div className={css.groupHint}>{t('groupEmpty')}</div>}
+                                        {members.map(member => (
+                                          <div className={css.groupMember} key={member}>
+                                            <span className={css.nm}>{member}</span>
+                                            {disabledSet.has(member) && <span className={css.spec}>{t('disabledState')}</span>}
+                                            <span className={css.grow} />
+                                            <button
+                                              type="button"
+                                              role="switch"
+                                              aria-checked={!disabledSet.has(member)}
+                                              aria-label={(disabledSet.has(member) ? t('enable') : t('disable')) + ' ' + member}
+                                              className={disabledSet.has(member) ? css.switch : `${css.switch} ${css.switchOn}`}
+                                              disabled={togglingName !== null}
+                                              onClick={() => doToggle(member, disabledSet.has(member))}
+                                            >
+                                              <span className={css.switchKnob} />
+                                            </button>
+                                            <Button variant="ghost" size="sm" onClick={() => doRemoveMember(gid, member)}>{t('groupRemove')}</Button>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                            <div className={css.sect}>{t('ungrouped')}</div>
+                            {ungroupedNames.length === 0
+                              ? <div className={css.empty}>{t('installedEmpty')}</div>
+                              : ungroupedNames.map(name => {
+                                  const entry = data === null ? undefined : entryForDep(data.plugins, name, String(installed[name]))
+                                  const off = disabledSet.has(name)
+                                  return (
+                                    <div className={css.irow} key={'ug-' + name}>
+                                      <div style={{ minWidth: 0 }}>
+                                        <div className={css.nm}>
+                                          {name}
+                                          {entry?.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
+                                        </div>
+                                        <div className={css.act}>
+                                          {off
+                                            ? <span className={css.actWarn}><StateDot state="warning" size={7} />{t('disabledState')}</span>
+                                            : <span className={css.actLive}><StateDot state="done" size={7} />{t('stateLive')}</span>}
+                                        </div>
+                                      </div>
+                                      <span className={css.grow} />
+                                      {assignFor === name
+                                        ? (
+                                            <div className={css.assignRow}>
+                                              <select className={css.assignSelect} value={assignTarget} onChange={e => setAssignTarget(e.target.value)}>
+                                                <option value="">{t('groupNamePh')}</option>
+                                                {groupOrder.map(gid => <option key={gid} value={gid}>{gid}</option>)}
+                                              </select>
+                                              <Button variant="primary" size="sm" disabled={assignTarget === ''} onClick={() => doAssign(name)}>{t('groupAssign')}</Button>
+                                              <Button variant="ghost" size="sm" onClick={() => { setAssignFor(null); setAssignTarget('') }}>{t('cancel')}</Button>
+                                            </div>
+                                          )
+                                        : <Button variant="outline" size="sm" disabled={groupOrder.length === 0} onClick={() => { setAssignFor(name); setAssignTarget('') }}>{t('groupAssign')}</Button>}
+                                    </div>
+                                  )
+                                })}
+                          </>
+                        )
+                      : Object.keys(installed).length === 0
+                        ? <div className={css.empty}>{t('installedEmpty')}</div>
+                        : Object.entries(installed).map(([name, spec]) => {
+                            const entry = data === null ? undefined : entryForDep(data.plugins, name, String(spec))
+                            const status = updates[name]
+                            const act = activations[name]
+                            const meta = act !== undefined ? activationMeta(act.state, t) : null
+                            const version = status && status.version ? 'v' + status.version : ''
+                            const specText = String(spec)
+                            const ghSpec = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:#|$)/.exec(specText)
+                            const repoUrl = entry !== undefined ? entry.url : ghSpec !== null ? 'https://github.com/' + ghSpec[1] : null
+                            const off = disabledSet.has(name)
+                            // Switches only where they make sense: everything in
+                            // the disable list (to re-enable), plus live/restart
+                            // states. inert/broken rows keep their diagnosis
+                            // without a misleading toggle (#60).
+                            const toggleable = off || (act !== undefined && (act.state === 'live' || act.state === 'restart'))
+                            return (
+                              <div key={name} className={css.irow}>
+                                <div style={{ minWidth: 0 }}>
+                                  <div className={css.nm}>
+                                    {name}
+                                    {entry?.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
+                                    {version && <span className={css.owner}>{' ' + version}</span>}
+                                  </div>
+                                  {repoUrl !== null
+                                    ? <a className={`${css.spec} ${css.src}`} href={repoUrl} target="_blank" rel="noreferrer" style={{ display: 'inline-block' }}>{specText}</a>
+                                    : <div className={css.spec}>{specText}</div>}
+                                  {entry !== undefined && (
+                                    <div className={`${css.desc} ${css.descTight}`}>
+                                      {(entry.description && (entry.description[lang] || entry.description.en)) || ''}
+                                    </div>
+                                  )}
+                                  {off
+                                    ? (
+                                        <div className={css.act}>
+                                          <span className={css.actWarn}>
+                                            <StateDot state="warning" size={7} />
+                                            {t('disabledState')}
+                                          </span>
+                                        </div>
+                                      )
+                                    : act !== undefined && meta !== null && (
+                                        <div className={css.act}>
+                                          <span
+                                            className={meta.dot === 'done' ? css.actLive : meta.dot === 'error' ? css.actBroken : css.actWarn}
+                                          >
+                                            <StateDot state={meta.dot} size={7} />
+                                            {meta.label}
+                                          </span>
+                                          {act.state !== 'live' && act.reasons.length > 0 && (
+                                            <details className={css.actWhy}>
+                                              <summary>{t('actWhy')}</summary>
+                                              <div className={css.spec}>{act.reasons.join(' / ')}</div>
+                                            </details>
+                                          )}
+                                        </div>
+                                      )}
+                                  {entry !== undefined && entry.deprecated === true && (
+                                    <div className={css.deprecate} style={{ marginTop: 8 }}>
+                                      <div className={css.depLine}>
+                                        <span>⚠️ {t('deprecatedWarn')}</span>
+                                        {entry.replacement !== undefined && (
+                                          <span className={css.src}>{t('replacementHint') + ' ' + entry.replacement}</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {updatingName === name && (
+                                    <div className={css.progress}>
+                                      <span className={css.spin} />
+                                      <code className={css.grow}>{progressText}</code>
+                                      {progressPct !== null && <span className={css.pct}>{progressPct}%</span>}
+                                      <button type="button" className={css.cancelBtn} disabled={cancelling} onClick={doCancel}>
+                                        {cancelling ? t('cancelling') : t('cancelOp')}
+                                      </button>
+                                      <div className={css.bar}>
+                                        <div
+                                          className={progressPct !== null ? css.barFill : `${css.barFill} ${css.barWave}`}
+                                          style={progressPct !== null ? { width: `${progressPct}%` } : undefined}
+                                        />
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                                <span className={css.grow} />
+                                {toggleable && (
+                                  <button
+                                    type="button"
+                                    role="switch"
+                                    aria-checked={!off}
+                                    aria-label={(off ? t('enable') : t('disable')) + ' ' + name}
+                                    className={off ? css.switch : `${css.switch} ${css.switchOn}`}
+                                    disabled={togglingName !== null || busyUrl !== null || updatingName !== null || removingName !== null}
+                                    onClick={() => doToggle(name, off)}
+                                  >
+                                    <span className={css.switchKnob} />
+                                  </button>
+                                )}
+                                {repoUrl !== null && <a className={css.src} href={repoUrl + '#readme'} target="_blank" rel="noreferrer">{t('readme')}</a>}
+                                {entry !== undefined && entry.deprecated === true && entry.replacement !== undefined && (() => {
+                                  const replacement = data?.plugins.find(r => r.name === entry.replacement)
+                                  if (replacement === undefined) return null
+                                  return (
+                                    <>
+                                      <Button variant="outline" size="sm" onClick={() => { setCat('all'); setQ(entry.replacement!); setTab('discover') }}>{t('viewReplacement')}</Button>
+                                      {!isInstalled(replacement, installed) && (
+                                        <Button variant="outline" size="sm" onClick={() => setConfirming(replacement)}>{t('installReplacement')}</Button>
+                                      )}
+                                    </>
+                                  )
+                                })()}
+                                {updatedNames.includes(name)
+                                  ? <span className={css.okState}>{act?.state === 'live' ? t('updatedLive') : t('updated')}</span>
+                                  : updatingName === name
+                                    ? <Button variant="primary" size="sm" className={css.warnBtn} disabled>{t('updating')}</Button>
+                                    : status && status.updateAvailable
+                                      ? (
+                                          <Button
+                                            variant="primary"
+                                            size="sm"
+                                            className={css.warnBtn}
+                                            disabled={updatingName !== null}
+                                            onClick={() => doUpdate(name)}
+                                          >{t('update')}</Button>
+                                        )
+                                      : status && status.kind === 'linked'
+                                        ? <span className={css.owner}>{t('linkedDev')}</span>
+                                        : <span className={css.owner}>{t('upToDate')}</span>}
+                                {name !== 'dsh-market' && name !== 'dshmarket' && (
+                                  removingName === name
+                                    ? <Button variant="outline" size="sm" className={css.dangerBtn} disabled>{t('uninstalling')}</Button>
+                                    : removeArmed === name
+                                      ? (
+                                          <Button
+                                            variant="primary"
+                                            size="sm"
+                                            className={css.dangerArmed}
+                                            onClick={() => doUninstall(name)}
+                                            onMouseLeave={() => setRemoveArmed(null)}
+                                          >{t('confirmRemove')}</Button>
+                                        )
+                                      : (
+                                          <Button
+                                            variant="outline"
+                                            size="sm"
+                                            className={css.dangerBtn}
+                                            disabled={removingName !== null || busyUrl !== null || updatingName !== null}
+                                            onClick={() => setRemoveArmed(name)}
+                                          >{t('uninstall')}</Button>
+                                        )
+                                )}
+                              </div>
+                            )
+                          })}
+                </>
+              )}
       </div>
       {showTop && (
         <button
@@ -1224,6 +1641,21 @@ export function MarketSection(props: MarketSectionProps) {
               <a className={css.src} href={confirming.url + '#readme'} target="_blank" rel="noreferrer">{t('readme')}</a>
             </p>
           )}
+          {confirming.deprecated === true && (() => {
+            const replacement = replacementOf(confirming)
+            return (
+              <div className={css.deprecate}>
+                <div className={css.depLine}>
+                  <span>⚠️ {t('deprecatedWarn')}</span>
+                  {replacement !== undefined && (
+                    <a className={css.src} href={replacement.url} target="_blank" rel="noreferrer">
+                      {t('replacementHint') + ' ' + replacement.name}
+                    </a>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
           <p className={css.modalNote}>{'⚠️ ' + t('confirmWarn')}</p>
         </Modal>
       )}

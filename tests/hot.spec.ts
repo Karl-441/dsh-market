@@ -60,3 +60,29 @@ describe('mountClientOnlyDeps vs the user patch layer (#58)', () => {
     }
   })
 })
+
+describe('mountClientOnlyDeps vs the persisted disable list (#60)', () => {
+  it('skips client-only packages the user switched off; still shims enabled ones', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        dependencies: {
+          'dsh-free-plugin': '^1.0.0',
+          'dsh-off-plugin': '^1.0.0',
+        },
+      }))
+      clientOnlyPkg(dir, 'dsh-free-plugin')
+      clientOnlyPkg(dir, 'dsh-off-plugin')
+      // A previous session toggled dsh-off-plugin off; the boot shim must
+      // not bring its fiber back up on the next start.
+      mkdirSync(join(dir, '.dsh-market'), { recursive: true })
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ disabled: ['dsh-off-plugin'] }))
+
+      const mounted = await mountClientOnlyDeps(ctx, dir)
+      expect(mounted).toContain('dsh-free-plugin')
+      expect(mounted).not.toContain('dsh-off-plugin')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
