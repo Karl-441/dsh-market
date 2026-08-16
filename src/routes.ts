@@ -469,7 +469,7 @@ export function mountMarketRoutes(
             sendJson(response, 400, { error: 'the market cannot be disabled from its own page; use the dsh CLI' })
             return
           }
-          if (readInstalled(config.profile)[name] === undefined) {
+          if (readInstalled(config.profile, activeProfileDir)[name] === undefined) {
             sendJson(response, 400, { error: 'plugin is not installed' })
             return
           }
@@ -532,7 +532,7 @@ export function mountMarketRoutes(
             sendJson(response, 400, { ok: false, error: 'unknown group action' })
             return
           }
-          const installed = new Set(Object.keys(readInstalled(config.profile)))
+          const installed = new Set(Object.keys(readInstalled(config.profile, activeProfileDir)))
           // Theme members follow the global one-active-theme rule: a group
           // holds at most one, and enabling one deactivates every other.
           const themeNames = await themes.installedThemeNames()
