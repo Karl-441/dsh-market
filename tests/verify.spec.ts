@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { profileDir } from '../src/profile.ts'
-import { verifyActivation } from '../src/verify.ts'
+import { brokenClientBundles, checkClientBundle, clientBundlePath, newlyBrokenBundles, verifyActivation } from '../src/verify.ts'
 
 let home: string
 beforeEach(() => {
@@ -54,6 +54,52 @@ describe('verifyActivation (P0-2)', () => {
 
     pkg('client-a', { dsh: { client: {} }, main: 'index.js' }, { 'index.js': '' })
     expect(verifyActivation('web', 'client-a', new Set(['client-a']))).toMatchObject({ state: 'live', hot: true, bundle: false })
+  })
+
+  /** #165: a plugin the user wired into their OWN cordis.patch.yml declares
+   * nothing, is not hot-mounted until the next boot, and so read as `broken`
+   * — the market said the install failed verification while the plugin was
+   * working. The profile's patch is a third evidence source beside the loader
+   * inventory and the package's own manifest. */
+  it('reads a package the user own patch loads as restart, not broken', () => {
+    const dir = profile(['@vincent-guo/dsh-web-search-openai'])
+    pkg('@vincent-guo/dsh-web-search-openai', { main: 'index.js' }, { 'index.js': '' })
+    // Without the patch it is what it looks like: bundled, no dsh metadata.
+    expect(verifyActivation('web', '@vincent-guo/dsh-web-search-openai', new Set()))
+      .toMatchObject({ state: 'broken' })
+
+    writeFileSync(
+      join(dir, 'cordis.patch.yml'),
+      '- insert:\n    - id: mine\n      name: "@vincent-guo/dsh-web-search-openai"\n',
+    )
+    expect(verifyActivation('web', '@vincent-guo/dsh-web-search-openai', new Set()))
+      .toMatchObject({ state: 'restart', bundle: true })
+  })
+
+  it('does not let an unrelated or unreadable patch soften a real defect', () => {
+    const dir = profile(['dsh-broken'])
+    pkg('dsh-broken', { main: 'index.js' }, { 'index.js': '' })
+    // Names a DIFFERENT package: no evidence about this one.
+    writeFileSync(join(dir, 'cordis.patch.yml'), '- insert:\n    - id: other\n      name: somebody-else\n')
+    expect(verifyActivation('web', 'dsh-broken', new Set())).toMatchObject({ state: 'broken' })
+
+    // Unparseable: unsure has to leave the stricter verdict standing, since
+    // this evidence only ever moves a verdict AWAY from broken.
+    writeFileSync(join(dir, 'cordis.patch.yml'), '- insert:\n    - id: broken\n      name: [\n')
+    expect(verifyActivation('web', 'dsh-broken', new Set())).toMatchObject({ state: 'broken' })
+  })
+
+  it('disabled when the user switched it off — never "restart to apply"', () => {
+    profile(['dsh-loop'])
+    pkg('dsh-loop', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'index.js' }, { 'index.js': '', 'cordis.patch.yml': SIMPLE_PATCH })
+    // Even when the fiber is somehow still up, the disabled flag wins.
+    const result = verifyActivation('web', 'dsh-loop', new Set(['dsh-loop']), undefined, true)
+    expect(result).toMatchObject({ state: 'disabled', hot: false, bundle: true })
+    expect(result.reasons.join(' ')).toMatch(/disabled|已停用/)
+
+    // A client-only package switched off reads disabled too, not inert.
+    pkg('client-a', { dsh: { client: {} }, main: 'index.js' }, { 'index.js': '' })
+    expect(verifyActivation('web', 'client-a', new Set(), undefined, true)).toMatchObject({ state: 'disabled', bundle: false })
   })
 
   it('restart when in bundles but not live, with the patch reason', () => {
@@ -119,5 +165,289 @@ describe('verifyActivation (P0-2)', () => {
     // 'dsh-loop-tool' is a distinct package; only an exact name or a real
     // `name/` subpath entry counts as the package being live.
     expect(verifyActivation('web', 'dsh-loop', new Set(['dsh-loop-tool']))).toMatchObject({ state: 'restart', bundle: true })
+  })
+})
+
+describe('carrier bundles (#103)', () => {
+  // Real shape of @linxin666/dsh-skins 0.1.17: skin assets + a patch mounting
+  // the skin center, no main/exports/index.js of its own.
+  const CARRIER_PATCH = "- insert:\n    - id: ui-skin-center\n      name: '@linxin666/dsh-client-ui-skin-center'\n"
+
+  it('is not broken when its patch mounts an installed package that has an entry', () => {
+    profile(['@linxin666/dsh-skins'])
+    pkg('@linxin666/dsh-skins', { dsh: { bundle: { patch: './cordis.patch.yml' } } }, {
+      'cordis.patch.yml': CARRIER_PATCH,
+      'skins/ocean.json': '{}',
+    })
+    pkg('@linxin666/dsh-client-ui-skin-center', { main: 'lib/index.js' }, { 'lib/index.js': '' })
+    // Judged by its own artifact it looked like a source-only checkout and was
+    // both flagged broken AND uninstalled by the #18 guard.
+    expect(verifyActivation('web', '@linxin666/dsh-skins', new Set())).toMatchObject({ state: 'restart', bundle: true })
+    expect(verifyActivation('web', '@linxin666/dsh-skins', new Set(['@linxin666/dsh-skins']))).toMatchObject({ state: 'live' })
+  })
+
+  it('stays broken when nothing it mounts is loadable — the #18 guard still bites', () => {
+    profile(['@linxin666/dsh-skins'])
+    pkg('@linxin666/dsh-skins', { dsh: { bundle: { patch: './cordis.patch.yml' } } }, { 'cordis.patch.yml': CARRIER_PATCH })
+    // Target absent entirely (or present without an artifact) → still broken.
+    expect(verifyActivation('web', '@linxin666/dsh-skins', new Set())).toMatchObject({ state: 'broken' })
+    pkg('@linxin666/dsh-client-ui-skin-center', { main: 'lib/index.js' })
+    expect(verifyActivation('web', '@linxin666/dsh-skins', new Set())).toMatchObject({ state: 'broken' })
+  })
+
+  it('a source-only checkout naming ONLY itself is still broken (no self-carrier loophole)', () => {
+    profile(['dsh-unbuilt'])
+    pkg('dsh-unbuilt', { main: 'lib/index.js', dsh: { bundle: { patch: './cordis.patch.yml' } } }, {
+      'cordis.patch.yml': "- insert:\n    - id: unbuilt\n      name: 'dsh-unbuilt'\n",
+    })
+    expect(verifyActivation('web', 'dsh-unbuilt', new Set())).toMatchObject({ state: 'broken' })
+  })
+})
+
+describe('loader inventory beats manifest inference (#135)', () => {
+  it('a live package with no dsh field is live, not broken', () => {
+    // @deepseek-ai/dsh-tools is loaded by the official dsh-base patch and
+    // carries no `dsh` field at all — "no manifest" never implied "never loads".
+    profile([])
+    pkg('@deepseek-ai/dsh-tools', { name: '@deepseek-ai/dsh-tools', main: 'lib/index.js' }, { 'lib/index.js': '' })
+    expect(verifyActivation('web', '@deepseek-ai/dsh-tools', new Set(['@deepseek-ai/dsh-tools'])))
+      .toMatchObject({ state: 'live', hot: true })
+  })
+
+  it('not live and no dsh field: inert as a plain dependency, broken only when listed as a bundle', () => {
+    profile([])
+    pkg('some-lib', { name: 'some-lib', main: 'i.js' }, { 'i.js': '' })
+    expect(verifyActivation('web', 'some-lib', new Set())).toMatchObject({ state: 'inert', bundle: false })
+    // Listed as a bundle but with no dsh surface — that IS a real defect.
+    profile(['some-lib'])
+    expect(verifyActivation('web', 'some-lib', new Set())).toMatchObject({ state: 'broken', bundle: true })
+  })
+
+  it('a live package still reads live when its entry artifact is missing', () => {
+    // Running is running: an unbuilt checkout that the loader nonetheless has
+    // up must not be reported as broken.
+    profile(['half-built'])
+    pkg('half-built', { dsh: { bundle: { patch: './cordis.patch.yml' } }, main: 'lib/index.js' })
+    expect(verifyActivation('web', 'half-built', new Set(['half-built']))).toMatchObject({ state: 'live' })
+    expect(verifyActivation('web', 'half-built', new Set())).toMatchObject({ state: 'broken' })
+  })
+})
+
+describe('activationAfterReplace (post-update verdict)', () => {
+  const live = { state: 'live' as const, reasons: ['已热加载 / live'], bundle: true, hot: true }
+
+  it('downgrades a plugin that was already running to "restart"', async () => {
+    // Measured on a real host: updating the market 1.11.3 → 1.12.2 left the
+    // process reporting 1.11.3 with an unchanged boot id, while the update
+    // route answered "live / 已热加载" in the same response. The loader
+    // inventory cannot tell the two apart — the name was in it before the
+    // update and is in it after, because replacing files on disk does not
+    // unload an imported module.
+    const { activationAfterReplace } = await import('../src/verify.ts')
+    const result = activationAfterReplace(live, true)
+    expect(result.state).toBe('restart')
+    expect(result.hot).toBe(false)
+    expect(result.reasons.join(' ')).toContain('重启后生效')
+  })
+
+  it('leaves a plugin that was NOT running alone', async () => {
+    // Nothing was loaded to shadow the new build, so the fresh mount really
+    // does run the new code. Downgrading this case too would tell users to
+    // restart for a change that already took effect — the mistake #156 was.
+    const { activationAfterReplace } = await import('../src/verify.ts')
+    expect(activationAfterReplace(live, false)).toBe(live)
+  })
+
+  it('does not promote a non-live verdict', async () => {
+    // Only "live" is the wrong answer here. A missing or broken package must
+    // keep saying so; turning it into "restart" would hide a failed update
+    // behind an instruction that cannot fix it.
+    const { activationAfterReplace } = await import('../src/verify.ts')
+    for (const state of ['missing', 'restart', 'disabled', 'broken'] as const) {
+      const other = { ...live, state }
+      expect(activationAfterReplace(other, true)).toBe(other)
+    }
+  })
+})
+
+describe('hasHostHalf (client-only updates need a refresh, not a restart)', () => {
+  it('is false for a dsh.client package with no dsh.bundle', async () => {
+    // Themes and skins. The market shim-mounts them so the loader has a live
+    // row, but no server code runs — the browser re-fetches their bundle from
+    // disk on the next page load. Asking these users to restart would repeat
+    // #156 in a narrower place.
+    const { hasHostHalf } = await import('../src/verify.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hosthalf-'))
+    const pkg = join(dir, 'node_modules', 'theme-only')
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'theme-only', dsh: { client: 'client/client.js' } }))
+    expect(hasHostHalf('web', 'theme-only', dir)).toBe(false)
+
+    const both = join(dir, 'node_modules', 'has-host')
+    mkdirSync(both, { recursive: true })
+    writeFileSync(join(both, 'package.json'), JSON.stringify({ name: 'has-host', dsh: { bundle: 'lib/index.js', client: 'client/client.js' } }))
+    expect(hasHostHalf('web', 'has-host', dir)).toBe(true)
+
+    // A package declaring NEITHER key still loads through the bundle layer,
+    // so it has a host half. Reading `dsh.bundle` alone would call this one
+    // client-only and silently switch the correction off for it.
+    const neither = join(dir, 'node_modules', 'bare')
+    mkdirSync(neither, { recursive: true })
+    writeFileSync(join(neither, 'package.json'), JSON.stringify({ name: 'bare', dsh: {} }))
+    expect(hasHostHalf('web', 'bare', dir)).toBe(true)
+
+    // A package that is not installed cannot have a stale host half either.
+    expect(hasHostHalf('web', 'absent', dir)).toBe(false)
+  })
+})
+
+describe('clientBundlePath', () => {
+  it('resolves the two shapes real plugins ship', () => {
+    expect(clientBundlePath('./client/client.js')).toBe('./client/client.js')
+    expect(clientBundlePath({ default: './client/client.js' })).toBe('./client/client.js')
+    // browser wins over default: it is the condition the host's client
+    // loader actually activates.
+    expect(clientBundlePath({ browser: './b.js', default: './d.js' })).toBe('./b.js')
+    expect(clientBundlePath({ browser: { default: './nested.js' } })).toBe('./nested.js')
+  })
+
+  it('gives up on anything it does not fully model, rather than guessing', () => {
+    // Guessing wrong here means reporting a HEALTHY plugin as corrupt,
+    // which is worse than the silence this replaces — so every unmodelled
+    // shape must resolve to null and skip the check entirely.
+    expect(clientBundlePath(undefined)).toBeNull()
+    expect(clientBundlePath(null)).toBeNull()
+    expect(clientBundlePath(['./a.js'])).toBeNull()
+    expect(clientBundlePath('client/client.js')).toBeNull()       // not relative
+    expect(clientBundlePath('https://cdn.example/x.js')).toBeNull()
+    // import/require describe a Node resolution this does not model, and
+    // could name a different artifact than the browser gets.
+    expect(clientBundlePath({ import: './esm.js', require: './cjs.js' })).toBeNull()
+    // Cyclic-ish nesting terminates instead of recursing forever.
+    const deep = { default: { default: { default: { default: { default: './x.js' } } } } }
+    expect(clientBundlePath(deep)).toBeNull()
+  })
+})
+
+describe('brokenClientBundles — the whole profile, not just what was added (#222)', () => {
+  /** A profile whose manifest actually lists its dependencies. */
+  function withDeps(names: string[]): void {
+    const dir = profileDir('web')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      dependencies: Object.fromEntries(names.map(name => [name, '^1.0.0'])),
+      dsh: { profile: { bundles: [] } },
+    }))
+  }
+
+  it('finds a plugin nobody touched', () => {
+    // The reported shape: updating ONE plugin re-extracts the whole tree, so
+    // an unrelated plugin comes back pristine-and-broken. Checking only what
+    // the operation added is exactly what missed it.
+    profile([])
+    withDeps(['untouched-ui', 'fine-ui'])
+    pkg('untouched-ui', {
+      name: 'untouched-ui', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'function ( { syntax error' })
+    pkg('fine-ui', {
+      name: 'fine-ui', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'module.exports = { ok: 1 }' })
+
+    const broken = brokenClientBundles('web')
+    expect(broken.map(entry => entry.name)).toEqual(['untouched-ui'])
+    expect(broken[0]?.reason).toBeTruthy()
+  })
+
+  it('reports only what an operation broke, never what the profile already carried', () => {
+    // A profile can hold a broken bundle indefinitely. Re-reporting it would
+    // put the user in front of something this operation neither caused nor
+    // can undo — the same rule introducedRisks follows.
+    const before = [{ name: 'already-bad', reason: 'old' }]
+    const after = [{ name: 'already-bad', reason: 'old' }, { name: 'just-broke', reason: 'new' }]
+    expect(newlyBrokenBundles(before, after).map(entry => entry.name)).toEqual(['just-broke'])
+    expect(newlyBrokenBundles(after, after)).toEqual([])
+  })
+
+  it('costs nothing on a profile with no client bundles at all', () => {
+    profile([])
+    withDeps(['host-only'])
+    pkg('host-only', { name: 'host-only', dsh: { bundle: {} }, exports: { '.': './lib/index.js' } })
+    expect(brokenClientBundles('web')).toEqual([])
+  })
+})
+
+describe('checkClientBundle (#222)', () => {
+  it('reports a client bundle that no longer parses', () => {
+    profile([])
+    pkg('broken-ui', {
+      name: 'broken-ui', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'function ( { syntax error' })
+    const result = checkClientBundle('web', 'broken-ui')
+    expect(result.ok).toBe(false)
+    expect(result.reason).toBeTruthy()
+  })
+
+  it('passes a bundle that parses, without executing it', () => {
+    profile([])
+    // If this were EXECUTED the throw would escape and fail the test — the
+    // whole point of compiling rather than running is that plugin code never
+    // gets a turn.
+    pkg('good-ui', {
+      name: 'good-ui', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'throw new Error("must never run")' })
+    expect(checkClientBundle('web', 'good-ui')).toEqual({ ok: true, reason: null })
+  })
+
+  it('does not call an ESM bundle corrupt (module syntax is not a break)', () => {
+    // `new Script` compiles a CLASSIC script, so valid module syntax throws
+    // SyntaxError. This package ships CJS, which is why it went unnoticed —
+    // but a plugin with an ESM client bundle was told its file was corrupt
+    // and offered a rollback for a file that is fine. A false "your plugin
+    // is corrupt" is the one outcome this check must never produce.
+    profile([])
+    for (const [name, source] of [
+      ['esm-export', 'export const ok = 1'],
+      ['esm-import', 'import x from "y"\nconsole.log(x)'],
+      ['esm-default', 'export default function () {}'],
+      ['esm-tla', 'const x = await Promise.resolve(1)\nconsole.log(x)'],
+    ] as const) {
+      pkg(name, {
+        name, dsh: { client: {} }, exports: { './client': './client/client.js' },
+      }, { 'client/client.js': source })
+      expect(checkClientBundle('web', name), `${name} was reported broken`).toEqual({ ok: true, reason: null })
+    }
+    // The limit this buys, stated rather than hidden: an ESM bundle is not
+    // checked AT ALL, including one that really is broken. V8 reports the
+    // `export` token before it reaches the stray brace, and there is no
+    // flag-free way to compile a module here. Silence on ESM is the price of
+    // never crying corrupt on a file that is fine — the direction this
+    // check's contract already chose.
+    pkg('broken-esm', {
+      name: 'broken-esm', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'export const a = 1\n}' })
+    expect(checkClientBundle('web', 'broken-esm').ok).toBe(true)
+
+    // CJS — what this package and most plugins ship — is still checked, and
+    // a real break in one is still caught.
+    pkg('broken-cjs', {
+      name: 'broken-cjs', dsh: { client: {} }, exports: { './client': './client/client.js' },
+    }, { 'client/client.js': 'module.exports = { a: 1 }\n}' })
+    expect(checkClientBundle('web', 'broken-cjs').ok).toBe(false)
+  })
+
+  it('stays silent for everything it cannot judge', () => {
+    profile([])
+    // No dsh.client at all — a host-only plugin has no bundle to check.
+    pkg('host-only', { name: 'host-only', dsh: { bundle: {} }, exports: { '.': './lib/index.js' } })
+    expect(checkClientBundle('web', 'host-only').ok).toBe(true)
+    // dsh.client but an exports shape this resolver does not model.
+    pkg('odd-exports', { name: 'odd-exports', dsh: { client: {} }, exports: { './client': ['./a.js'] } })
+    expect(checkClientBundle('web', 'odd-exports').ok).toBe(true)
+    // Declared but absent: verifyActivation already calls a missing entry
+    // artifact `broken`; reporting it twice in two vocabularies helps nobody.
+    pkg('absent', { name: 'absent', dsh: { client: {} }, exports: { './client': './client/gone.js' } })
+    expect(checkClientBundle('web', 'absent').ok).toBe(true)
+    // Not installed at all.
+    expect(checkClientBundle('web', 'nope').ok).toBe(true)
   })
 })

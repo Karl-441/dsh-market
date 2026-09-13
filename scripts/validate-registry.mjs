@@ -2,21 +2,21 @@
 /**
  * Registry data gate — P1-8 in IMPROVEMENT-PLAN.md ("目录数据治理").
  *
- * Offline, dependency-free validation of data/registry-snapshot.json, the
- * curated plugin catalog the market serves. It catches the defects that would
- * otherwise reach users as a broken install or an ambiguous entry:
+ * Dependency-free validation of the curated plugin catalog the market serves.
+ * It catches the defects that would otherwise reach users as a broken install
+ * or an ambiguous entry:
  *
  *   E1  required string fields present and non-empty
  *   E2  description carries both non-empty "en" and "zh" (the market is bilingual)
  *   E3  npm is null or a syntactically valid npm package name
- *   E4  stars is a non-negative integer
+ *   E4  stars is a non-negative integer, or null when the catalog has no count
  *   E5  url is a github repo or tree(subpath) url
  *   E6  owner field matches the owner parsed from url
  *   E7  category is in the declared whitelist (top-level `categories`)
  *   E8  page is an awesome-dsh-plugin.com/p/ url
  *   E9  added is a YYYY-MM-DD date not in the future
- *   E10 install command references the entry's real target
- *       (npm name, or github:owner/repo[+ #path:] for git entries)
+ *   E10 install command references the entry's real target (npm name,
+ *       github:owner/repo[+ #path:], or a release archive under that same repo)
  *   E11 no duplicate install identity (same repo+subpath, or same npm package)
  *   E12 top-level `count` matches plugins.length
  *
@@ -32,7 +32,49 @@
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const SNAPSHOT = fileURLToPath(new URL('../data/registry-snapshot.json', import.meta.url))
+/**
+ * Where the catalog is read from, live first.
+ *
+ * It used to be a committed `data/registry-snapshot.json`, and that copy went
+ * eleven days stale without anyone noticing — because nothing depends on it
+ * being fresh: the site build downloads its own copy into a throwaway
+ * checkout, and the market has read the live catalog since the bundled
+ * fallback was deliberately removed (see loadRegistry: for a catalog, stale
+ * is not a degraded answer, it is a wrong one).
+ *
+ * So the only thing the committed file did was gate merges on an old copy of
+ * data this repository does not own, while looking enough like the source of
+ * truth that people tried to add plugins to it (#545 by @Icstick, and the
+ * CI guard that exists because it had happened before).
+ *
+ * Now the gate reads what users actually get. A local file still wins when
+ * present, so an offline run works by dropping one in.
+ */
+const CATALOG_URL = process.env.DSHM_REGISTRY_URL ?? 'https://awesome-dsh-plugin.com/plugins.json'
+const LOCAL = fileURLToPath(new URL('../data/registry-snapshot.json', import.meta.url))
+
+/** The catalog and where it came from, or null when neither source answers. */
+async function loadCatalog() {
+  if (fs.existsSync(LOCAL)) {
+    try {
+      return { raw: JSON.parse(fs.readFileSync(LOCAL, 'utf8')), from: LOCAL }
+    } catch (e) {
+      console.error(`validate-registry: cannot read ${LOCAL}: ${e.message}`)
+      process.exit(1)
+    }
+  }
+  try {
+    const response = await fetch(CATALOG_URL, { signal: AbortSignal.timeout(30_000) })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return { raw: await response.json(), from: CATALOG_URL }
+  } catch (e) {
+    // Not a failure: an origin that cannot be reached has not said anything
+    // about the catalog, and failing every unrelated PR on someone else's
+    // outage would teach people to ignore this gate.
+    console.log(`validate-registry: skipped — ${CATALOG_URL} unreachable (${e.message})`)
+    return null
+  }
+}
 
 // npm package-name syntax (scoped or simple), lowercased per npm rules.
 const NPM_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/
@@ -44,21 +86,33 @@ const INSTALL_RE = /^dsh plugin --profile \S+ add (.+)$/
 
 const now = new Date()
 
+/**
+ * The `owner/repo` a GitHub release archive belongs to, or null when the
+ * target is not one. Mirrors releaseTarballTarget in src/sources.ts.
+ * @param target - the install target from the entry's install command.
+ * @returns lowercase `owner/repo`, or null.
+ */
+function releaseTargetRepo(target) {
+  let url
+  try { url = new URL(target) } catch { return null }
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com') return null
+  if (!url.pathname.endsWith('.tgz') && !url.pathname.endsWith('.tar.gz')) return null
+  const segments = url.pathname.split('/').filter(segment => segment !== '')
+  if (segments.length < 4 || segments[2] !== 'releases') return null
+  return `${segments[0]}/${segments[1]}`.toLowerCase()
+}
+
 function fail(errors, entry, code, msg) {
   errors.push({ entry: entry && entry.name ? entry.name : '<unknown>', code, msg })
 }
 
-function main() {
+async function main() {
   const errors = []
   const warnings = []
 
-  let raw
-  try {
-    raw = JSON.parse(fs.readFileSync(SNAPSHOT, 'utf8'))
-  } catch (e) {
-    console.error(`validate-registry: cannot read ${SNAPSHOT}: ${e.message}`)
-    process.exit(1)
-  }
+  const loaded = await loadCatalog()
+  if (loaded === null) return
+  const { raw, from } = loaded
 
   const plugins = raw && raw.plugins
   if (!Array.isArray(plugins)) {
@@ -98,8 +152,18 @@ function main() {
     }
 
     // E4 — stars
-    if (typeof p.stars !== 'number' || !Number.isInteger(p.stars) || p.stars < 0) {
-      fail(errors, p, 'E4', 'stars must be a non-negative integer')
+    //
+    // null is a legitimate value, not a defect: the catalog probes star counts
+    // against the GitHub API, whose anonymous quota it can exhaust, and its own
+    // publish guard ships as long as two thirds of entries have a count. So up
+    // to a third of a perfectly good plugins.json can carry `stars: null`, and
+    // the market renders those cards without the star line already
+    // (`typeof p.stars === 'number' &&`). Requiring a number here made this
+    // check pass only by luck — on the snapshot refresh where 302 entries came
+    // back null it failed the build for data that was doing nothing wrong.
+    if (p.stars !== null && p.stars !== undefined
+      && (typeof p.stars !== 'number' || !Number.isInteger(p.stars) || p.stars < 0)) {
+      fail(errors, p, 'E4', `stars must be a non-negative integer or null, got ${JSON.stringify(p.stars)}`)
     }
 
     // E5 — url shape (repo root or tree subpath)
@@ -139,12 +203,27 @@ function main() {
     if (!im) {
       fail(errors, p, 'E10', `install must match "dsh plugin --profile <p> add <target>": ${p.install}`)
     } else {
-      const target = im[1]
+      // The command quotes a URL target, so the quotes are part of the match.
+      const target = im[1].replace(/^"(.*)"$/, '$1')
       if (p.npm) {
         if (target !== p.npm) fail(errors, p, 'E10', `install target "${target}" does not match npm "${p.npm}"`)
       } else if (um) {
         const expect = `github:${um[1]}/${um[2]}`
-        if (!target.startsWith(expect)) {
+        // An author-published release archive is a legitimate target — it is
+        // the prebuilt path that makes a source-only plugin install in
+        // seconds. What matters is the same thing the market enforces at
+        // install time (releaseTarballTarget in src/sources.ts): the archive
+        // must live under the entry's OWN repo, or an entry could name a
+        // trusted repository and serve bytes from somewhere else. Kept in
+        // step with that function deliberately, including the case-insensitive
+        // owner/repo compare and the refusal of the release CDN hosts, whose
+        // paths carry no owner to bind to.
+        const release = releaseTargetRepo(target)
+        if (release !== null) {
+          if (release !== `${um[1]}/${um[2]}`.toLowerCase()) {
+            fail(errors, p, 'E10', `release archive "${target}" belongs to ${release}, not ${um[1]}/${um[2]}`)
+          }
+        } else if (!target.startsWith(expect)) {
           fail(errors, p, 'E10', `install target "${target}" does not reference ${expect}`)
         }
       }
@@ -174,7 +253,13 @@ function main() {
     if (p.npm) {
       identity = `npm:${p.npm}`
     } else if (um) {
-      const sp = (im && (im[1].match(/#path:\/(.+)$/) || [])[1]) || ''
+      // The subpath comes from `url`, which every entry has, rather than from
+      // the install command, which only carries `#path:` for the github:
+      // shortcut form. An entry that installs from a release archive has no
+      // such fragment, so reading the command collapsed every plugin in one
+      // monorepo onto a single identity and reported unrelated plugins as
+      // duplicates of each other.
+      const sp = um[4] ?? (im && (im[1].match(/#path:\/(.+)$/) || [])[1]) ?? ''
       identity = `gh:${um[1]}/${um[2]}#${sp}`
     } else {
       identity = `??:${p.url}`
@@ -209,7 +294,7 @@ function main() {
   const stars0 = plugins.filter((p) => p.stars === 0).length
 
   // Report
-  const rel = SNAPSHOT.replace(/\\/g, '/').replace(/.*dsh-market\//, 'dsh-market/')
+  const rel = from.replace(/\\/g, '/').replace(/.*dsh-market\//, 'dsh-market/')
   console.log(`validate-registry: ${rel}`)
   console.log(
     `  plugins: ${plugins.length} | categories: ${categories.size} | ` +
@@ -232,4 +317,4 @@ function main() {
   console.log('\n  registry ok ✓')
 }
 
-main()
+await main()

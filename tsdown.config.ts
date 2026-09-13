@@ -12,7 +12,7 @@
  * exact `window.__ModuleLoader__.load({ id: "dshmarket"` prefix.
  */
 import { readFile } from 'node:fs/promises'
-import { basename, dirname, resolve as resolvePath } from 'node:path'
+import { basename, dirname, relative, resolve as resolvePath } from 'node:path'
 import { defineConfig } from 'tsdown'
 import { transform } from 'lightningcss'
 
@@ -23,7 +23,7 @@ const id = 'dshmarket'
  * platform seed entries this bundle actually requires; everything else
  * (nothing today) inlines.
  */
-const CLIENT_EXTERNALS = ['react', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives']
+const CLIENT_EXTERNALS = ['react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives']
 
 /**
  * Virtual-id wrapper keeping module CSS away from tsdown's own css pipeline
@@ -44,9 +44,23 @@ export default defineConfig({
   // Host types ship from lib/types (tsc); dts here would wrap the
   // banner/footer into .d.cts and break parsing.
   dts: false,
-  // Plugin code is fetched outside the host's module graph, so its own bundle
-  // carries the TS/TSX mapping consumed by browser profiling tools.
-  sourcemap: true,
+  // No sourcemap, and the reason is the repository rather than the browser.
+  //
+  // `client.js` is committed (the market must install where build scripts are
+  // blocked) and CI enforces that it matches the source. That is fine for the
+  // bundle itself: 11k unminified lines with real identifiers, which git
+  // merges line by line like any other file — measured across a run of
+  // front-end PRs, it did not conflict once.
+  //
+  // The map is one 789KB line. Every change to it is a whole-file conflict,
+  // for every contributor, every time another front-end PR lands first
+  // (#533 by @liuwenji007, who was hitting it on three stacked PRs). It also
+  // rode along in the published package, where nothing consumed it.
+  //
+  // The debugging it bought was small, because the bundle it maps is already
+  // readable — a stack trace against it names the real functions. Not worth a
+  // permanent tax on everyone who touches the client.
+  sourcemap: false,
   clean: false,
   external: [...CLIENT_EXTERNALS],
   // tsdown auto-externalizes package dependencies; anything NOT in the loader
@@ -71,8 +85,14 @@ export default defineConfig({
       // The virtual id otherwise hides the physical stylesheet from Rolldown's watch graph.
       this.addWatchFile(fileId)
       const source = await readFile(fileId)
+      // The filename feeds lightningcss's `[hash]`. Handing it the absolute
+      // path made the class prefix a fingerprint of the checkout location:
+      // the same commit built `.SOz1_a_root` on one machine and
+      // `.eGUBIq_root` on the CI runner (#472's second half, measured by the
+      // reproducibility guard this repo now runs). Repo-relative with posix
+      // separators is the same input everywhere, including Windows.
       const { code, exports: cssExports } = transform({
-        filename: fileId,
+        filename: relative(process.cwd(), fileId).split('\\').join('/'),
         code: source,
         cssModules: { pattern: '[hash]_[local]' },
         minify: true,

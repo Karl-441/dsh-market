@@ -18,6 +18,9 @@ import { classifyPnpmFailure, pluginArgsFor } from '../src/pnpm-compat.ts'
 
 /** Last release of each major the market supports; behavior is per-major. */
 const PNPM = { 9: '9.15.9', 10: '10.28.2', 11: '11.21.0' } as const
+/** Version pinned by the DSH Desktop 2.0.3 distribution reported in #385. */
+const DESKTOP_PNPM = '11.8.0'
+const GIT_FIXTURE_SHA = '6ebf1e03de0ada9e653d1f8ff82ad905ab761ad9'
 
 const dirs: string[] = []
 afterEach(() => { while (dirs.length > 0) rmSync(dirs.pop()!, { recursive: true, force: true }) })
@@ -35,11 +38,19 @@ function profileFixture(options: { workspace: boolean; extraWorkspaceYaml?: stri
 }
 
 function pnpm(version: string, args: string[], cwd: string): { code: number | null; out: string } {
-  const r = spawnSync('npx', ['-y', `pnpm@${version}`, ...args], {
+  // `npx` is a cmd shim on Windows and cannot be spawned directly without a
+  // shell. Keep argument arrays on both platforms; no package target is ever
+  // interpolated into a command string.
+  const command = process.platform === 'win32' ? (process.env.ComSpec ?? 'cmd.exe') : 'npx'
+  const commandArgs = process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npx', '-y', `pnpm@${version}`, ...args]
+    : ['-y', `pnpm@${version}`, ...args]
+  const r = spawnSync(command, commandArgs, {
     cwd, encoding: 'utf8', timeout: 240_000,
     env: { ...process.env, CI: 'true', COREPACK_ENABLE_STRICT: '0' },
   })
-  return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` }
+  const spawnError = r.error === undefined ? '' : `\n${r.error.name}: ${r.error.message}`
+  return { code: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}${spawnError}` }
 }
 
 function installedVersion(dir: string, name: string): string | null {
@@ -57,12 +68,16 @@ describe('#20 bug 1 — workspace-root add without -w', () => {
     expect(classifyPnpmFailure(out)?.code).toBe('adding-to-root')
   })
 
-  it('pnpm 10 and 11 accept it (the refusal is a pnpm-9-only behavior)', () => {
-    for (const version of [PNPM[10], PNPM[11]]) {
-      const dir = profileFixture({ workspace: true })
-      const { code } = pnpm(version, ['add', 'is-odd@3.0.1'], dir)
-      expect(code, `pnpm ${version}`).toBe(0)
-    }
+  it('pnpm 10 accepts it (the refusal is a pnpm-9-only behavior)', () => {
+    const dir = profileFixture({ workspace: true })
+    const { code } = pnpm(PNPM[10], ['add', 'is-odd@3.0.1'], dir)
+    expect(code, `pnpm ${PNPM[10]}`).toBe(0)
+  })
+
+  it('pnpm 11 accepts it (the refusal is a pnpm-9-only behavior)', () => {
+    const dir = profileFixture({ workspace: true })
+    const { code } = pnpm(PNPM[11], ['add', 'is-odd@3.0.1'], dir)
+    expect(code, `pnpm ${PNPM[11]}`).toBe(0)
   })
 })
 
@@ -92,15 +107,132 @@ describe('the market argv decision works on every pnpm major × profile shape', 
   })
 })
 
+const GIT_FIXTURE_REPO = 'pnpm/test-git-fetch'
+
+/** Lock shapes for `github:owner/repo#sha` — older pnpm used codeload tarballs
+ *  with `gitHosted: true`; current pnpm writes `git+https` / `git+ssh` /
+ *  `type: git`. */
+function githubShortcutLockShape(lockfile: string, sha: string): {
+  hasCodeload: boolean
+  hasGitUrl: boolean
+} {
+  return {
+    hasCodeload: lockfile.includes(`codeload.github.com/${GIT_FIXTURE_REPO}/tar.gz/${sha}`),
+    hasGitUrl: lockfile.includes(`git+https://github.com/${GIT_FIXTURE_REPO}.git#${sha}`)
+      || lockfile.includes(`git+ssh://git@github.com/${GIT_FIXTURE_REPO}.git#${sha}`)
+      || (lockfile.includes(GIT_FIXTURE_REPO) && lockfile.includes('type: git') && lockfile.includes(sha)),
+  }
+}
+
+/** Prefix-proxied codeload lock entry without `gitHosted` — the durable
+ *  orphan v1.34 left behind. Hand-written so the probe does not depend on
+ *  current pnpm's lock shape. */
+function orphanedProxyLockfile(proxied: string): string {
+  return [
+    "lockfileVersion: '9.0'",
+    '',
+    'settings:',
+    '  autoInstallPeers: false',
+    '  excludeLinksFromLockfile: false',
+    '',
+    'importers:',
+    '',
+    '  .:',
+    '    dependencies:',
+    '      test-git-fetch:',
+    `        specifier: ${proxied}`,
+    `        version: ${proxied}`,
+    '',
+    'packages:',
+    '',
+    `  test-git-fetch@${proxied}:`,
+    `    resolution: {tarball: ${proxied}}`,
+    '    version: 1.0.0',
+    '',
+    'snapshots:',
+    '',
+    `  test-git-fetch@${proxied}: {}`,
+    '',
+  ].join('\n')
+}
+
+describe('#385 — pnpm keeps a commit-pinned github shortcut inside its git-hosted trust boundary', () => {
+  it('installs on Desktop and current pnpm, then survives the next dependency mutation', () => {
+    for (const version of [DESKTOP_PNPM, PNPM[11]]) {
+      const dir = profileFixture({ workspace: true })
+      const target = `github:${GIT_FIXTURE_REPO}#${GIT_FIXTURE_SHA}`
+
+      const installed = pnpm(version, ['add', '-w', '--ignore-scripts', target], dir)
+      expect(installed.code, `pnpm ${version}\n${installed.out.slice(-600)}`).toBe(0)
+
+      const lockfile = readFileSync(join(dir, 'pnpm-lock.yaml'), 'utf8')
+      const { hasCodeload, hasGitUrl } = githubShortcutLockShape(lockfile, GIT_FIXTURE_SHA)
+      expect(hasCodeload || hasGitUrl, `pnpm ${version} lock shape:\n${lockfile.slice(0, 800)}`).toBe(true)
+      if (hasCodeload) expect(lockfile).toContain('gitHosted: true')
+
+      // A prefix-proxied codeload URL loses that marker and #385 fails here
+      // with ERR_PNPM_MISSING_TARBALL_INTEGRITY. The pinned github shortcut
+      // remains valid when pnpm verifies the whole lockfile on a later add.
+      // Keep this compatibility probe about lockfile integrity. The fixture
+      // deliberately has a prepare script, whose separate allowBuilds policy
+      // would otherwise stop the second command before this assertion.
+      const mutation = pnpm(version, ['add', '-w', '--ignore-scripts', 'is-odd@3.0.1'], dir)
+      expect(mutation.code, `pnpm ${version}\n${mutation.out.slice(-600)}`).toBe(0)
+      expect(mutation.out).not.toContain('ERR_PNPM_MISSING_TARBALL_INTEGRITY')
+    }
+  })
+
+  it('repairs the orphaned proxy lock entry left by a failed Desktop install', () => {
+    const dir = profileFixture({ workspace: true })
+    const target = `github:${GIT_FIXTURE_REPO}#${GIT_FIXTURE_SHA}`
+    const canonical = `https://codeload.github.com/${GIT_FIXTURE_REPO}/tar.gz/${GIT_FIXTURE_SHA}`
+    const proxied = `https://gh-proxy.com/${canonical}`
+    const lockPath = join(dir, 'pnpm-lock.yaml')
+    const manifestPath = join(dir, 'package.json')
+
+    // Hand-write the bricked profile: manifest + lock both name a
+    // prefix-proxied codeload tarball without gitHosted. Current pnpm writes
+    // git+https/ssh, so poisoning a live seed cannot recreate this mode.
+    const poisoned = orphanedProxyLockfile(proxied)
+    expect(poisoned).toContain(proxied)
+    expect(poisoned).not.toContain('gitHosted: true')
+    writeFileSync(lockPath, poisoned)
+    writeFileSync(manifestPath, JSON.stringify({
+      name: 'dsh-profile-fixture',
+      private: true,
+      dependencies: { 'test-git-fetch': proxied },
+    }))
+
+    const before = pnpm(DESKTOP_PNPM, ['add', '-w', '--ignore-scripts', 'is-odd@3.0.1'], dir)
+    expect(before.out).toContain('ERR_PNPM_MISSING_TARBALL_INTEGRITY')
+
+    // v1.34 restored package.json after the failed install but left the
+    // proxied lock entry behind.
+    writeFileSync(manifestPath, JSON.stringify({ name: 'dsh-profile-fixture', private: true }))
+
+    const repaired = pnpm(DESKTOP_PNPM, ['add', '-w', '--ignore-scripts', target], dir)
+    expect(repaired.code, repaired.out.slice(-600)).toBe(0)
+    const repairedLock = readFileSync(lockPath, 'utf8')
+    expect(repairedLock).not.toContain('gh-proxy.com')
+    const repairedShape = githubShortcutLockShape(repairedLock, GIT_FIXTURE_SHA)
+    expect(repairedShape.hasCodeload || repairedShape.hasGitUrl).toBe(true)
+    if (repairedShape.hasCodeload) expect(repairedLock).toContain('gitHosted: true')
+
+    const mutation = pnpm(DESKTOP_PNPM, ['add', '-w', '--ignore-scripts', 'is-odd@3.0.1'], dir)
+    expect(mutation.code, mutation.out.slice(-600)).toBe(0)
+    expect(mutation.out).not.toContain('ERR_PNPM_MISSING_TARBALL_INTEGRITY')
+  })
+})
+
 describe('#20 bug 2 — modules dir built by pnpm 9, mutated by pnpm 11', () => {
-  it('fails with ERR_PNPM_PUBLIC_HOIST_PATTERN_DIFF, and one `install` + retry recovers', () => {
+  it('fails with a modules-layout mismatch, and one `install` + retry recovers', () => {
     const dir = profileFixture({ workspace: true })
     const seed = pnpm(PNPM[9], ['add', '-w', 'is-odd@3.0.1'], dir)
     expect(seed.code, seed.out.slice(-400)).toBe(0)
 
     const drift = pnpm(PNPM[11], ['add', '-w', 'is-even@1.0.0'], dir)
     expect(drift.code).not.toBe(0)
-    expect(drift.out).toContain('ERR_PNPM_PUBLIC_HOIST_PATTERN_DIFF')
+    expect(drift.out).toMatch(/ERR_PNPM_(?:PUBLIC_HOIST_PATTERN|VIRTUAL_STORE_DIR_MAX_LENGTH)_DIFF/)
     const failure = classifyPnpmFailure(drift.out)
     expect(failure?.code).toBe('hoist-pattern-diff')
     expect(failure?.recoverable).toBe(true)
@@ -165,4 +297,32 @@ describe('#39 — a too-young lockfile entry blocks every later mutation', () =>
       expect(removed.code, `pnpm ${version}: ${removed.out.slice(-300)}`).toBe(0)
     }
   })
+})
+
+describe('a dead file: dependency blocks the whole profile (#436)', () => {
+  // @screamff could not uninstall the market until they removed an unrelated
+  // plugin that had been installed from a .tgz they had since deleted. pnpm
+  // re-resolves every direct dependency before any mutation, so one dead
+  // local path stops everything — and the error names the PATH, never the
+  // package, which is why it read as unrelated to what they were doing.
+  for (const version of [PNPM[10], PNPM[11]]) {
+    it(`pnpm ${version} refuses to remove an unrelated package, and the market names the cause`, () => {
+      const dir = profileFixture({ workspace: true })
+      expect(pnpm(version, ['add', '-w', 'is-odd@3.0.0'], dir).code).toBe(0)
+      const manifestPath = join(dir, 'package.json')
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { dependencies?: Record<string, string> }
+      const ghost = join(dir, 'gone', 'ghost-plugin-1.0.0.tgz')
+      manifest.dependencies = { ...manifest.dependencies, 'ghost-plugin': `file:${ghost}` }
+      writeFileSync(manifestPath, JSON.stringify(manifest))
+
+      const blocked = pnpm(version, ['remove', '-w', 'is-odd'], dir)
+
+      expect(blocked.code, blocked.out.slice(-400)).not.toBe(0)
+      const failure = classifyPnpmFailure(blocked.out, blocked.code)
+      expect(failure?.code, blocked.out.slice(-400)).toBe('missing-local-dependency')
+      // The path is the only handle the user has: it is the literal value of
+      // the offending line in their package.json.
+      expect(failure?.message).toContain('ghost-plugin-1.0.0.tgz')
+    }, 300_000)
+  }
 })
