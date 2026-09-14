@@ -78,8 +78,20 @@ jobs:
         env:
           ADSENSE_CLIENT: ${{ vars.ADSENSE_CLIENT }}
 
+      # Artifacts are keyed by RUN, and a re-run of a failed job keeps the same
+      # run id while uploading a SECOND artifact under the same name — which is
+      # what makes actions/deploy-pages fail with "Multiple artifacts named
+      # github-pages were unexpectedly found for this workflow run. Artifact
+      # count is 2." Naming the artifact per ATTEMPT removes the ambiguity:
+      # `github.run_id` alone would not, because that is the one identifier the
+      # two attempts of a run share. `github.run_attempt` is what differs.
+      # (Old attempts' artifacts are not deleted; upload-pages-artifact keeps
+      # them for a day, and the deploy now only ever looks at its own.)
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
