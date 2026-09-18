@@ -36,8 +36,8 @@ import { applyBundleOrder, mergeOrder, readBundleRules, readBundleStack, validat
 import { applyPreset, deletePreset, listPresets, previewPreset, savePreset } from './presets.ts'
 import { createProfileSnapshot, DEFAULT_MAX_SNAPSHOTS, deleteSnapshot, listSnapshots, restoreSnapshot } from './snapshot.ts'
 import { trialValidate } from './trial.ts'
-import { codeloadAllowBuildsKey, findCatalogEntryForLocal, findInstalledAlias, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitUpdateTarget, installTargetFor, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, workspaceProtocolDeps } from './sources.ts'
-import { failureDetail, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuilds, parsePrepareNotAllowed, pnpmNeverStarted, RELEASE_AGE_OVERRIDE, retargetCollections, validateAddedPlugins, withHoistRecovery } from './install.ts'
+import { codeloadAllowBuildsKey, findCatalogEntryForLocal, findInstalledAlias, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitUpdateTarget, installTargetFor, isGenerationLink, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, workspaceProtocolDeps } from './sources.ts'
+import { failureDetail, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuilds, parsePrepareNotAllowed, pnpmBlockedByOpenFiles, pnpmNeverStarted, RELEASE_AGE_OVERRIDE, retargetCollections, validateAddedPlugins, withHoistRecovery } from './install.ts'
 import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './channels.ts'
 import {
   asRegion, githubProxyManaged, normalizeGithubProxy, REGIONS, routesFor, setActiveRegion,
@@ -487,14 +487,31 @@ export function mountMarketRoutes(
   }
 
   /**
-   * Apply one enable/disable request: persist the choice in state.json, then
-   * drive the live composition. Covers every mount form — hot mounts and
-   * client-only shims go through hotUnmount/hotMount, bundle-layer entries
-   * through setEntryDisabled. Enabling a THEME goes through the caller's
-   * activateTheme instead so the Themes tab's exclusivity stays intact.
+   * Apply one enable/disable request: drive the live composition, then
+   * persist the choice in state.json. Covers every mount form — hot mounts
+   * and client-only shims go through hotUnmount/hotMount, bundle-layer
+   * entries through setEntryDisabled. Enabling a THEME goes through the
+   * caller's activateTheme instead so the Themes tab's exclusivity stays
+   * intact.
+   *
+   * A FAILED ENABLE LEAVES EVERYTHING AS IT WAS (#575). The choice used to be
+   * recorded before the mount was attempted and persisted whatever happened,
+   * so enabling a plugin that crashes on import — deterministically, every
+   * time — wrote "enabled" into state.json anyway. The next boot tried the
+   * import again and died again; the reporter measured 24 restarts before
+   * restoring the disable by hand. The toggle route's patch-layer gate
+   * (@JINITAIMEI121 in #584) closed the same hole in cordis.patch.yml; this
+   * closes it in the market's own store, which is the ONLY durable state a
+   * client-only plugin has — that plugin kind has no bundle rows, so the
+   * patch gate never runs for it.
+   *
+   * A failed DISABLE still persists, and that asymmetry is deliberate: the
+   * user asked for OFF, and a failed unmount leaves the plugin live only for
+   * this session. There the durable disable is the contract, not an error.
    */
   async function setPluginEnabled(name: string, enabled: boolean): Promise<{ ok: boolean; reason?: string }> {
     const dir = activeProfileDir
+    const wasDisabled = disabled.has(name)
     if (enabled) disabled.delete(name)
     else disabled.add(name)
     let ok: boolean
@@ -521,6 +538,13 @@ export function mountMarketRoutes(
         // entry, or already off): the persisted flag is the contract.
         ok = true
       }
+    }
+    if (!ok && enabled) {
+      // Put the in-memory view back before persisting: it is the same object
+      // the route reports as `disabled`, so restoring it keeps the reply, the
+      // store and the patch layer telling one story.
+      if (wasDisabled) disabled.add(name)
+      logEvent('warn', 'toggle', `${name}: enable failed; leaving it disabled rather than persisting a state that crashes at boot (#575)`)
     }
     writeMarketState(dir, { disabled, groups, groupOrder })
     return { ok, reason }
@@ -1156,6 +1180,63 @@ export function mountMarketRoutes(
     try { return new URL(request.url ?? '', 'http://localhost').searchParams.get('force') === '1' } catch { return false }
   }
 
+  /**
+   * The npm package an install with no registry spec of its own is compared
+   * against: a `file:` package matched to the catalog (#429), or a
+   * generation the desktop host linked in (#497). Null for everything else
+   * — a developer's own `link:` checkout is never compared online.
+   */
+  const onlineSourceOf = (
+    plugins: Awaited<ReturnType<typeof loadRegistry>>['plugins'],
+    name: string,
+    spec: string,
+  ): string | null => {
+    if (!spec.toLowerCase().startsWith('file:') && !isGenerationLink(spec)) return null
+    const evidence = readInstalledRepoEvidence(config.profile, name, spec, activeProfileDir)
+    const entry = findCatalogEntryForLocal(plugins, name, evidence.identities, evidence.hints)
+    const target = entry === null ? null : restoreTargetForLocal(entry, evidence.identities)
+    return target !== null && NPM_NAME_RE.test(target) ? target : null
+  }
+
+  /**
+   * The two inputs `checkUpdates` needs beyond the profile itself: which
+   * packages follow a release channel, and which local/generation installs
+   * have a catalog source worth comparing against.
+   *
+   * Extracted so the market page's own listing, the single-package v1
+   * endpoint and the v1 summary cannot drift apart (#602). A client that
+   * renders a badge from the summary and a row from the single check has to
+   * get the same answer, and the only way to guarantee that is for both to
+   * ask the same question.
+   */
+  async function updateCheckInputs(): Promise<{
+    channelFor: Map<string, Channel>
+    onlineSourceFor: Map<string, string>
+  }> {
+    // Only the market itself follows the channel setting (see
+    // MarketSettings.channel): a user opting into betas is volunteering to
+    // try THIS plugin early, not to be handed every other author's
+    // unreleased work.
+    const channel = activeChannel()
+    const installed = readInstalled(config.profile, activeProfileDir)
+    const channelFor = new Map(
+      Object.keys(installed)
+        .filter(name => SELF_NAMES.has(name))
+        .map(name => [name, channel] as const),
+    )
+    const onlineSourceFor = new Map<string, string>()
+    try {
+      const registry = await loadRegistry()
+      for (const [name, spec] of Object.entries(installed)) {
+        const source = onlineSourceOf(registry.plugins, name, spec)
+        if (source !== null) onlineSourceFor.set(name, source)
+      }
+    } catch (error) {
+      logEvent('warn', 'updates', `package source lookup failed — ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { channelFor, onlineSourceFor }
+  }
+
   const disposers = [
     host.webServer.register({
       kind: 'exact',
@@ -1185,6 +1266,10 @@ export function mountMarketRoutes(
             progress: true,
             rollback: true,
             restart: canRestart,
+            // A capability bit, not just an endpoint path: a client that
+            // renders an update badge has to know the aggregate exists
+            // without probing for it (#602).
+            updatesSummary: true,
           },
           restart: {
             supported: canRestart,
@@ -1196,11 +1281,54 @@ export function mountMarketRoutes(
           operationLimit: MAX_UPDATE_OPERATIONS_V1,
           endpoints: {
             updates: '/dsh-market/api/v1/updates',
+            updatesSummary: '/dsh-market/api/v1/updates/summary',
             operations: '/dsh-market/api/v1/operations',
             rollback: '/dsh-market/api/v1/rollback',
             restart: '/dsh-market/api/v1/restart',
           },
         })
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/updates/summary',
+      handler: async (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
+        }
+        try {
+          const { channelFor, onlineSourceFor } = await updateCheckInputs()
+          const updates = await checkUpdates(config.profile, forceCheckFrom(request), activeProfileDir, channelFor, onlineSourceFor)
+          // `packages` carries the same objects the single-package endpoint
+          // returns, so one parser serves both. Only updatable ones: a badge
+          // wants the count, a panel wants the rows, and neither wants to
+          // filter the whole profile itself.
+          const packages = Object.entries(updates)
+            .filter(([, status]) => status.updateAvailable === true)
+            .map(([name, status]) => ({
+              name,
+              source: status.kind,
+              installedVersion: status.current ?? status.version,
+              latestVersion: status.latest,
+            }))
+          sendJson(response, 200, {
+            schema: UPDATE_API_V1_SCHEMA,
+            // The denominator, so a caller can tell "nothing to update" from
+            // "nothing was looked at" — which is the difference between a
+            // badge that is right and one that is merely quiet.
+            checked: Object.keys(readInstalled(config.profile, activeProfileDir)).length,
+            updatable: packages.length,
+            packages,
+          })
+        } catch (error) {
+          sendJson(response, 500, {
+            schema: UPDATE_API_V1_SCHEMA,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
       },
     }),
 
@@ -1216,9 +1344,11 @@ export function mountMarketRoutes(
           }
           try {
             const force = forceCheckFrom(request)
-            const channel = activeChannel()
-            const channelFor = SELF_NAMES.has(name) ? new Map([[name, channel]]) : undefined
-            const update = (await checkUpdates(config.profile, force, activeProfileDir, channelFor))[name]
+            // The same inputs the market page builds, so a generation (#497)
+            // or a catalog-matched local package answers here with the
+            // release it can be compared against rather than with nothing.
+            const { channelFor, onlineSourceFor } = await updateCheckInputs()
+            const update = (await checkUpdates(config.profile, force, activeProfileDir, channelFor, onlineSourceFor))[name]
             if (update === undefined) {
               sendJson(response, 404, { schema: UPDATE_API_V1_SCHEMA, error: 'plugin is not installed' })
               return
@@ -2078,7 +2208,18 @@ export function mountMarketRoutes(
             }
           }
           let patchWrite: { ok: boolean; reason: string | null } | null = null
-          if (patchRows.length > 0) {
+          // #575: a failed ENABLE must not flip the durable patch layer.
+          // The hot-mount failure may be deterministic (a plugin that
+          // crashes on import), and persisting "enabled" turns a transient
+          // in-session error into a boot crash loop — the loader re-applies
+          // the flipped rows on every start. The frontend already shows the
+          // plugin as still disabled, and the next explicit enable retries
+          // cleanly. Disables keep their unconditional write: a failed
+          // unmount leaves the plugin live in-session, and the user asked
+          // for it OFF — the durable disable is then the contract, not an
+          // error.
+          const patchGate = ok || !enabled
+          if (patchRows.length > 0 && patchGate) {
             for (const rowId of patchRows) {
               const result = enabled ? await enableRow(userPatchPath, rowId) : await disableRow(userPatchPath, rowId)
               if (!result.ok && patchWrite === null) patchWrite = result
@@ -2452,29 +2593,17 @@ export function mountMarketRoutes(
         }
         try {
           const force = (request.url ?? '').includes('force=1')
-          // Only the market itself follows the channel setting (see
-          // MarketSettings.channel): a user opting into betas is volunteering
-          // to try THIS plugin early, not to be handed every other author's
-          // unreleased work.
-          const channel = activeChannel()
-          const installed = readInstalled(config.profile, activeProfileDir)
-          const channelFor = new Map(
-            Object.keys(installed)
-              .filter(name => SELF_NAMES.has(name))
-              .map(name => [name, channel] as const),
-          )
-          const onlineSourceFor = new Map<string, string>()
+          const { channelFor, onlineSourceFor } = await updateCheckInputs()
+          // Migration hints are this listing's own business: the market page
+          // is where "this could come from npm now" is offered, and no other
+          // caller acts on it.
           const sourceMigrationFor = new Map<string, { kind: 'git-to-npm'; repo: string; target: string }>()
           try {
             const registry = await loadRegistry()
+            const installed = readInstalled(config.profile, activeProfileDir)
             for (const [name, spec] of Object.entries(installed)) {
               const migration = findGitToNpmMigration(registry.plugins, spec)
               if (migration !== null) sourceMigrationFor.set(name, migration)
-              if (!spec.toLowerCase().startsWith('file:')) continue
-              const evidence = readInstalledRepoEvidence(config.profile, name, spec, activeProfileDir)
-              const entry = findCatalogEntryForLocal(registry.plugins, name, evidence.identities, evidence.hints)
-              const target = entry === null ? null : restoreTargetForLocal(entry, evidence.identities)
-              if (target !== null && NPM_NAME_RE.test(target)) onlineSourceFor.set(name, target)
             }
           } catch (error) {
             logEvent('warn', 'updates', `package source lookup failed — ${error instanceof Error ? error.message : String(error)}`)
@@ -3163,16 +3292,54 @@ sendJson(response, 200, { updates })
             // rollback cannot be verified ("inspect this profile before
             // restarting") would be alarm over an untouched profile, on top
             // of a failure the user already cannot act on from here.
+            // The host holds the package's files open (#608): pnpm staged the
+            // new build beside the old one and the final rename was refused.
+            // Reinstalling the previous build would run that same rename
+            // against the same open handles, so it is not attempted. What can
+            // be put back from here is the durable state — package.json,
+            // which the host may have rewritten before pnpm ran (#65), and
+            // pnpm-lock.yaml, which pnpm rewrites before it links — and
+            // whether the previous build still has a loadable entry is checked
+            // rather than assumed: pnpm clears as much of the target directory
+            // as it can before retrying the rename, so files beside the locked
+            // one can already be gone.
+            const keepLockedBuild = (): { ok: boolean; detail: string | null } => {
+              restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
+              const lock = lockfileCapture.ok
+                ? restoreProfileLockfile(lockfileCapture.snapshot)
+                : { ok: false, detail: lockfileCapture.detail }
+              if (!lock.ok) return lock
+              if (!hasLoadableEntry(activeProfileDir, name)) {
+                return { ok: false, detail: 'the previous build is incomplete (package.json or its entry file is missing)' }
+              }
+              return { ok: true, detail: null }
+            }
             if ((result.exitCode !== 0 || result.timedOut) && !cancelled && result.busy !== true
               && !pnpmNeverStarted(result)) {
-              const rollback = await rollbackAttemptBuild()
-              rollbackOk = rollback.ok
-              rollbackDetail = rollback.detail
-              if (rollback.ok) {
-                logEvent('warn', 'update', `${name}: failed update command; previous build restored and verified`)
+              if (pnpmBlockedByOpenFiles(result)) {
+                const kept = keepLockedBuild()
+                rollbackOk = kept.ok
+                rollbackDetail = kept.detail
+                if (kept.ok) {
+                  // A short answer of its own: the client shows only the tail
+                  // of stderr, which would be the English half of the
+                  // classifier's explanation. The long form stays in stderr.
+                  hardFailureRollbackError = `${name} 更新未生效：运行中的 DSH 占用着它的文件，pnpm 无法替换目录；package.json 与 pnpm-lock.yaml 已恢复为更新前的版本，更新前构建的入口仍在。请完全退出 DSH 后再更新一次。 / ${name} update did not apply: the running DSH holds its files open and pnpm could not replace the directory; package.json and pnpm-lock.yaml are back to the previous version and the previous build still has its entry. Quit DSH completely and update again.`
+                  logEvent('warn', 'update', `${name}: the running host holds its files open, so the update did not apply; package.json and pnpm-lock.yaml restored, previous build still has a loadable entry, nothing reinstalled`)
+                } else {
+                  hardFailureRollbackError = `${name} 更新未生效：运行中的 DSH 占用着它的文件，pnpm 无法替换目录，且更新前的状态未能完整恢复（${kept.detail ?? 'unknown'}）。DSH 运行期间无法重装，请完全退出 DSH 后再更新一次。 / ${name} update did not apply: the running DSH holds its files open and pnpm could not replace the directory, and the previous state could not be fully restored (${kept.detail ?? 'unknown'}). It cannot be reinstalled while DSH is running; quit DSH completely and update again.`
+                  logEvent('error', 'update-rollback', `${name}: the running host holds its files open and the previous state could not be fully restored — ${kept.detail ?? 'unknown'}`)
+                }
               } else {
-                hardFailureRollbackError = `${name} 更新失败，且更新前的构建未能验证恢复（${rollback.detail ?? 'unknown'}）；请先检查该 profile，再重新启动。 / ${name} update failed and restoration of the previous build could not be verified (${rollback.detail ?? 'unknown'}); inspect this profile before restarting.`
-                logEvent('error', 'update-rollback', `${name}: failed update command and restoration of the previous build could not be verified — ${rollback.detail ?? 'unknown'}`)
+                const rollback = await rollbackAttemptBuild()
+                rollbackOk = rollback.ok
+                rollbackDetail = rollback.detail
+                if (rollback.ok) {
+                  logEvent('warn', 'update', `${name}: failed update command; previous build restored and verified`)
+                } else {
+                  hardFailureRollbackError = `${name} 更新失败，且更新前的构建未能验证恢复（${rollback.detail ?? 'unknown'}）；请先检查该 profile，再重新启动。 / ${name} update failed and restoration of the previous build could not be verified (${rollback.detail ?? 'unknown'}); inspect this profile before restarting.`
+                  logEvent('error', 'update-rollback', `${name}: failed update command and restoration of the previous build could not be verified — ${rollback.detail ?? 'unknown'}`)
+                }
               }
             }
             let ok = result.exitCode === 0 && !result.timedOut && !cancelled

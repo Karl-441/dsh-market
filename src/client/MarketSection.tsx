@@ -43,7 +43,7 @@ import type { OperationRecord } from './operations.ts'
 import { Diagnostics } from './Diagnostics.tsx'
 import { exportMarketLog } from './self-check.ts'
 import {
-  api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, githubRouteCandidates, groupSwitchState, humanOutput, installedForCatalog, isInstalled, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
+  api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, githubRouteCandidates, groupSwitchState, humanOutput, installedForCatalog, isGenerationSpec, isInstalled, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
   formatCount, pageItems, pluginName, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, rankThemeScreenshots, readSession, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins,
 } from './market-data.ts'
 import type {
@@ -1539,6 +1539,14 @@ export function MarketSection(props: MarketSectionProps) {
   // (padding, sticky `top`), which drifts silently whenever that CSS
   // changes. The sentinel just reports what's actually true on screen.
   const [catsStuck, setCatsStuck] = useState(false)
+  /** While the sticky header is pinned, expansion is this flag — not
+   * `catsOpen`. Becoming stuck collapses on the SAME render (stuckExpanded
+   * starts false) instead of a follow-up `useLayoutEffect` that flipped
+   * `catsOpen` and forced a second commit; that delayed height change is
+   * what lined up with the host Settings dialog hitching after tab 收放.
+   * An explicit chevron click while stuck sets this true and keeps
+   * `catsOpen` in sync so unstuck restores the user's choice. */
+  const [stuckExpanded, setStuckExpanded] = useState(false)
   const [catsSentinel, setCatsSentinel] = useState<HTMLDivElement | null>(null)
 
   const refreshInstalled = useCallback((force?: boolean) => {
@@ -3635,32 +3643,23 @@ export function MarketSection(props: MarketSectionProps) {
           const overflow = root.scrollHeight - root.clientHeight
           if (overflow <= wrap.offsetHeight) return
         }
-        setCatsStuck(leftView)
+        setCatsStuck(prev => (prev === leftView ? prev : leftView))
       },
       { root: bodyRef.current, threshold: 0 },
     )
     observer.observe(catsSentinel)
     return () => observer.disconnect()
   }, [catsSentinel])
-  /**
-   * Becoming stuck auto-collapses an open row — a REAL `catsOpen` flip, not
-   * a display-only override. An earlier version faked this by computing a
-   * separate "effectively open" value for rendering while leaving `catsOpen`
-   * itself true; the chevron's own click handler only ever toggled the real
-   * `catsOpen`, so while stuck it flipped a value the render path had
-   * already stopped consulting — clicking "expand" did nothing visible
-   * (reported: "吸顶滚动了之后，展开没反应了"). Driving the same state the
-   * chevron drives means the chevron always works, stuck or not.
-   */
-  const catsAutoCollapsedRef = useRef(false)
-  useLayoutEffect(() => {
-    if (catsStuck) {
-      if (catsOpen) { setCatsOpen(false); catsAutoCollapsedRef.current = true }
-    } else if (catsAutoCollapsedRef.current) {
-      setCatsOpen(true)
-      catsAutoCollapsedRef.current = false
-    }
+  // Drop any in-pin expand once the header unpins, so the next pin starts
+  // collapsed without a rising-edge setState in the observer.
+  useEffect(() => {
+    if (!catsStuck) setStuckExpanded(false)
   }, [catsStuck])
+  /** Expanded chips + chevron share one value. Stuck uses `stuckExpanded`
+   * so pinning collapses without rewriting `catsOpen` in a layout effect
+   * (see stuckExpanded state). Leaving stuck falls back to `catsOpen`,
+   * which still holds the pre-pin / in-pin user choice. */
+  const catsExpanded = catsStuck ? stuckExpanded : catsOpen
 
   /**
    * A fresh install (hotUrls/hotNames) and a toggle/group action
@@ -3743,7 +3742,7 @@ export function MarketSection(props: MarketSectionProps) {
                 >{updatingName === self ? t('updating') : status.restoreRequired === true ? t('restoreOnline') : t('marketUpdate')}</Button>
               )
           })()}
-          {reminderBatchUpdatableNames.length >= 2 && (
+          {reminderBatchUpdatableNames.length >= 1 && (
             <Button
               variant="primary"
               size="sm"
@@ -4008,7 +4007,10 @@ export function MarketSection(props: MarketSectionProps) {
       <div
         className={css.body}
         ref={bodyRef}
-        onScroll={e => setShowTop(e.currentTarget.scrollTop > 400)}
+        onScroll={e => {
+          const show = e.currentTarget.scrollTop > 400
+          setShowTop(prev => (prev === show ? prev : show))
+        }}
       >
         {tab === 'backup'
           ? (
@@ -4165,12 +4167,12 @@ export function MarketSection(props: MarketSectionProps) {
                         {(() => {
                           // Collapsed, the selected category is pulled to the front so it never hides.
                           // Whenever collapsed (default, or auto-collapsed by the sticky
-                          // header going stuck — see catsAutoCollapsedRef above), a stuck
+                          // header going stuck — see catsExpanded / stuckExpanded), a stuck
                           // header uses the one-row budget instead of the two-row one so an
                           // already-open list that just got pinned shrinks further.
                           const budget = catsStuck ? visibleCatsOneRow : visibleCats
-                          const ordered = orderedCategories(categories, cat, catsOpen, budget)
-                          const shown = catsOpen || budget === null ? ordered : ordered.slice(0, Math.max(0, budget - 1))
+                          const ordered = orderedCategories(categories, cat, catsExpanded, budget)
+                          const shown = catsExpanded || budget === null ? ordered : ordered.slice(0, Math.max(0, budget - 1))
                           return (
                             <>
                               <Pill data-chip="1" active={cat === 'all'} onClick={() => setCat('all')}>{t('all') + ' (' + formatCount(data!.count) + ')'}</Pill>
@@ -4186,13 +4188,12 @@ export function MarketSection(props: MarketSectionProps) {
                                 variant="ghost"
                                 size="sm"
                                 className={css.catsToggle}
-                                icon={catsOpen ? <IconChevronUpOutline14 size={14} /> : <IconChevronDownOutline14 size={14} />}
-                                aria-label={catsOpen ? t('catsLess') : t('catsMore')}
+                                icon={catsExpanded ? <IconChevronUpOutline14 size={14} /> : <IconChevronDownOutline14 size={14} />}
+                                aria-label={catsExpanded ? t('catsLess') : t('catsMore')}
                                 onClick={() => {
-                                  // An explicit click always wins — don't let the next
-                                  // stuck/unstuck transition second-guess it.
-                                  catsAutoCollapsedRef.current = false
-                                  setCatsOpen(o => !o)
+                                  const next = !catsExpanded
+                                  if (catsStuck) setStuckExpanded(next)
+                                  setCatsOpen(next)
                                 }}
                               />
                             </>
@@ -4589,7 +4590,13 @@ export function MarketSection(props: MarketSectionProps) {
                             const missing = pendingBackup !== null && !installedFiles.includes(name)
                             const entry = data === null ? undefined : catalogEntryForInstalled(data.plugins, name, String(spec), repoIdentities[name], repoHints[name])
                             const status = updates[name]
-                            const localDev = /^(?:link|file):/i.test(String(spec)) || status?.kind === 'linked'
+                            // A generation is the desktop host's own install (#497):
+                            // the host updates it, the market only says a newer
+                            // release exists. Not a development checkout, so no
+                            // "local" tag and no restore — the host would put the
+                            // generation straight back.
+                            const generation = status?.kind === 'generation' || isGenerationSpec(String(spec))
+                            const localDev = !generation && (/^(?:link|file):/i.test(String(spec)) || status?.kind === 'linked')
                             const act = activations[name]
                             const meta = act !== undefined ? activationMeta(act.state, t) : null
                             const version = status && status.version ? 'v' + status.version : ''
@@ -4703,7 +4710,7 @@ export function MarketSection(props: MarketSectionProps) {
                                       one quiet line in the flow the row already
                                       reserves for conditional content, so rows
                                       without it are pixel-identical to before. */}
-                                  {status !== undefined && status.updateAvailable && (
+                                  {status !== undefined && (status.updateAvailable || (generation && status.latest != null)) && (
                                     <div className={css.noteRow}>
                                       <button
                                         type="button"
@@ -4845,6 +4852,8 @@ export function MarketSection(props: MarketSectionProps) {
                                     ? <span className={`${css.metaTag} ${css.metaTagOk}`}>{act?.state === 'live' ? t('updatedLive') : t('updated')}</span>
                                     : updatingName === name
                                       ? <Button variant="primary" size="sm" className={css.warnBtn} disabled>{t('updating')}</Button>
+                                      : status !== undefined && generation && status.latest != null
+                                        ? <span className={css.metaTag} title={t('hostUpdateHint')}>{t('hostUpdateReady').replace('{0}', status.latest)}</span>
                                       : status && status.updateAvailable
                                         ? (
                                             <Button

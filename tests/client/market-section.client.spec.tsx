@@ -232,6 +232,27 @@ describe('api() base resolution (#345)', () => {
 })
 
 describe('MarketSection (jsdom)', () => {
+  it('offers the top update-all button when exactly one plugin is updatable (#555)', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-loop': '^1.0.0' },
+        live: ['dsh-loop'],
+        disabled: [],
+        notes: {},
+      },
+      '/dsh-market/updates': {
+        updates: {
+          'dsh-loop': {
+            kind: 'npm', version: '1.0.0', current: '1.0.0', latest: '1.2.0', updateAvailable: true,
+          },
+        },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    expect(await screen.findByRole('button', { name: /Update all \(1\)/ })).toBeTruthy()
+  })
+
   it('renders the catalog with install buttons once the registry loads', async () => {
     render(<MarketSection {...props()} />)
     expect(await screen.findByText('dsh-loop')).toBeTruthy()
@@ -2730,6 +2751,30 @@ describe('local-dev restore', () => {
     })
   })
 
+  it('names a newer release for a host-installed generation without a button (#497)', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { 'dsh-loop': 'link:../.generations/live/dsh-loop+1.0.0+7aba605c3145/node_modules/dsh-loop' },
+        live: [],
+      },
+      '/dsh-market/updates': {
+        updates: { 'dsh-loop': { kind: 'generation', version: '1.0.0', current: '1.0.0', latest: '1.1.0', updateAvailable: false } },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    expect(await screen.findByText(en.hostUpdateReady.replace('{0}', '1.1.0'))).toBeTruthy()
+    // The host reconciles its generations at startup: an update applied here
+    // would silently revert, and a restore would tear down the host's own
+    // install. Neither is offered, and the row is not tagged as local work.
+    expect(screen.queryByRole('button', { name: en.update })).toBeNull()
+    expect(screen.queryByRole('button', { name: en.restoreOnline })).toBeNull()
+    expect(screen.queryByRole('button', { name: en.restore })).toBeNull()
+    expect(screen.queryByText(en.linkedDev)).toBeNull()
+  })
+
   it('does not offer restore when the linked plugin is not in the catalog', async () => {
     stubFetch({
       '/dsh-market/installed': { profile: 'web', installed: { 'mystery-plug': 'link:../mystery' }, live: [] },
@@ -3850,20 +3895,19 @@ describe('category row expansion', () => {
       // would use — proves the stuck path swapped budgets, not just re-ran
       // the ordinary collapse.
       expect(chipCount()).toBe(3) // "all" pill + 2 categories
-      // The auto-collapse is a REAL catsOpen flip, so the chevron now reads
-      // "more" (collapsed), not "less" — and, critically, clicking it must
-      // still work. An earlier version computed a display-only "effectively
-      // open" value while leaving catsOpen genuinely true, so the chevron's
-      // click handler toggled a value the render path had stopped
-      // consulting — clicking it while stuck did nothing visible (reported:
-      // "吸顶滚动了之后，展开没反应了").
+      // Auto-collapse is render-derived (`catsExpanded = stuckExpanded` while
+      // pinned, starting false) — not a follow-up catsOpen flip. Chevron still
+      // tracks catsExpanded, and clicking it while stuck must keep working
+      // (earlier display-only overrides left catsOpen true and ignored the
+      // click — "吸顶滚动了之后，展开没反应了").
       const moreButton = screen.getByLabelText(re(en.catsMore))
       fireEvent.click(moreButton)
       await waitFor(() => expect(chipCount()).toBe(openCount))
       expect(screen.getByLabelText(re(en.catsLess))).toBeTruthy()
 
       // An explicit re-open while still stuck must survive scrolling back to
-      // the top — the auto-collapse must not fight the user's own choice.
+      // the top — catsOpen stays aligned with the chevron so unstuck keeps
+      // the open row.
       onChange!({ isIntersecting: true })
       await waitFor(() => expect(chipCount()).toBe(openCount))
       expect(screen.getByLabelText(re(en.catsLess))).toBeTruthy()

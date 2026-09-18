@@ -112,7 +112,7 @@ export async function withHoistRecovery(
       logEvent('warn', 'install', `a too-young release blocks pnpm's lockfile verification (#39) — retrying once with ${RELEASE_AGE_OVERRIDE}`)
       result = await run(profile, [pluginArgs[0], RELEASE_AGE_OVERRIDE, ...pluginArgs.slice(1)])
     } else if (
-      failure?.code === 'fetch-404'
+      (failure?.code === 'fetch-404' || failure?.code === 'no-matching-version')
       && isUnpublishedHostPeer(failure.pkg, profile, profileDirectory)
       && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')
       && !pluginArgs.includes(AUTO_INSTALL_PEERS_OFF)
@@ -189,6 +189,24 @@ export async function withHoistRecovery(
  */
 export function pnpmNeverStarted(result: InstallResult): boolean {
   return classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'pnpm-unusable'
+}
+
+/**
+ * Whether pnpm failed because the running host holds the package's files
+ * open, so nothing pnpm runs from inside that host can replace them.
+ *
+ * Worth asking for the same reason as pnpmNeverStarted: the update route
+ * answers a failed run by reinstalling the previous build, and that reinstall
+ * performs the very rename that just failed, against the same open handles
+ * (#608 by @Euezb). It cannot win — pnpm retries the rename for about three
+ * minutes before giving up — and the route then told the user their profile
+ * might be broken and to inspect it before restarting, when nothing had been
+ * reinstalled and the previous build was still there to be checked.
+ * @param result - the failed run.
+ * @returns true when pnpm was stopped by files the host holds open.
+ */
+export function pnpmBlockedByOpenFiles(result: InstallResult): boolean {
+  return classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'windows-file-locked'
 }
 
 /**

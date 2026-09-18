@@ -40,6 +40,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			setSelfUpdateReady: "有新版本",
 			setSelfUpdateHint: "更新会下载新版本，重启后生效。",
 			setSelfUpToDateHint: "",
+			setSelfHostManagedHint: "这份市场由桌面宿主安装，新版本请在桌面端更新。",
 			setSelfUpdate: "更新",
 			setSelfUpdatedHint: "已下载完成。重启 DeepSeek Harness 后新版本才会生效——前端页面会立即更新，服务端不会。",
 			setRegion: "下载区域",
@@ -154,6 +155,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			updateFail: "更新失败",
 			upToDate: "已是最新",
 			linkedDev: "本地开发",
+			hostUpdateReady: "有新版本 {0}",
+			hostUpdateHint: "这份由桌面宿主安装和更新，市场只提醒，不在这里更新",
 			notesLink: "更新内容",
 			notesRelease: "版本说明",
 			notesCommits: "提交记录",
@@ -570,6 +573,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			setSelfUpdateReady: "New version available:",
 			setSelfUpdateHint: "Updating downloads the new version; it takes effect after a restart.",
 			setSelfUpToDateHint: "",
+			setSelfHostManagedHint: "This copy was installed by the desktop host; update it from the desktop app.",
 			setSelfUpdate: "Update",
 			setSelfUpdatedHint: "Downloaded. Restart DeepSeek Harness for it to take effect — the frontend updates at once, the server does not.",
 			setRegion: "Download region",
@@ -684,6 +688,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			updateFail: "Update failed",
 			upToDate: "Up to date",
 			linkedDev: "local",
+			hostUpdateReady: "New version {0}",
+			hostUpdateHint: "Installed and updated by the desktop host; the market only reports it",
 			notesLink: "What changed",
 			notesRelease: "Release notes",
 			notesCommits: "Commits",
@@ -1268,6 +1274,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		function installedForCatalog(installed, bundles) {
 			return Object.fromEntries([...bundles.map((name) => [name, "*"]), ...Object.entries(installed)]);
 		}
+		/**
+		* A `link:` the desktop host wrote for one of its generations (#497). The
+		* test the server applies (`isGenerationLink` in sources.ts), repeated here
+		* because the client bundle cannot import server modules.
+		*/
+		function isGenerationSpec(spec) {
+			return /^link:/i.test(spec) && /(?:^|[\\/])\.generations[\\/]live[\\/]/i.test(spec);
+		}
 		function groupSwitchState(members, disabled) {
 			const list = members ?? [];
 			if (list.length === 0) return "empty";
@@ -1577,10 +1591,20 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* dependency's spec pins a github repo AND the entry states one, the repos
 		* decide — the loose name/npm identities only apply when at least one side
 		* carries no repo evidence (npm installs, non-github entries).
+		*
+		* Repo evidence only ever decides by repository ROOT. A monorepo catalog
+		* entry states `owner/repo#path:/pkg` while an npm-installed manifest
+		* usually states the bare `owner/repo` (it rarely declares
+		* `repository.directory`), and reading that asymmetry as a source conflict
+		* kept a genuinely installed subpackage from ever reading as installed.
 		*/
+		/** Repository root: the part before any `#path:/…` subpath selection. */
+		function repoRoots(ids) {
+			return new Set([...ids].map((id) => id.split("#path:/")[0]));
+		}
 		function sameSourceConflict(plugin, spec, repoIdentities = []) {
-			const entry = entryRepoIds(plugin);
-			const dep = depRepoIds(spec, repoIdentities);
+			const entry = repoRoots(entryRepoIds(plugin));
+			const dep = repoRoots(depRepoIds(spec, repoIdentities));
 			if (entry.size === 0 || dep.size === 0) return false;
 			for (const id of dep) if (entry.has(id)) return false;
 			return true;
@@ -1631,6 +1655,56 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			for (const id of entryIdentities(plugin)) if (dep.has(id)) return true;
 			return false;
 		}
+		/**
+		* The same memo, for the branch #262 left behind (#589).
+		*
+		* `looseMatchCount` above covers dependencies installed by version. A
+		* `link:` or `file:` dependency takes the other branch, into
+		* `findCatalogEntryForLocal`, which walks the whole catalog at least twice
+		* per call — once to filter by name, once to collect `/tree/` repos — and
+		* up to twice more when there are identities to probe. Both callers below
+		* run once per rendered card. The reporter profiled ~300ms per repaint at
+		* 24 cards against a 3,627-entry catalog where a version-pinned dependency
+		* paid 1.1ms; a local benchmark measured ~38ms per render at that shape,
+		* and ~1.4s at 96 cards with eight local dependencies.
+		*
+		* The inner key carries the EVIDENCE, not just the name. Installing a plugin
+		* hands the next render a fresh identities array while the catalog array
+		* stays the same, so a name-only key would answer the post-install question
+		* with the pre-install result — which is the same-named-fork confusion #485
+		* asked this matcher to stop making, reintroduced as a cache bug.
+		*
+		* A miss is cached as `null`, which is why the "not cached yet" sentinel
+		* has to be `undefined`: `null` is a real answer here, and it costs the
+		* same full scan to establish as a hit does. It is also the common case —
+		* a checkout you are developing is usually not in the catalog at all.
+		*
+		* The invariant this rests on, stated because the WeakMap cannot enforce it:
+		* the catalog array and the entries inside it are frozen once handed here. A
+		* refetch replaces the array — which is what the outer key is for — but an
+		* in-place `push`, `sort` or `reverse`, or editing a row's `url`, would keep
+		* the key and change the answer. Order is load-bearing too: the matcher
+		* returns the FIRST row that fits. Nothing in the client does any of this
+		* today; `visiblePlugins` and `themePlugins` both sort copies.
+		*/
+		const localMatchCache = /* @__PURE__ */ new WeakMap();
+		function cachedEntryForLocal(plugins, name, identities, hints) {
+			let byKey = localMatchCache.get(plugins);
+			if (byKey === void 0) {
+				byKey = /* @__PURE__ */ new Map();
+				localMatchCache.set(plugins, byKey);
+			}
+			const key = JSON.stringify([
+				name,
+				identities,
+				hints
+			]);
+			const hit = byKey.get(key);
+			if (hit !== void 0) return hit;
+			const entry = findCatalogEntryForLocal(plugins, name, identities, hints);
+			byKey.set(key, entry);
+			return entry;
+		}
 		/** The installed dependency name a registry entry corresponds to, or null. */
 		function matchInstalledName(plugin, installed, repoIdentities = {}, plugins, repoHints = {}) {
 			const ids = entryIdentities(plugin);
@@ -1639,7 +1713,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				const repos = repoIdentities[name] ?? [];
 				if (/^(?:link|file):/i.test(specStr)) {
 					if (plugins === void 0) continue;
-					const entry = findCatalogEntryForLocal(plugins, name, repos, repoHints[name] ?? []);
+					const entry = cachedEntryForLocal(plugins, name, repos, repoHints[name] ?? []);
 					if (entry !== null && entry.url === plugin.url) return name;
 					continue;
 				}
@@ -2041,7 +2115,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		}
 		/** Catalog row for an installed dependency — strict for local link:/file: specs. */
 		function catalogEntryForInstalled(plugins, name, spec, repoIdentities = [], repoHints = []) {
-			if (/^(?:link|file):/i.test(spec)) return findCatalogEntryForLocal(plugins, name, repoIdentities, repoHints) ?? void 0;
+			if (/^(?:link|file):/i.test(spec)) return cachedEntryForLocal(plugins, name, repoIdentities, repoHints) ?? void 0;
 			return entryForDep(plugins, name, spec, repoIdentities, repoHints);
 		}
 		//#endregion
@@ -6462,6 +6536,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			const [visibleCatsOneRow, setVisibleCatsOneRow] = (0, react.useState)(null);
 			const catsWrapRef = (0, react.useRef)(null);
 			const [catsStuck, setCatsStuck] = (0, react.useState)(false);
+			/** While the sticky header is pinned, expansion is this flag — not
+			* `catsOpen`. Becoming stuck collapses on the SAME render (stuckExpanded
+			* starts false) instead of a follow-up `useLayoutEffect` that flipped
+			* `catsOpen` and forced a second commit; that delayed height change is
+			* what lined up with the host Settings dialog hitching after tab 收放.
+			* An explicit chevron click while stuck sets this true and keeps
+			* `catsOpen` in sync so unstuck restores the user's choice. */
+			const [stuckExpanded, setStuckExpanded] = (0, react.useState)(false);
 			const [catsSentinel, setCatsSentinel] = (0, react.useState)(null);
 			const refreshInstalled = (0, react.useCallback)((force) => {
 				fetch(api("/dsh-market/installed"), { cache: "no-store" }).then((res) => res.json()).then((body) => {
@@ -8518,7 +8600,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					if (leftView && root !== null && wrap !== null) {
 						if (root.scrollHeight - root.clientHeight <= wrap.offsetHeight) return;
 					}
-					setCatsStuck(leftView);
+					setCatsStuck((prev) => prev === leftView ? prev : leftView);
 				}, {
 					root: bodyRef.current,
 					threshold: 0
@@ -8526,28 +8608,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				observer.observe(catsSentinel);
 				return () => observer.disconnect();
 			}, [catsSentinel]);
-			/**
-			* Becoming stuck auto-collapses an open row — a REAL `catsOpen` flip, not
-			* a display-only override. An earlier version faked this by computing a
-			* separate "effectively open" value for rendering while leaving `catsOpen`
-			* itself true; the chevron's own click handler only ever toggled the real
-			* `catsOpen`, so while stuck it flipped a value the render path had
-			* already stopped consulting — clicking "expand" did nothing visible
-			* (reported: "吸顶滚动了之后，展开没反应了"). Driving the same state the
-			* chevron drives means the chevron always works, stuck or not.
-			*/
-			const catsAutoCollapsedRef = (0, react.useRef)(false);
-			(0, react.useLayoutEffect)(() => {
-				if (catsStuck) {
-					if (catsOpen) {
-						setCatsOpen(false);
-						catsAutoCollapsedRef.current = true;
-					}
-				} else if (catsAutoCollapsedRef.current) {
-					setCatsOpen(true);
-					catsAutoCollapsedRef.current = false;
-				}
+			(0, react.useEffect)(() => {
+				if (!catsStuck) setStuckExpanded(false);
 			}, [catsStuck]);
+			/** Expanded chips + chevron share one value. Stuck uses `stuckExpanded`
+			* so pinning collapses without rewriting `catsOpen` in a layout effect
+			* (see stuckExpanded state). Leaving stuck falls back to `catsOpen`,
+			* which still holds the pre-pin / in-pin user choice. */
+			const catsExpanded = catsStuck ? stuckExpanded : catsOpen;
 			/**
 			* A fresh install (hotUrls/hotNames) and a toggle/group action
 			* (refreshNames) both end in the same place — "reload the page" — and
@@ -8628,7 +8696,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 											children: updatingName === self ? t("updating") : status.restoreRequired === true ? t("restoreOnline") : t("marketUpdate")
 										});
 									})(),
-									reminderBatchUpdatableNames.length >= 2 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
+									reminderBatchUpdatableNames.length >= 1 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
 										variant: "primary",
 										size: "sm",
 										disabled: updatingAll || updatingName !== null || busyUrl !== null || removingName !== null,
@@ -8997,7 +9065,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						className: Market_module_css_default.body,
 						ref: bodyRef,
-						onScroll: (e) => setShowTop(e.currentTarget.scrollTop > 400),
+						onScroll: (e) => {
+							const show = e.currentTarget.scrollTop > 400;
+							setShowTop((prev) => prev === show ? prev : show);
+						},
 						children: tab === "backup" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 							className: Market_module_css_default.backupGrid,
 							children: [
@@ -9279,8 +9350,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 											className: visibleCats === null ? `${Market_module_css_default.catsWrap} ${Market_module_css_default.catsCollapsed}` : Market_module_css_default.catsWrap,
 											children: (() => {
 												const budget = catsStuck ? visibleCatsOneRow : visibleCats;
-												const ordered = orderedCategories(categories, cat, catsOpen, budget);
-												const shown = catsOpen || budget === null ? ordered : ordered.slice(0, Math.max(0, budget - 1));
+												const ordered = orderedCategories(categories, cat, catsExpanded, budget);
+												const shown = catsExpanded || budget === null ? ordered : ordered.slice(0, Math.max(0, budget - 1));
 												return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 													/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Pill, {
 														"data-chip": "1",
@@ -9298,11 +9369,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 														variant: "ghost",
 														size: "sm",
 														className: Market_module_css_default.catsToggle,
-														icon: catsOpen ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronUpOutline14, { size: 14 }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutline14, { size: 14 }),
-														"aria-label": catsOpen ? t("catsLess") : t("catsMore"),
+														icon: catsExpanded ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronUpOutline14, { size: 14 }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconChevronDownOutline14, { size: 14 }),
+														"aria-label": catsExpanded ? t("catsLess") : t("catsMore"),
 														onClick: () => {
-															catsAutoCollapsedRef.current = false;
-															setCatsOpen((o) => !o);
+															const next = !catsExpanded;
+															if (catsStuck) setStuckExpanded(next);
+															setCatsOpen(next);
 														}
 													})
 												] });
@@ -9850,7 +9922,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 									const missing = pendingBackup !== null && !installedFiles.includes(name);
 									const entry = data === null ? void 0 : catalogEntryForInstalled(data.plugins, name, String(spec), repoIdentities[name], repoHints[name]);
 									const status = updates[name];
-									const localDev = /^(?:link|file):/i.test(String(spec)) || status?.kind === "linked";
+									const generation = status?.kind === "generation" || isGenerationSpec(String(spec));
+									const localDev = !generation && (/^(?:link|file):/i.test(String(spec)) || status?.kind === "linked");
 									const act = activations[name];
 									const meta = act !== void 0 ? activationMeta(act.state, t) : null;
 									const version = status && status.version ? "v" + status.version : "";
@@ -9971,7 +10044,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 														]
 													});
 												})(),
-												status !== void 0 && status.updateAvailable && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												status !== void 0 && (status.updateAvailable || generation && status.latest != null) && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 													className: Market_module_css_default.noteRow,
 													children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 														type: "button",
@@ -10117,6 +10190,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 															className: Market_module_css_default.warnBtn,
 															disabled: true,
 															children: t("updating")
+														}) : status !== void 0 && generation && status.latest != null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+															className: Market_module_css_default.metaTag,
+															title: t("hostUpdateHint"),
+															children: t("hostUpdateReady").replace("{0}", status.latest)
 														}) : status && status.updateAvailable ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
 															variant: "primary",
 															size: "sm",
@@ -10665,6 +10742,86 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			});
 		}
 		//#endregion
+		//#region src/client/market-element.ts
+		/**
+		* The market's panel, as an element, built from explicit dependencies.
+		*
+		* Two callers want the same thing and must not drift apart:
+		*
+		* - the `settings.section` this package registers, whose slot passes down a
+		*   host-chosen `preferredSubsectionId`;
+		* - `market.render()`, for a host shell that renders the market inside its
+		*   own container (#602, from the Tauri desktop).
+		*
+		* A module function taking its dependencies rather than a closure over the
+		* cordis context, so the wiring — which locale, which theme, which log
+		* exporter reaches the panel — is something a test can assert instead of
+		* something only a running host can reveal.
+		*/
+		/**
+		* @param props - see {@link MarketElementProps}.
+		* @returns the panel wrapped in its error boundary.
+		*/
+		function marketElement(props) {
+			return (0, react.createElement)(MarketErrorBoundary, {
+				text: props.crashText,
+				actions: (0, react.createElement)("button", {
+					type: "button",
+					onClick: () => {
+						props.exportLog();
+					}
+				}, props.t("exportLog"))
+			}, (0, react.createElement)(MarketSection, {
+				t: props.t,
+				locale: props.locale,
+				theme: props.theme,
+				themeStore: props.themeStore,
+				preferredSubsectionId: props.preferredSubsectionId
+			}));
+		}
+		//#endregion
+		//#region src/client/section-gate.ts
+		/**
+		* @param register - registers the entry and returns its disposer. Called
+		*   only when the entry should be visible; may be called again after a
+		*   retraction, which is why the disposer is required rather than optional.
+		* @returns the gate.
+		*/
+		function createSectionGate(register) {
+			let ready = false;
+			let wanted = true;
+			let removed = false;
+			let dispose = null;
+			const apply = () => {
+				if (!ready) return;
+				const shouldShow = wanted && !removed;
+				if (shouldShow && dispose === null) {
+					dispose = register();
+					return;
+				}
+				if (!shouldShow && dispose !== null) {
+					const stop = dispose;
+					dispose = null;
+					stop();
+				}
+			};
+			return {
+				available: () => {
+					ready = true;
+					apply();
+				},
+				setVisible: (visible) => {
+					wanted = visible;
+					apply();
+				},
+				visible: () => dispose !== null,
+				retire: () => {
+					removed = true;
+					apply();
+				}
+			};
+		}
+		//#endregion
 		//#region src/client/SettingsCard.tsx
 		/**
 		* The market's card on the plugin configuration page (dsh >= 0.1.0-rc.7).
@@ -10756,7 +10913,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				updateAvailable: own.updateAvailable === true,
 				latest: own.latest ?? null,
 				channelSwitch: own.channelSwitch ?? null,
-				restoreRequired: own.restoreRequired === true
+				restoreRequired: own.restoreRequired === true,
+				hostManaged: own.kind === "generation"
 			};
 		}
 		/**
@@ -10982,7 +11140,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			}, [post, t]);
 			/** One label + hint block with an optional action, the host's row shape. */
 			const row = (label, hint, action) => (0, react.createElement)("div", { className: Market_module_css_default.setRow }, (0, react.createElement)("div", { className: Market_module_css_default.setLabelBox }, (0, react.createElement)("div", { className: Market_module_css_default.setLabel }, label), (0, react.createElement)("div", { className: Market_module_css_default.setHint }, hint)), action);
-			const body = phase === "removed" ? row(t("setSelfRemoved"), t("setSelfRemovedHint"), null) : (0, react.createElement)(react.Fragment, null, status?.selfManaged === true ? row(update?.updateAvailable === true && update.latest !== null ? `${t("setSelfUpdateReady")} ${update.latest}` : update?.channelSwitch != null ? `${t("setChannelSwitch")} ${update.channelSwitch}` : t("setSelfUpToDate"), phase === "updated" ? t("setSelfUpdatedHint") : update?.channelSwitch != null ? t("setChannelSwitchHint") : update?.updateAvailable === true ? t("setSelfUpdateHint") : t("setSelfUpToDateHint"), phase === "updated" ? null : update?.updateAvailable === true ? (0, react.createElement)(_deepseek_ai_dsh_client_ui_primitives.Button, {
+			const body = phase === "removed" ? row(t("setSelfRemoved"), t("setSelfRemovedHint"), null) : (0, react.createElement)(react.Fragment, null, status?.selfManaged === true ? row((update?.updateAvailable === true || update?.hostManaged === true) && update.latest !== null ? `${t("setSelfUpdateReady")} ${update.latest}` : update?.channelSwitch != null ? `${t("setChannelSwitch")} ${update.channelSwitch}` : t("setSelfUpToDate"), phase === "updated" ? t("setSelfUpdatedHint") : update?.channelSwitch != null ? t("setChannelSwitchHint") : update?.updateAvailable === true ? t("setSelfUpdateHint") : update?.hostManaged === true && update.latest !== null ? t("setSelfHostManagedHint") : t("setSelfUpToDateHint"), phase === "updated" ? null : update?.updateAvailable === true ? (0, react.createElement)(_deepseek_ai_dsh_client_ui_primitives.Button, {
 				variant: "primary",
 				size: "sm",
 				disabled: busy,
@@ -11290,8 +11448,32 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			}), "dsh-market: dictionaries");
 			const t = ctx.locale.bind(NS);
 			installSettingsNavIcon(ctx, () => t("nav"));
-			let retireSection = null;
-			ctx.slots.inject("settings.section", () => {
+			/**
+			* The market's own panel, as an element — one builder for the settings
+			* section this package registers and for `market.render()` (#602). Built
+			* per call: the props are live (locale, theme, the host's preferred
+			* subsection), and a cached element would freeze the first caller's.
+			*/
+			const buildMarketElement = (ownerProps = {}) => marketElement({
+				t,
+				locale: ctx.locale,
+				theme: ctx.theme,
+				themeStore: {
+					subscribe: (cb) => ctx.on("theme/change", cb),
+					getSnapshot: () => ctx.theme.getTheme()
+				},
+				crashText: {
+					title: t("crashTitle"),
+					hint: t("crashHint"),
+					reload: t("crashReload"),
+					details: t("crashDetails")
+				},
+				exportLog: () => {
+					exportMarketLog().catch(() => {});
+				},
+				preferredSubsectionId: ownerProps.preferredSubsectionId
+			});
+			const sectionGate = createSectionGate(() => {
 				const off = ctx.slots.register({
 					name: "settings.section",
 					id: "market",
@@ -11299,32 +11481,31 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					label: () => t("nav"),
 					locale: NS,
 					inject: () => ({ t })
-				}, (ownerProps = {}) => (0, react.createElement)(MarketErrorBoundary, {
-					text: {
-						title: t("crashTitle"),
-						hint: t("crashHint"),
-						reload: t("crashReload"),
-						details: t("crashDetails")
-					},
-					actions: (0, react.createElement)("button", {
-						type: "button",
-						onClick: () => {
-							exportMarketLog().catch(() => {});
-						}
-					}, t("exportLog"))
-				}, (0, react.createElement)(MarketSection, {
-					t,
-					locale: ctx.locale,
-					theme: ctx.theme,
-					themeStore: {
-						subscribe: (cb) => ctx.on("theme/change", cb),
-						getSnapshot: () => ctx.theme.getTheme()
-					},
-					preferredSubsectionId: ownerProps.preferredSubsectionId
-				})));
-				if (typeof off === "function") retireSection = off;
-				return off;
+				}, (ownerProps = {}) => buildMarketElement(ownerProps));
+				return typeof off === "function" ? off : () => {};
 			});
+			ctx.slots.inject("settings.section", () => {
+				sectionGate.available();
+			});
+			const marketControl = {
+				version: 1,
+				setSettingsVisible: (visible) => {
+					sectionGate.setVisible(visible);
+				},
+				settingsVisible: () => sectionGate.visible(),
+				/**
+				* The market's panel as an element, for a host that renders it inside
+				* its own container. Same page, same React instance — this package's
+				* bundle resolves react through the host's module table, so an element
+				* returned here mounts anywhere in that tree.
+				*
+				* What it is NOT: a way to rearrange the market. It hands over the whole
+				* panel, chrome included. Cutting the market into host-fillable regions
+				* is a different design and has not been asked for by a second host yet.
+				*/
+				render: (props = {}) => buildMarketElement(props)
+			};
+			if (typeof ctx.provide === "function") ctx.provide("market", marketControl);
 			ctx.inject(["settingsScope"], (scoped) => {
 				scoped.slots.inject("settings.plugin.item", () => scoped.slots.register({
 					name: "settings.plugin.item",
@@ -11334,9 +11515,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}, () => (0, react.createElement)(SettingsCard, {
 					t,
 					onRemoved: () => {
-						const off = retireSection;
-						retireSection = null;
-						off?.();
+						sectionGate.retire();
 					}
 				})));
 			});

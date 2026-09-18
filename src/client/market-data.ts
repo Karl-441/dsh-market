@@ -124,10 +124,21 @@ export interface GistExportResult {
   gistUrl: string
 }
 
+/**
+ * A `link:` the desktop host wrote for one of its generations (#497). The
+ * test the server applies (`isGenerationLink` in sources.ts), repeated here
+ * because the client bundle cannot import server modules.
+ */
+export function isGenerationSpec(spec: string): boolean {
+  return /^link:/i.test(spec) && /(?:^|[\\/])\.generations[\\/]live[\\/]/i.test(spec)
+}
+
 /** Per-package update status from /dsh-market/updates. */
 export interface UpdateStatus {
   updateAvailable?: boolean
   version?: string
+  /** `github` | `npm` | `linked` | `generation` — the last is a host-managed
+      install (#497): `latest` names a newer release, never an offer. */
   kind?: string
   /** What is installed and what the source of truth offers — versions for npm
       packages, commit shas for github installs; the notes dialog (#294) shows
@@ -680,10 +691,20 @@ function entryRepoIds(plugin: RegistryPlugin): Set<string> {
  * dependency's spec pins a github repo AND the entry states one, the repos
  * decide — the loose name/npm identities only apply when at least one side
  * carries no repo evidence (npm installs, non-github entries).
+ *
+ * Repo evidence only ever decides by repository ROOT. A monorepo catalog
+ * entry states `owner/repo#path:/pkg` while an npm-installed manifest
+ * usually states the bare `owner/repo` (it rarely declares
+ * `repository.directory`), and reading that asymmetry as a source conflict
+ * kept a genuinely installed subpackage from ever reading as installed.
  */
+/** Repository root: the part before any `#path:/…` subpath selection. */
+function repoRoots(ids: ReadonlySet<string>): Set<string> {
+  return new Set([...ids].map(id => id.split('#path:/')[0]!))
+}
 function sameSourceConflict(plugin: RegistryPlugin, spec: string, repoIdentities: readonly string[] = []): boolean {
-  const entry = entryRepoIds(plugin)
-  const dep = depRepoIds(spec, repoIdentities)
+  const entry = repoRoots(entryRepoIds(plugin))
+  const dep = repoRoots(depRepoIds(spec, repoIdentities))
   if (entry.size === 0 || dep.size === 0) return false
   for (const id of dep) if (entry.has(id)) return false
   return true
@@ -743,6 +764,66 @@ function looseMatches(plugin: RegistryPlugin, name: string): boolean {
   return false
 }
 
+/**
+ * The same memo, for the branch #262 left behind (#589).
+ *
+ * `looseMatchCount` above covers dependencies installed by version. A
+ * `link:` or `file:` dependency takes the other branch, into
+ * `findCatalogEntryForLocal`, which walks the whole catalog at least twice
+ * per call — once to filter by name, once to collect `/tree/` repos — and
+ * up to twice more when there are identities to probe. Both callers below
+ * run once per rendered card. The reporter profiled ~300ms per repaint at
+ * 24 cards against a 3,627-entry catalog where a version-pinned dependency
+ * paid 1.1ms; a local benchmark measured ~38ms per render at that shape,
+ * and ~1.4s at 96 cards with eight local dependencies.
+ *
+ * The inner key carries the EVIDENCE, not just the name. Installing a plugin
+ * hands the next render a fresh identities array while the catalog array
+ * stays the same, so a name-only key would answer the post-install question
+ * with the pre-install result — which is the same-named-fork confusion #485
+ * asked this matcher to stop making, reintroduced as a cache bug.
+ *
+ * A miss is cached as `null`, which is why the "not cached yet" sentinel
+ * has to be `undefined`: `null` is a real answer here, and it costs the
+ * same full scan to establish as a hit does. It is also the common case —
+ * a checkout you are developing is usually not in the catalog at all.
+ *
+ * The invariant this rests on, stated because the WeakMap cannot enforce it:
+ * the catalog array and the entries inside it are frozen once handed here. A
+ * refetch replaces the array — which is what the outer key is for — but an
+ * in-place `push`, `sort` or `reverse`, or editing a row's `url`, would keep
+ * the key and change the answer. Order is load-bearing too: the matcher
+ * returns the FIRST row that fits. Nothing in the client does any of this
+ * today; `visiblePlugins` and `themePlugins` both sort copies.
+ */
+const localMatchCache = new WeakMap<RegistryPlugin[], Map<string, RegistryPlugin | null>>()
+
+function cachedEntryForLocal(
+  plugins: RegistryPlugin[],
+  name: string,
+  identities: readonly string[],
+  hints: readonly string[],
+): RegistryPlugin | null {
+  let byKey = localMatchCache.get(plugins)
+  if (byKey === undefined) {
+    byKey = new Map<string, RegistryPlugin | null>()
+    localMatchCache.set(plugins, byKey)
+  }
+  // JSON, not a delimiter-joined string. `[]` and `['']` join to the same
+  // thing and they are NOT the same question: an empty-but-present identity
+  // list has size 1, so it enters the evidence branch and refuses to guess,
+  // while an absent one falls through to the unique-name match. A key that
+  // cannot tell those apart lets whichever ran first answer for both, which
+  // is the guess this matcher exists to refuse. Stringifying the arrays is
+  // injective for free, and its cost is noise beside the scan it replaces.
+  const key = JSON.stringify([name, identities, hints])
+  const hit = byKey.get(key)
+  if (hit !== undefined) return hit
+  const entry = findCatalogEntryForLocal(plugins, name, identities, hints)
+  byKey.set(key, entry)
+  return entry
+}
+
 /** The installed dependency name a registry entry corresponds to, or null. */
 export function matchInstalledName(
   plugin: RegistryPlugin,
@@ -761,7 +842,7 @@ export function matchInstalledName(
     // else's fork as installed (#485).
     if (/^(?:link|file):/i.test(specStr)) {
       if (plugins === undefined) continue
-      const entry = findCatalogEntryForLocal(plugins, name, repos, repoHints[name] ?? [])
+      const entry = cachedEntryForLocal(plugins, name, repos, repoHints[name] ?? [])
       if (entry !== null && entry.url === plugin.url) return name
       continue
     }
@@ -1305,7 +1386,7 @@ export function catalogEntryForInstalled(
   repoHints: readonly string[] = [],
 ): RegistryPlugin | undefined {
   if (/^(?:link|file):/i.test(spec)) {
-    return findCatalogEntryForLocal(plugins, name, repoIdentities, repoHints) ?? undefined
+    return cachedEntryForLocal(plugins, name, repoIdentities, repoHints) ?? undefined
   }
   return entryForDep(plugins, name, spec, repoIdentities, repoHints)
 }
