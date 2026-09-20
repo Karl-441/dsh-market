@@ -105,7 +105,7 @@ const TWO_ENTRIES_FAILED = [
   'needs-service: pending (waiting for service: nonexistent)',
   '    at Fiber.<anonymous> (file:///D:/dsh/node_modules/@deepseek-ai/cordis/lib/index.js:100:5)',
   '',
-  '[dsh-market] the replacement did not bind port 3080 within 20s (it exited with code 1)',
+  '[dsh-market] the replacement never came up on port 3080 (it exited with code 1)',
 ].join('\n')
 
 /** The shape a REAL composition produced (captured from a live dsh web run). */
@@ -296,6 +296,38 @@ describe('startRecoveryServer', () => {
     expect(body.unmatched.map(entry => entry.name)).toEqual(['needs-service'])
   })
 
+  it('opens with the blamed plugins UNTICKED — the promise the prompt makes', async () => {
+    // "The plugins DSH blamed are marked red and left unticked" is the
+    // contract in the README and the copy. It used to be only half true: the
+    // payload flagged them and every surface still ticked them, so the user
+    // had to find and untick the red row themselves. The recommendation lives
+    // in the payload so both surfaces inherit it from one place.
+    const { base } = await serve()
+    const body = await (await fetch(base + '/dsh-market/recovery')).json() as {
+      plugins: Array<{ name: string; enabled: boolean; implicated: boolean; toggleable: boolean }>
+    }
+    const blamed = body.plugins.find(plugin => plugin.name === 'blamed-plugin')
+    expect(blamed?.implicated).toBe(true)
+    expect(blamed?.enabled, 'a blamed, switchable plugin must start unticked').toBe(false)
+    expect(body.plugins.find(plugin => plugin.name === 'good-plugin')?.enabled).toBe(true)
+  })
+
+  it('leaves an untouchable plugin at its own state', async () => {
+    // Nothing the user could do with another position: host infrastructure is
+    // listed for context, not to be switched.
+    const { base, config } = await serve()
+    config.plugins.push({
+      name: '@deepseek-ai/dsh-host-webserver', rows: [], enabled: true, protected: true,
+      carrier: false, toggleable: false, note: 'host infrastructure',
+    })
+    const body = await (await fetch(base + '/dsh-market/recovery')).json() as {
+      plugins: Array<{ name: string; enabled: boolean; toggleable: boolean }>
+    }
+    const hostRow = body.plugins.find(plugin => plugin.name === '@deepseek-ai/dsh-host-webserver')
+    expect(hostRow?.toggleable).toBe(false)
+    expect(hostRow?.enabled).toBe(true)
+  })
+
   it('serves a standalone page for a fresh visit, with the same data', async () => {
     const { base } = await serve()
     const response = await fetch(base + '/', { headers: { 'accept-language': 'zh-CN,zh;q=0.9' } })
@@ -432,6 +464,73 @@ describe('runRecovery', () => {
     }).catch(() => undefined)
     expect(await running).toBe('released')
   }, 90_000)
+  it('comes back with the write errors instead of booting a partial choice', async () => {
+    // A write that lands for some plugins and not others leaves the profile
+    // as neither what the user asked for nor what it was. Booting that is
+    // booting a guess, so the surface has to come back and say what failed.
+    const { port, release } = await hold()
+    await release()
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-partial-'))
+    const patchPath = join(dir, 'cordis.patch.yml')
+    writeFileSync(patchPath, '# dsh profile root\n[]\n')
+    const mark = join(dir, 'booted.txt')
+    const spawnScript = join(dir, 'replacement.cjs')
+    writeFileSync(spawnScript, 'require("node:fs").writeFileSync(' + JSON.stringify(mark) + ', "booted")\n')
+    // A row id the patch layer refuses (space + punctuation) is how a partial
+    // write happens for real: the plugin is fine, its row is not writable.
+    const config = makeConfig(dir, patchPath, [makePlugin('blamed-plugin', { rows: ['bad row!'] })])
+    config.port = port
+    config.spawn = { file: process.execPath, args: [spawnScript], viaShell: false, detached: false }
+    const running = runRecovery(config, { exitCode: 1, bound: false })
+    const base = 'http://127.0.0.1:' + String(port)
+    cleanups.push(async () => {
+      await fetch(base + '/dsh-market/recovery/release', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: base },
+        body: '{}',
+      }).catch(() => undefined)
+      await Promise.race([running.catch(() => 'released'), new Promise(resolve => setTimeout(resolve, 3000))])
+    })
+
+    /** Poll the surface until it answers, or give up. */
+    const readView = async (): Promise<{ lastErrors: string[] } | null> => {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        try {
+          const response = await fetch(base + '/dsh-market/recovery', { cache: 'no-store' })
+          if (response.ok) return await response.json() as { lastErrors: string[] }
+        } catch { /* not up yet */ }
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      return null
+    }
+
+    const first = await readView()
+    expect(first).not.toBeNull()
+    await fetch(base + '/dsh-market/recovery/apply', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ enabled: [] }),
+    })
+
+    // The surface returns — with the errors — and nothing was booted.
+    const deadline = Date.now() + 30_000
+    let errors: string[] = []
+    while (Date.now() < deadline && errors.length === 0) {
+      const view = await readView()
+      errors = view?.lastErrors ?? []
+      if (errors.length === 0) await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    expect(errors.length, 'the write failure never reached the surface').toBeGreaterThan(0)
+    expect(errors[0]).toContain('bad row!')
+    expect(existsSync(mark), 'a partial write was booted anyway').toBe(false)
+    await fetch(base + '/dsh-market/recovery/release', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: '{}',
+    }).catch(() => undefined)
+    expect(await running).toBe('released')
+  }, 90_000)
 })
 
 describe('respawnAndWatch', () => {
@@ -539,7 +638,7 @@ describe('restartHelperSource handoff', () => {
     expect(argv).toContain('--exit=1')
     expect(argv).toContain('--bound=0')
     const log = readFileSync(errLog, 'utf8')
-    expect(log).toContain('did not bind')
+    expect(log).toContain('never came up on port')
     expect(log).toContain('starting the recovery surface')
   }, 40_000)
 
@@ -556,7 +655,7 @@ describe('restartHelperSource handoff', () => {
     )
     const child = spawn(process.execPath, ['-e', source], { stdio: 'ignore' })
     cleanups.push(() => { child.kill() })
-    const wrote = await until(() => existsSync(errLog) && readFileSync(errLog, 'utf8').includes('did not bind'), 20_000)
+    const wrote = await until(() => existsSync(errLog) && readFileSync(errLog, 'utf8').includes('never came up on port'), 20_000)
     expect(wrote).toBe(true)
     expect(readFileSync(errLog, 'utf8')).not.toContain('recovery surface')
   }, 40_000)

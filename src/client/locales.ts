@@ -556,6 +556,7 @@ export const zh = {
   recoveryStandalone: '打开独立恢复页',
   recoveryRestarting: '正在重启：dsh 起来后本页会刷新；若又失败，会带着新的报错回到这里。',
   recoveryApplyFailed: '写入失败：',
+  recoveryWriteFailed: '上次的选择没能完整写入，因此没有重启：',
   recoveryTimeout: '等待 DeepSeek Harness 启动超时。可以点「调整插件」看看是不是某个插件导致起不来。',
 }
 
@@ -1118,5 +1119,6 @@ export const en: Record<MarketKey, string> = {
   recoveryStandalone: 'Open the standalone recovery page',
   recoveryRestarting: 'Restarting: this page reloads once dsh is up; if it fails again you come back here with the new error.',
   recoveryApplyFailed: 'The write failed: ',
+  recoveryWriteFailed: 'The last choice could not be written in full, so nothing was restarted: ',
   recoveryTimeout: 'Timed out waiting for DeepSeek Harness to start. "Adjust plugins" can tell you whether one of them is what stops it.',
 }

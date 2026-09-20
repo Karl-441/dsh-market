@@ -390,7 +390,12 @@ export function restartHelperSource(
     'const handOff = async () => {',
     '  if (!recoveryScript || !recoveryConfig) return',
     '  try {',
-    '    const child = spawn(process.execPath, [recoveryScript, recoveryConfig, "--exit=" + String(exited), "--bound=0"], { detached: true, stdio: "ignore", env: process.env })',
+    // windowsHide with the detached spawn: this helper has no console, so a
+    // console program spawned from it is handed a new, visible one (#624).
+    // Measured on Windows 11: the flag combination is accepted and the child
+    // runs (the two flags are documented as mutually exclusive on MSDN, so
+    // the probe matters more than the docs here).
+    '    const child = spawn(process.execPath, [recoveryScript, recoveryConfig, "--exit=" + String(exited), "--bound=0"], { detached: true, stdio: "ignore", env: process.env, windowsHide: true })',
     '    child.on("error", (error) => note(`could not start the recovery surface: ${error && error.message ? error.message : error}`))',
     '    child.unref()',
     '    note("the replacement never came up — starting the recovery surface")',
@@ -450,10 +455,30 @@ export function restartHelperSource(
     // the path that has no port to poll. CI on windows-latest caught it —
     // locally it passes either way.
     "  if (!port) { await sleep(3000); return }",
-    '  const upBy = Date.now() + 20000',
-    '  while (Date.now() < upBy && !(await listening())) { if (exited !== null) break; await sleep(500) }',
-    '  if (await listening()) return',
-    '  note(`the replacement did not bind port ${port} within 20s${exited === null ? "" : ` (it exited with code ${exited})`} — see the output log beside this one`)',
+    // Success is not 'the port answered once'. A boot that fails its
+    // activation audit has ALREADY bound the web port by the time the audit
+    // runs — the tree mounts, the server listens, and only then does DSH
+    // refuse the whole composition and exit. Judging on a single answer
+    // therefore reports success for a harness that is mid-collapse, and the
+    // recovery surface never starts: exactly the failure this handoff exists
+    // for. The port has to answer CONTINUOUSLY for SETTLE_MS instead, which
+    // is far longer than an audit takes to refuse a tree and much shorter
+    // than a user would notice. (src/recovery.ts keeps the same rule for the
+    // boots it supervises.)
+    '  const SETTLE_MS = 8000',
+    '  const upBy = Date.now() + 20000 + SETTLE_MS',
+    '  let steadySince = null',
+    '  while (Date.now() < upBy) {',
+    '    if (await listening()) {',
+    '      if (steadySince === null) steadySince = Date.now()',
+    '      else if (Date.now() - steadySince >= SETTLE_MS) return',
+    '    } else {',
+    '      steadySince = null',
+    '      if (exited !== null) break',
+    '    }',
+    '    await sleep(500)',
+    '  }',
+    '  note(`the replacement never came up on port ${port}${exited === null ? "" : ` (it exited with code ${exited})`} — see the output log beside this one`)',
     // The host is not coming back on its own. Everything the user can still
     // do about it lives in the recovery surface, so start it while the
     // browser tab that asked for the restart is still open.

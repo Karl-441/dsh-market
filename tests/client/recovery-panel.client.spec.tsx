@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createElement as h } from 'react'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import {
-  applyRecovery, fetchRecovery, isRecoveryView, RecoveryPanel, watchRestart,
+  applyRecovery, fetchRecovery, initialKeep, isRecoveryView, RecoveryPanel, watchRestart,
   type RecoveryView,
 } from '../../src/client/RecoveryPanel.tsx'
 
@@ -34,7 +34,9 @@ function view(overrides: Partial<RecoveryView> = {}): RecoveryView {
     },
     plugins: [
       {
-        name: 'blamed-plugin', rows: ['blamed-plugin'], enabled: true, protected: false,
+        // The switch position the payload recommends for a blamed, switchable
+        // plugin is OFF (src/recovery.ts sets it; see initialKeep below).
+        name: 'blamed-plugin', rows: ['blamed-plugin'], enabled: false, protected: false,
         carrier: false, toggleable: true, implicated: true, reason: 'Error: boom',
       },
       {
@@ -47,6 +49,7 @@ function view(overrides: Partial<RecoveryView> = {}): RecoveryView {
       },
     ],
     unmatched: [],
+    lastErrors: [],
     logPath: '/tmp/dsh-market-restart.err.log',
     ...overrides,
   }
@@ -55,6 +58,52 @@ function view(overrides: Partial<RecoveryView> = {}): RecoveryView {
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+})
+
+describe('initialKeep', () => {
+  it('opens from the payload: a blamed plugin starts unticked, the rest as they are', () => {
+    // This is the PRODUCTION initialisation the panel is rendered with. The
+    // older tests hand-built `keep`, which is how the payload shipped the
+    // right recommendation while both surfaces still ticked everything: the
+    // promise "left unticked" was only true in the tests. Pin the real path.
+    const keep = initialKeep(view())
+    expect(keep['blamed-plugin']).toBe(false)
+    expect(keep['good-plugin']).toBe(true)
+    // A plugin that cannot be switched keeps its own state.
+    expect(keep['@deepseek-ai/dsh-host-webserver']).toBe(true)
+  })
+
+  it('renders that state, so the red row really is unticked', () => {
+    const payload = view()
+    render(h(RecoveryPanel, {
+      open: true,
+      view: payload,
+      keep: initialKeep(payload),
+      busy: false,
+      onToggle: () => {},
+      onApply: () => {},
+      onClose: () => {},
+      t,
+    }))
+    const boxes = screen.getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes.map(box => box.checked)).toEqual([false, true, true])
+  })
+})
+
+describe('RecoveryPanel write errors', () => {
+  it('says the choice could not be written instead of quietly re-booting', () => {
+    render(h(RecoveryPanel, {
+      open: true,
+      view: view({ lastErrors: ['blamed-plugin: row id has unsupported characters'] }),
+      keep: initialKeep(view()),
+      busy: false,
+      onToggle: () => {},
+      onApply: () => {},
+      onClose: () => {},
+      t,
+    }))
+    expect(screen.getByText(/row id has unsupported characters/)).toBeTruthy()
+  })
 })
 
 describe('RecoveryPanel', () => {

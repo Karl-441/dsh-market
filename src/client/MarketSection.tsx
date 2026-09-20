@@ -38,7 +38,7 @@ import css from './Market.module.css'
 import { MARK_BLOCK_RADIUS, MARK_BLOCK_SIZE, MARK_GRID_BLOCKS, MARK_PLUG_BLOCK, MARK_VIEW_BOX } from './market-mark.ts'
 import { CommentsModal } from './CommentsModal.tsx'
 import { OperationsPanel } from './OperationsPanel.tsx'
-import { applyRecovery, fetchRecovery, RecoveryPanel, watchRestart, type RecoveryView } from './RecoveryPanel.tsx'
+import { applyRecovery, fetchRecovery, initialKeep, RecoveryPanel, watchRestart, type RecoveryView } from './RecoveryPanel.tsx'
 import { clearSettled, drop, enqueue, patch as patchRecord, recordForUrl } from './operations.ts'
 import type { OperationRecord } from './operations.ts'
 import { Diagnostics } from './Diagnostics.tsx'
@@ -2380,7 +2380,9 @@ export function MarketSection(props: MarketSectionProps) {
    */
   const enterRecovery = useCallback((view: RecoveryView) => {
     setRecovery(view)
-    setRecoveryKeep(Object.fromEntries(view.plugins.map(plugin => [plugin.name, plugin.enabled])))
+    // The payload decides where the switches start (off for a blamed plugin);
+    // this copies it rather than re-deriving it — see initialKeep.
+    setRecoveryKeep(initialKeep(view))
     setRecoveryBusy(false)
     setRestarting(false)
     setInstallError(t('recoveryBanner') + (view.failure.summary || t('recoveryNoSummary')))

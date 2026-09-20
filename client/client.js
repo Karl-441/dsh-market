@@ -585,6 +585,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			recoveryStandalone: "打开独立恢复页",
 			recoveryRestarting: "正在重启：dsh 起来后本页会刷新；若又失败，会带着新的报错回到这里。",
 			recoveryApplyFailed: "写入失败：",
+			recoveryWriteFailed: "上次的选择没能完整写入，因此没有重启：",
 			recoveryTimeout: "等待 DeepSeek Harness 启动超时。可以点「调整插件」看看是不是某个插件导致起不来。"
 		};
 		const en = {
@@ -1139,6 +1140,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			recoveryStandalone: "Open the standalone recovery page",
 			recoveryRestarting: "Restarting: this page reloads once dsh is up; if it fails again you come back here with the new error.",
 			recoveryApplyFailed: "The write failed: ",
+			recoveryWriteFailed: "The last choice could not be written in full, so nothing was restarted: ",
 			recoveryTimeout: "Timed out waiting for DeepSeek Harness to start. \"Adjust plugins\" can tell you whether one of them is what stops it."
 		};
 		//#endregion
@@ -3481,6 +3483,21 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* recovery server renders at `/` (for a fresh visit, or when that tab is
 		* gone).
 		*/
+		/**
+		* The switch positions a surface OPENS on, taken straight from the payload.
+		*
+		* Extracted because this is the production initialisation both surfaces
+		* depend on: the payload already carries the recommended position (off for a
+		* plugin this boot blamed — see RecoveryPluginView.enabled in
+		* src/recovery.ts), so the client's job is to copy it, not to re-derive it. A
+		* test that hand-builds `keep` proves nothing about what a user actually
+		* sees, which is how "unticked by default" shipped unimplemented once.
+		* @param view - the recovery payload.
+		* @returns the initial checkbox state, keyed by plugin name.
+		*/
+		function initialKeep(view) {
+			return Object.fromEntries(view.plugins.map((plugin) => [plugin.name, plugin.enabled]));
+		}
 		/** Whether a payload really is the recovery surface's answer. */
 		function isRecoveryView(value) {
 			if (value === null || typeof value !== "object") return false;
@@ -3612,6 +3629,13 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							size: 14,
 							className: Market_module_css_default.bannerIcon
 						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: view.failure.summary || t("recoveryNoSummary") })]
+					}),
+					view.lastErrors.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: Market_module_css_default.recoverySummary,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.IconWarningOutline16, {
+							size: 14,
+							className: Market_module_css_default.bannerIcon
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [t("recoveryWriteFailed"), view.lastErrors.join("; ")] })]
 					}),
 					view.failure.tail !== "" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("details", {
 						className: Market_module_css_default.recoveryLog,
@@ -7645,7 +7669,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			*/
 			const enterRecovery = (0, react.useCallback)((view) => {
 				setRecovery(view);
-				setRecoveryKeep(Object.fromEntries(view.plugins.map((plugin) => [plugin.name, plugin.enabled])));
+				setRecoveryKeep(initialKeep(view));
 				setRecoveryBusy(false);
 				setRestarting(false);
 				setInstallError(t("recoveryBanner") + (view.failure.summary || t("recoveryNoSummary")));

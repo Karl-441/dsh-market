@@ -303,6 +303,14 @@ export function matchFailureToPlugins(
 
 /** The plugin view the UI renders: inventory plus what the failure implicated. */
 export interface RecoveryPluginView extends RecoveryPlugin {
+  /**
+   * The switch position the surface OPENS on, not the plugin's current state.
+   * For a plugin this boot blamed — and that can be switched at all — the fix
+   * is "off", so the box starts off: that is the contract the failure prompt
+   * makes ("the plugins DSH blamed are marked red and left unticked"), and
+   * leaving the user to untick a red row by hand is a weaker one.
+   */
+  enabled: boolean
   implicated: boolean
   /** The reason the boot named, when it named this plugin. */
   reason?: string
@@ -320,11 +328,23 @@ export interface RecoveryPayload {
   plugins: RecoveryPluginView[]
   /** Names DSH blamed that this surface cannot switch. */
   unmatched: BootFailureEntry[]
+  /** Write errors from the last apply, when the choice could not be written in full. */
+  lastErrors: string[]
   logPath: string
 }
 
-/** Build the payload from the config and the parsed failure. */
-export function recoveryPayload(config: RecoveryConfig, failure: BootFailure): RecoveryPayload {
+/**
+ * Build the payload from the config and the parsed failure.
+ * @param config - the recovery config written before the restart.
+ * @param failure - the failure parsed from the replacement's log.
+ * @param lastErrors - write errors from the previous apply, if it did not land.
+ * @returns the payload both surfaces render.
+ */
+export function recoveryPayload(
+  config: RecoveryConfig,
+  failure: BootFailure,
+  lastErrors: readonly string[] = [],
+): RecoveryPayload {
   const { implicated, reasons, unmatched } = matchFailureToPlugins(config.plugins, failure)
   return {
     ok: true,
@@ -336,13 +356,19 @@ export function recoveryPayload(config: RecoveryConfig, failure: BootFailure): R
     failure,
     plugins: config.plugins.map((plugin) => {
       const reason = reasons.get(plugin.name)?.reason
+      const blamed = implicated.has(plugin.name)
       return {
         ...plugin,
-        implicated: implicated.has(plugin.name),
+        // Blame is a recommendation and the recommendation is OFF — see
+        // RecoveryPluginView.enabled. A plugin that cannot be switched keeps
+        // its state: there is nothing the user could do with another position.
+        enabled: blamed && plugin.toggleable ? false : plugin.enabled,
+        implicated: blamed,
         ...(reason === undefined ? {} : { reason }),
       }
     }),
     unmatched,
+    lastErrors: [...lastErrors],
     logPath: config.logs.err,
   }
 }
@@ -451,6 +477,11 @@ export async function respawnAndWatch(config: RecoveryConfig): Promise<boolean> 
       stdio: ['ignore', openSync(config.logs.out, 'a'), openSync(config.logs.err, 'a')],
       env: process.env,
       shell: config.spawn.viaShell,
+      // The recovery server runs without a console (it is spawned detached by
+      // the helper), so a console child would be handed a new, visible one
+      // (#624). Same flag the restart helper uses for this reason; on POSIX it
+      // is inert.
+      windowsHide: true,
     })
   } catch (cause) {
     note(config, `could not start the replacement: ${cause instanceof Error ? cause.message : String(cause)}`)
@@ -540,6 +571,7 @@ const PAGE_TEXT = {
     idle: '长时间无人操作后本页会自动释放端口。',
     changes: '将要改动：',
     nothing: '没有需要改动的插件，直接重启。',
+    writeFailed: '上次的选择没能完整写入，因此没有重启：',
   },
   en: {
     title: 'DeepSeek Harness failed to start',
@@ -559,6 +591,7 @@ const PAGE_TEXT = {
     idle: 'This page releases the port on its own after a long idle period.',
     changes: 'Changes:',
     nothing: 'Nothing to change — restarting.',
+    writeFailed: 'The last choice could not be written in full, so nothing was restarted:',
   },
 } as const
 
@@ -620,6 +653,7 @@ export function recoveryPageHtml(lang: PageLang): string {
   <h1>${text.title}</h1>
   <p class="lead">${text.lead}</p>
   <div class="err" id="err"><b id="errTitle">…</b><pre id="tail"></pre></div>
+  <div class="err hidden" id="writeErr"><b id="writeErrTitle"></b><pre id="writeErrDetail"></pre></div>
   <h2 id="blamedHeading">${text.failed}</h2>
   <ul id="list"></ul>
   <p class="note" id="unmatched"></p>
@@ -643,6 +677,11 @@ export function recoveryPageHtml(lang: PageLang): string {
     if (state === null) return
     document.getElementById('errTitle').textContent = state.failure.summary || T.none
     document.getElementById('tail').textContent = state.failure.tail || ''
+    if (state.lastErrors && state.lastErrors.length > 0) {
+      document.getElementById('writeErr').classList.remove('hidden')
+      document.getElementById('writeErrTitle').textContent = T.writeFailed
+      document.getElementById('writeErrDetail').textContent = state.lastErrors.join('\n')
+    }
     document.getElementById('logPath').textContent = state.logPath ? T.log + ': ' + state.logPath : ''
     document.getElementById('blamedHeading').textContent = state.failure.entries.length > 0 ? T.failed : T.plugins
     if (state.unmatched.length > 0) {
@@ -804,7 +843,7 @@ function pageLang(request: IncomingMessage): PageLang {
 export async function startRecoveryServer(
   config: RecoveryConfig,
   failure: BootFailure,
-  options: { port?: number; idleTimeoutMs?: number } = {},
+  options: { port?: number; idleTimeoutMs?: number; lastErrors?: readonly string[] } = {},
 ): Promise<RecoveryServer> {
   let currentFailure = failure
   let applyRequested: ((enabled: string[]) => void) | null = null
@@ -844,7 +883,7 @@ export async function startRecoveryServer(
       return
     }
     if (path === '/dsh-market/recovery') {
-      sendJson(response, 200, recoveryPayload(config, currentFailure))
+      sendJson(response, 200, recoveryPayload(config, currentFailure, options.lastErrors ?? []))
       return
     }
     // The market page in the tab that started the restart keeps polling this
@@ -1014,6 +1053,8 @@ export async function runRecovery(
   }
   note(config, `recovery surface starting on port ${String(options.port ?? config.port)} — ${failure.summary}`)
   const servePort = options.port ?? config.port
+  /** Write errors from the previous apply; they travel into the next payload. */
+  let writeErrors: string[] = []
   for (;;) {
     // A failed attempt may still be holding the port while it disposes: binding
     // over it would fail, and the surface the user is looking at would vanish
@@ -1022,7 +1063,7 @@ export async function runRecovery(
       note(config, `port ${String(servePort)} never came free — nothing left to serve on`)
       return 'released'
     }
-    const surface = await startRecoveryServer(config, failure, options)
+    const surface = await startRecoveryServer(config, failure, { ...options, lastErrors: writeErrors })
     const outcome = await surface.finished
     if (outcome.kind !== 'apply') return outcome.kind
     // THE WRITE. The surface only collected the ticks; this is where they
@@ -1030,7 +1071,16 @@ export async function runRecovery(
     // change). Without it the user's decision is thrown away and the same
     // broken composition is booted again — the bug the demo plugin found.
     const applied = await applyRecovery(config, outcome.enabled)
-    for (const error of applied.errors) note(config, `could not write the choice: ${error}`)
+    if (!applied.ok) {
+      // A partial write leaves the profile neither as the user asked nor as it
+      // was, so booting it would be booting a guess. Come back to the surface
+      // with the errors instead, and let the user retry or fix the patch file.
+      writeErrors = [...applied.errors]
+      for (const error of applied.errors) note(config, `could not write the choice: ${error}`)
+      note(config, 'the choice could not be written in full — back to the recovery surface')
+      continue
+    }
+    writeErrors = []
     note(config, `wrote ${String(applied.changes.length)} change(s): ${applied.changes.map(change => (change.to ? '+' : '-') + change.name).join(', ') || 'none'}`)
     const booted = await respawnAndWatch(config)
     if (booted) {
