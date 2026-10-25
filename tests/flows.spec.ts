@@ -622,6 +622,8 @@ const hot = vi.hoisted(() => ({
   favorites: [] as string[],
   blocked: [] as string[],
   updateExempt: [] as string[],
+  /** Rename offers recorded by a failed update (#1012); undefined = none. */
+  renameOffers: undefined as Record<string, string> | undefined,
   /** Stands in for the buildEnv line of state.json; undefined = composition. */
   buildEnv: undefined as Record<string, string> | undefined,
   /** The live source the routes installed, so a test can read what a spawn would. */
@@ -654,6 +656,7 @@ vi.mock('../src/hot.ts', async (importOriginal) => ({
     ...(typeof hot.sidebarEntry === 'boolean' ? { sidebarEntry: hot.sidebarEntry } : {}),
     notes: hot.notes, favorites: hot.favorites, blocked: hot.blocked,
     updateExempt: hot.updateExempt,
+    ...(hot.renameOffers === undefined ? {} : { renameOffers: hot.renameOffers }),
     buildEnv: hot.buildEnv,
   }),
   // Carries `channel` because the real one does. A stand-in that silently
@@ -667,6 +670,7 @@ vi.mock('../src/hot.ts', async (importOriginal) => ({
     sidebarEntry?: boolean
     notes?: Record<string, string>; favorites?: string[]; blocked?: string[]
     updateExempt?: string[]
+    renameOffers?: Record<string, string>
     buildEnv?: Record<string, string>
   }) => {
     if (Object.prototype.hasOwnProperty.call(state, 'sidebarEntry')) hot.sidebarEntry = state.sidebarEntry
@@ -682,6 +686,7 @@ vi.mock('../src/hot.ts', async (importOriginal) => ({
     if (state.favorites !== undefined) hot.favorites = state.favorites
     if (state.blocked !== undefined) hot.blocked = state.blocked
     if (state.updateExempt !== undefined) hot.updateExempt = state.updateExempt
+    if (state.renameOffers !== undefined) hot.renameOffers = state.renameOffers
   },
   listHotMounts: () => [...hot.mounts],
   hotMount: (_ctx: unknown, _dir: string, name: string) => {
@@ -8839,6 +8844,114 @@ describe('the dev channel is an ordinary choice', () => {
               expect(updates.json.updates['dsh-genui'].sourceMigration).toBeUndefined()
               const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', { name: 'dsh-genui' })
               expect(migrated.status).toBe(400)
+              expect(installedSpec('dsh-genui')).toBe('github:omdsh-dev/dsh-genui#publish')
+            })
+
+            /**
+             * #1012. The old package name still RESOLVES on npm here (it is
+             * just stale), which is the realistic shape: the registry keeps a
+             * renamed package alive, so nothing 404s and the failure only
+             * surfaces as "the new artifact is named something else". The
+             * offer comes from the recorded rename, and the same transaction
+             * that moves a Git install moves this one.
+             */
+            it('offers and performs an npm rename, refusing unverified targets (#1012)', async () => {
+              const dir = profileDir('web')
+              writeFileSync(join(dir, 'package.json'), JSON.stringify({
+                dependencies: { 'dsh-genui': '^0.9.6' },
+              }))
+              mkdirSync(join(dir, 'node_modules', 'dsh-genui'), { recursive: true })
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'package.json'), JSON.stringify({
+                name: 'dsh-genui', version: '0.9.6', main: 'index.js',
+              }))
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'index.js'), '')
+              fake.npm['@changfenhuang/dsh-genui'] = {
+                latest: '0.9.8',
+                versions: {
+                  '0.9.8': {
+                    manifest: { name: '@changfenhuang/dsh-genui', main: 'index.js' },
+                    artifacts: ['index.js'],
+                  },
+                },
+              }
+              hot.disabled.add('dsh-genui')
+              hot.groups.work = ['dsh-genui']
+              hot.groupOrder.push('work')
+              hot.notes['dsh-genui'] = 'renamed package'
+              hot.renameOffers = { 'dsh-genui': '@changfenhuang/dsh-genui' }
+
+              // The offer outlives the response that discovered it, so this
+              // row offers the move after a reload instead of dead-ending.
+              const updates = await bed.dispatch('GET', '/dsh-market/updates?force=1')
+              expect(updates.status).toBe(200)
+              expect(updates.json.updates['dsh-genui'].sourceMigration).toEqual({
+                kind: 'npm-rename',
+                from: 'dsh-genui',
+                target: '@changfenhuang/dsh-genui',
+              })
+
+              // The body is user-reachable: an unverified target must not
+              // reach `add <to>@latest`.
+              for (const body of [
+                { name: 'dsh-genui', kind: 'npm-rename' },
+                { name: 'dsh-genui', kind: 'npm-rename', to: 'dsh-genui' },
+                { name: 'dsh-genui', kind: 'npm-rename', to: 'github:o/x' },
+                { name: 'dsh-genui', kind: 'npm-rename', to: '@nobody/nothing' },
+                { name: 'dsh-genui', kind: 'harness' },
+              ]) {
+                const refused = await bed.dispatch('POST', '/dsh-market/migrate-source', body)
+                expect(refused.status, JSON.stringify(refused.json)).toBe(400)
+                expect(installedSpec('dsh-genui')).toBe('^0.9.6')
+              }
+
+              const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', {
+                name: 'dsh-genui',
+                kind: 'npm-rename',
+                to: '@changfenhuang/dsh-genui',
+              })
+              expect(migrated.status, JSON.stringify(migrated.json)).toBe(200)
+              expect(migrated.json).toMatchObject({
+                ok: true,
+                kind: 'npm-rename',
+                from: { name: 'dsh-genui', source: '^0.9.6' },
+                to: { name: '@changfenhuang/dsh-genui', source: 'npm' },
+              })
+              expect(installedSpec('dsh-genui')).toBeUndefined()
+              expect(installedSpec('@changfenhuang/dsh-genui')).toBe('^0.9.8')
+              expect(hot.disabled.has('@changfenhuang/dsh-genui')).toBe(true)
+              expect(hot.disabled.has('dsh-genui')).toBe(false)
+              expect(hot.groups.work).toEqual(['@changfenhuang/dsh-genui'])
+              expect(hot.notes['@changfenhuang/dsh-genui']).toBe('renamed package')
+              // Nothing left to offer once the install carries the new name.
+              expect(hot.renameOffers).toEqual({})
+            })
+
+            /**
+             * A git install can never be renamed through this transaction, so an
+             * offer naming one must not put a button on the row: every click
+             * would 400 and the offer would never clear (#1012). The offer here
+             * names a REAL catalog npm package — the spec shape is what has to
+             * keep the button away.
+             */
+            it('does not offer a rename on a row the transaction would refuse (#1012)', async () => {
+              const dir = profileDir('web')
+              writeFileSync(join(dir, 'package.json'), JSON.stringify({
+                dependencies: { 'dsh-genui': 'github:omdsh-dev/dsh-genui#publish' },
+              }))
+              mkdirSync(join(dir, 'node_modules', 'dsh-genui'), { recursive: true })
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'package.json'), JSON.stringify({
+                name: 'dsh-genui', version: '0.9.6', main: 'index.js',
+              }))
+              writeFileSync(join(dir, 'node_modules', 'dsh-genui', 'index.js'), '')
+              hot.renameOffers = { 'dsh-genui': '@changfenhuang/dsh-genui' }
+
+              const updates = await bed.dispatch('GET', '/dsh-market/updates?force=1')
+              expect(updates.status).toBe(200)
+              expect(updates.json.updates['dsh-genui'].sourceMigration).toBeUndefined()
+              const refused = await bed.dispatch('POST', '/dsh-market/migrate-source', {
+                name: 'dsh-genui', kind: 'npm-rename', to: '@changfenhuang/dsh-genui',
+              })
+              expect(refused.status).toBe(400)
               expect(installedSpec('dsh-genui')).toBe('github:omdsh-dev/dsh-genui#publish')
             })
           })

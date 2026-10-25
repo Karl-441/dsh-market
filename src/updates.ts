@@ -10,6 +10,7 @@ import { DIST_TAG, type Channel } from './channels.ts'
 import { resolveHeadCommit } from './accelerate.ts'
 import { marketFetch } from './net.ts'
 import { activeRegion, githubRoutesFor, rememberGithubRoute, throughProxy, type Region } from './regions.ts'
+import type { GitToNpmMigration, NpmRenameMigration } from './source-migration.ts'
 import { readMinimumReleaseAgeMs } from './install.ts'
 import { hasDshManifest, profileDir, readGitResolutionCommit, readInstalled, readInstalledVersion, readLockCommits, readProfileBundles } from './profile.ts'
 import { userPatchPackageReferences } from './patch.ts'
@@ -68,8 +69,12 @@ export interface UpdateStatus {
   newerPrerelease?: string
   /** Taking this update replaces a local package source with its matched online release. */
   restoreRequired?: boolean
-  /** Independent, explicit source switch offered for verified legacy Git installs. */
-  sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
+  /**
+   * Independent, explicit source switch offered for an installed profile: a
+   * verified legacy Git install (#461), or an npm install whose package was
+   * renamed and no longer resolves (#1012).
+   */
+  sourceMigration?: GitToNpmMigration | NpmRenameMigration
   /**
    * A newer release exists but this profile's `minimumReleaseAge` will not let
    * pnpm install it yet (#945). The official Desktop takes no one-shot bypass,

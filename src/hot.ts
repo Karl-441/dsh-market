@@ -24,6 +24,7 @@ import { asChannel, type Channel } from './channels.ts'
 import { asRegion, normalizeGithubProxy, type Region } from './regions.ts'
 import { logEvent } from './log.ts'
 import { declaredBundlePatchFiles, entryArtifactExists } from './profile.ts'
+import { NPM_NAME_RE } from './sources.ts'
 
 interface HotRow {
   id: string
@@ -300,6 +301,20 @@ export interface MarketState {
    * An empty array is how the last name is removed.
    */
   updateExempt?: string[]
+  /**
+   * Installed package names that were renamed upstream on npm (#1012):
+   * old name → the package name the plugin now publishes under.
+   *
+   * Only ever written from an update that came back carrying a different
+   * package name (the artifact has already proven the rename), never guessed
+   * from the catalog. Its whole purpose is to keep that fact after the
+   * failure: the row then offers the migration on a later page load instead
+   * of the fact dying with the response that discovered it. Cleared per
+   * entry once the migration goes through.
+   *
+   * Optional on the way in, for the same reason as `blocked` (#339).
+   */
+  renameOffers?: Record<string, string>
   /** User-supplied HTTPS prefix used when the built-in GitHub routes fail. */
   githubProxy?: string
   /**
@@ -496,6 +511,7 @@ export function readMarketState(profileDir: string): MarketState {
       favorites?: unknown
       blocked?: unknown
       updateExempt?: unknown
+      renameOffers?: unknown
       brokenPlugins?: unknown
       sidebarEntry?: unknown
     }
@@ -516,6 +532,16 @@ export function readMarketState(profileDir: string): MarketState {
     }
     const githubProxy = normalizeGithubProxy(state.githubProxy)
     const brokenPlugins = brokenPluginsFromUnknown(state.brokenPlugins)
+    // Only a real package name on both sides is an offer (#1012): this map
+    // feeds a `/updates` row that offers to reinstall under the new name, and
+    // a malformed entry would put a button on the row that cannot work.
+    const renameOffers: Record<string, string> = {}
+    if (state.renameOffers !== null && typeof state.renameOffers === 'object' && !Array.isArray(state.renameOffers)) {
+      for (const [name, to] of Object.entries(state.renameOffers)) {
+        if (!NPM_NAME_RE.test(name) || typeof to !== 'string' || !NPM_NAME_RE.test(to) || name === to) continue
+        renameOffers[name] = to
+      }
+    }
     // The order and the map are two halves of one fact, and a state file can
     // carry them out of step (#964): the UI then lists a group the routes
     // cannot find, so "assign to" and even "delete" answer group-not-found
@@ -539,6 +565,7 @@ export function readMarketState(profileDir: string): MarketState {
       favorites: favoriteUrls(state.favorites),
       blocked: blockedNames(state.blocked),
       updateExempt: updateExemptNames(state.updateExempt),
+      ...(Object.keys(renameOffers).length === 0 ? {} : { renameOffers }),
       ...(githubProxy === null ? {} : { githubProxy }),
       ...(brokenPlugins === undefined ? {} : { brokenPlugins }),
       // true AND false are both preserved: on a host with no settings page
@@ -632,6 +659,12 @@ export function writeMarketState(profileDir: string, state: MarketState): void {
   const favorites = state.favorites ?? onDisk.favorites ?? []
   const blocked = state.blocked ?? onDisk.blocked ?? []
   const updateExempt = state.updateExempt ?? onDisk.updateExempt ?? []
+  // Omission and `undefined` both preserve; an explicit empty object clears.
+  // `undefined` must not be read as "clear": callers rebuild this field from a
+  // fresh read, and the ordinary state has no offers at all, so treating
+  // "nothing to say" as a deletion would let any whole-state write erase an
+  // offer another request recorded in between (#1012).
+  const renameOffers = state.renameOffers ?? onDisk.renameOffers
   // This field does have a clear action ("restore automatic"). As with
   // regionAuto, omission preserves while an explicit undefined removes it.
   const githubProxy = Object.prototype.hasOwnProperty.call(state, 'githubProxy')
@@ -651,6 +684,7 @@ export function writeMarketState(profileDir: string, state: MarketState): void {
     ...(blocked.length > 0 ? { blocked } : {}),
     ...(updateExempt.length > 0 ? { updateExempt } : {}),
     ...(Object.keys(notes).length > 0 ? { notes } : {}),
+    ...(renameOffers === undefined || Object.keys(renameOffers).length === 0 ? {} : { renameOffers }),
     // Omitted while unchosen, so "never picked" survives a round trip and
     // keeps deriving from the running build — but only when disk has not
     // recorded a choice either.
@@ -685,6 +719,23 @@ export function readDisabled(profileDir: string): Set<string> {
 export function writeDisabled(profileDir: string, disabled: Set<string>): void {
   const state = readMarketState(profileDir)
   state.disabled = new Set(disabled)
+  writeMarketState(profileDir, state)
+}
+
+/**
+ * Remember that an installed package was renamed upstream (#1012).
+ *
+ * Called from the one place that has evidence — an update whose artifact
+ * carries a different package name — so the row can keep offering the
+ * migration after the response that discovered it is gone.
+ */
+export function recordRenameOffer(profileDir: string, name: string, to: string): void {
+  if (!NPM_NAME_RE.test(name) || !NPM_NAME_RE.test(to) || name === to) return
+  const state = readMarketState(profileDir)
+  const offers = { ...(state.renameOffers ?? {}) }
+  if (offers[name] === to) return
+  offers[name] = to
+  state.renameOffers = offers
   writeMarketState(profileDir, state)
 }
 

@@ -2020,6 +2020,43 @@ interface SourceMigrationConfirm {
   name: string
   source: string
   target: string
+  kind: SourceMigrationKind
+}
+
+/**
+ * The two moves one dialog serves: a Git install switching to the npm
+ * package its own repository publishes (#461), and an npm install following a
+ * package rename (#1012). Same confirmation, same transaction.
+ */
+type SourceMigrationKind = 'git-to-npm' | 'npm-rename'
+
+/**
+ * What the two moves say (#1012). Same dialog and same transaction, so the
+ * difference belongs in one branch rather than a ternary per line.
+ */
+function sourceMigrationCopy(confirm: SourceMigrationConfirm, t: (key: string) => string) {
+  if (confirm.kind === 'npm-rename') {
+    return {
+      title: t('renameTitle'),
+      description: t('renameDescription'),
+      confirmLabel: t('renameContinue'),
+      currentLabel: t('renameCurrentPackage'),
+      targetLabel: t('renameTargetPackage'),
+      note: t('renameWarning'),
+      // Reassurance, not a warning: a rename cannot touch what the plugin
+      // saved itself, and painting that as a warning is the #4 relapse.
+      noteTone: 'plain' as const,
+    }
+  }
+  return {
+    title: t('migrateTitle'),
+    description: t('migrateDescription'),
+    confirmLabel: t('migrateContinue'),
+    currentLabel: t('migrateCurrentSource'),
+    targetLabel: t('migrateTargetSource'),
+    note: t('migrateWarning'),
+    noteTone: 'warning' as const,
+  }
 }
 
 /**
@@ -4238,6 +4275,23 @@ export function MarketSection(props: MarketSectionProps) {
           // last 600 characters kept the English and dropped the Chinese.
           const clipped = detail.trim().slice(0, 1200)
           setRecords(list => patchRecord(list, updateRecordId, { state: 'failed', reason: clipped }))
+          // A package renamed upstream (#1012) is not a dead end. The host has
+          // already rolled the update back, and this dialog moves the row to
+          // the new name in one step — so it replaces the failure banner and
+          // the "uninstall, then install the new name" advice it used to give.
+          const renamedTarget = typeof body.renamedTo === 'string' && body.renamedTo !== '' ? body.renamedTo : null
+          if (renamedTarget !== null) {
+            // Keep the failure line as well: the dialog is the way out, not the
+            // whole story, and cancelling it must still leave a reason on screen.
+            setInstallError((restore ? t('restoreFail') : t('updateFail')) + ': ' + name + ' — ' + localizeBilingual(clipped, lang))
+            setMigrationConfirm({
+              name,
+              source: String(installed[name] ?? ''),
+              target: renamedTarget,
+              kind: 'npm-rename',
+            })
+            return
+          }
           // Localize the server half before prepending t() chrome.
           setInstallError((restore ? t('restoreFail') : t('updateFail')) + ': ' + name + ' — ' + localizeBilingual(clipped, lang))
         }
@@ -4248,10 +4302,10 @@ export function MarketSection(props: MarketSectionProps) {
         // running row, and let the status poll converge the outcome instead
         // of declaring a false failure — mirroring the install flow's catch.
       })
-  }, [refreshInstalled, t, lang])
+  }, [refreshInstalled, installed, t, lang])
 
 
-  const doSourceMigration = useCallback((name: string, confirmAgentsRunning = false) => {
+  const doSourceMigration = useCallback((name: string, confirmAgentsRunning = false, renameTo?: string) => {
     setInstallError(null)
     setActivationWarnings([])
     setMigrationConfirm(null)
@@ -4259,7 +4313,11 @@ export function MarketSection(props: MarketSectionProps) {
     return fetch(api('/dsh-market/migrate-source'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name, ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}) }),
+      body: JSON.stringify({
+        name,
+        ...(renameTo === undefined ? {} : { kind: 'npm-rename', to: renameTo }),
+        ...(confirmAgentsRunning ? { confirmAgentsRunning: true } : {}),
+      }),
     })
       .then(res => res.json().then(body => ({ status: res.status, body })))
       .then(({ status, body }) => {
@@ -4276,7 +4334,7 @@ export function MarketSection(props: MarketSectionProps) {
           return
         }
         if (status === 409 && body.agentsBusy === true) {
-          setAgentsConfirm({ name, kind: 'update', run: () => { void doSourceMigration(name, true) } })
+          setAgentsConfirm({ name, kind: 'update', run: () => { void doSourceMigration(name, true, renameTo) } })
           return
         }
         setInstallError(t('migrateFail') + ': ' + localizeBilingual(String(body.error || ('HTTP ' + String(status))), lang))
@@ -4305,6 +4363,7 @@ export function MarketSection(props: MarketSectionProps) {
       name,
       source: String(source),
       target: migration.target,
+      kind: migration.kind,
     })
   }, [installed, updates])
 
@@ -7843,7 +7902,7 @@ export function MarketSection(props: MarketSectionProps) {
                                     size="sm"
                                     disabled={updatingName !== null || removingName !== null || busyUrl !== null}
                                     onClick={() => askSourceMigration(name)}
-                                  >{t('migrateNpm')}</Button>
+                                  >{status.sourceMigration.kind === 'npm-rename' ? t('renameRowAction') : t('migrateNpm')}</Button>
                                 )}
                                 {missing
                                   ? <span className={css.metaTag}>{t('notInstalled')}</span>
@@ -8226,53 +8285,60 @@ export function MarketSection(props: MarketSectionProps) {
           t={t}
         />
       )}
-      {migrationConfirm !== null && (
-        <Modal
-          open
-          onClose={() => setMigrationConfirm(null)}
-          title={t('migrateTitle')}
-          description={t('migrateDescription')}
-          footer={(
-            <>
-              <Button
-                variant="ghost"
-                onClick={() => setMigrationConfirm(null)}
-              >
-                {t('cancel')}
-              </Button>
-              <Button
-                variant="primary"
-                disabled={updatingName !== null}
-                onClick={() => doSourceMigration(migrationConfirm.name)}
-              >
-                {t('migrateContinue')}
-              </Button>
-            </>
-          )}
-        >
-          <div className={css.migrationSources}>
-            <div className={css.migrationSource}>
-              <span className={css.migrationLabel}>
-                {t('migrateCurrentSource')}
-              </span>
-              <code>
-                {migrationConfirm.name}: {migrationConfirm.source}
-              </code>
+      {migrationConfirm !== null && (() => {
+        const copy = sourceMigrationCopy(migrationConfirm, t)
+        return (
+          <Modal
+            open
+            onClose={() => setMigrationConfirm(null)}
+            title={copy.title}
+            description={copy.description}
+            footer={(
+              <>
+                <Button
+                  variant="ghost"
+                  onClick={() => setMigrationConfirm(null)}
+                >
+                  {t('cancel')}
+                </Button>
+                <Button
+                  variant="primary"
+                  disabled={updatingName !== null}
+                  onClick={() => doSourceMigration(
+                    migrationConfirm.name,
+                    false,
+                    migrationConfirm.kind === 'npm-rename' ? migrationConfirm.target : undefined,
+                  )}
+                >
+                  {copy.confirmLabel}
+                </Button>
+              </>
+            )}
+          >
+            <div className={css.migrationSources}>
+              <div className={css.migrationSource}>
+                <span className={css.migrationLabel}>{copy.currentLabel}</span>
+                <code>
+                  {migrationConfirm.name}: {migrationConfirm.source}
+                </code>
+              </div>
+              <div className={css.migrationArrow}>↓</div>
+              <div className={css.migrationSource}>
+                <span className={css.migrationLabel}>{copy.targetLabel}</span>
+                <code>{migrationConfirm.target}</code>
+              </div>
             </div>
-            <div className={css.migrationArrow}>↓</div>
-            <div className={css.migrationSource}>
-              <span className={css.migrationLabel}>
-                {t('migrateTargetSource')}
-              </span>
-              <code>{migrationConfirm.target}</code>
-            </div>
-          </div>
-          <p className={css.migrationWarning}>
-            <IconWarningOutline16 size={14} />
-            {t('migrateWarning')}
-          </p>
-        </Modal>
-      )}
+            {copy.noteTone === 'warning' ? (
+              <p className={css.migrationWarning}>
+                <IconWarningOutline16 size={14} />
+                {copy.note}
+              </p>
+            ) : (
+              <p className={css.migrationNote}>{copy.note}</p>
+            )}
+          </Modal>
+        )
+      })()}
       {agentsConfirm !== null && (
         <Modal
           open

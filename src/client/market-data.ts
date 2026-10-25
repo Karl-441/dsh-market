@@ -219,7 +219,14 @@ export interface UpdateStatus {
       on the official Desktop there is no bypass to offer. */
   heldUpdate?: { latest: string; until: string; estimated?: true }
   /** Explicit source migration; never part of update-all. */
-  sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
+  sourceMigration?:
+    | { kind: 'git-to-npm'; repo: string; target: string }
+    /**
+     * The package was renamed on npm (#1012). Only ever reported from a
+     * recorded fact — a failed update that came back under another name — so
+     * the row can offer the move instead of asking for uninstall + install.
+     */
+    | { kind: 'npm-rename'; from: string; target: string }
 }
 
 /** Poll payload from /dsh-market/status. */

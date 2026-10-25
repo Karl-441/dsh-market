@@ -1216,3 +1216,5 @@
 .migrationLabel{font-size:11px;color:var(--dsw-alias-label-secondary,#9ca3af)}
 .migrationArrow{text-align:center;color:var(--dsw-alias-label-secondary,#9ca3af)}
 .migrationWarning{display:flex;align-items:flex-start;gap:6px;margin:12px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary,#b45309)}
+/* Reassurance, not a warning: a rename cannot touch what the plugin saved itself. */
+.migrationNote{margin:12px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#6b7280)}

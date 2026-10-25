@@ -1097,6 +1097,23 @@ describe('POST /dsh-market/restore-snapshot & /dsh-market/delete-snapshot', () =
     expect(jsonBody(listed)).toEqual({ snapshots: [] })
   })
 
+  it('restoring a snapshot neither resurrects nor erases a rename offer (#1012)', async () => {
+    writeStandardProfile()
+    mkdirSync(join(dir, '.dsh-market'), { recursive: true })
+    writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ disabled: ['gone'], renameOffers: { 'evo-subagent': 'dsh-evo-subagent' } }))
+    const created = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    const id = (jsonBody(created).snapshot as { id: string }).id
+
+    // The snapshot froze the old offer; the registry has moved on since.
+    writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ disabled: ['gone'], renameOffers: { 'old-name': 'new-name-x' } }))
+    const restored = await hit(routes, '/dsh-market/restore-snapshot', post('/dsh-market/restore-snapshot', { snapshot: id }))
+    expect(restored.status).toBe(200)
+    const state = JSON.parse(readFileSync(join(dir, '.dsh-market', 'state.json'), 'utf8')) as { renameOffers?: Record<string, string> }
+    // A restore is a picture of the configuration; the offer is a fact about
+    // the registry, so the present value wins in both directions.
+    expect(state.renameOffers).toEqual({ 'old-name': 'new-name-x' })
+  })
+
   it('restore of an unknown snapshot answers 400', async () => {
     const res = await hit(routes, '/dsh-market/restore-snapshot', post('/dsh-market/restore-snapshot', { snapshot: 'snapshot-does-not-exist' }))
     expect(res.status).toBe(400)
