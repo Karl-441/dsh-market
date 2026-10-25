@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-          import { findGitToNpmMigration, findNpmTargetEntry } from '../src/source-migration.ts'
+          import { findCatalogRename, findGitToNpmMigration, findInstalledPredecessor, findNpmTargetEntry, isRegistryRangeSpec } from '../src/source-migration.ts'
 
           const plugins = [
             { name: 'dsh-genui', url: 'https://github.com/omdsh-dev/dsh-genui', npm: '@changfenhuang/dsh-genui' },
@@ -72,3 +72,67 @@ import { describe, expect, it } from 'vitest'
               expect(findNpmTargetEntry([{ name: 'x', npm: 'not a name' }], 'not a name')).toBeNull()
             })
           })
+
+          describe('findCatalogRename (#1012 P1)', () => {
+            const catalog = [
+              { name: 'evo-subagent', npm: 'dsh-evo-subagent', previousNpm: ['evo-subagent-old'] },
+              { name: 'renamed', npm: '@scope/renamed', previousNpm: ['@scope/legacy'] },
+              { name: 'plain', npm: 'plain' },
+            ]
+
+            it('finds the entry that declares the installed name as its predecessor', () => {
+              expect(findCatalogRename(catalog, 'evo-subagent-old')).toEqual({
+                entry: catalog[0],
+                target: 'dsh-evo-subagent',
+              })
+              // npm names are case-insensitive, and the installed key may differ in case
+              expect(findCatalogRename(catalog, '@SCOPE/Legacy')?.target).toBe('@scope/renamed')
+            })
+
+            it('offers nothing when no entry claims the name', () => {
+              expect(findCatalogRename(catalog, 'evo-subagent')).toBeNull()
+              expect(findCatalogRename(catalog, 'plain')).toBeNull()
+            })
+
+            it('fails closed when two entries claim one former name', () => {
+              const ambiguous = [
+                ...catalog,
+                { name: 'impostor', npm: 'impostor', previousNpm: ['evo-subagent-old'] },
+              ]
+              expect(findCatalogRename(ambiguous, 'evo-subagent-old')).toBeNull()
+            })
+
+            it('requires the successor to be installable from npm', () => {
+              expect(findCatalogRename([{ name: 'git-only', previousNpm: ['old'] }], 'old')).toBeNull()
+              expect(findCatalogRename([{ name: 'self', npm: 'self', previousNpm: ['self'] }], 'self')).toBeNull()
+            })
+          })
+
+          describe('findInstalledPredecessor (#1012 P1)', () => {
+            const entry = { name: 'evo', npm: 'dsh-evo-subagent', previousNpm: ['evo-subagent-old'] }
+
+            it('names the installed package that answers to the former name', () => {
+              expect(findInstalledPredecessor(entry, { 'evo-subagent-old': '^1.1.0' })).toBe('evo-subagent-old')
+              expect(findInstalledPredecessor(entry, { 'EVO-SUBAGENT-OLD': '^1.1.0' })).toBe('EVO-SUBAGENT-OLD')
+            })
+
+            it('is silent when the former name is not installed', () => {
+              expect(findInstalledPredecessor(entry, { other: '^1.0.0' })).toBeNull()
+              expect(findInstalledPredecessor({ name: 'x', npm: 'x' }, { 'evo-subagent-old': '^1.1.0' })).toBeNull()
+            })
+          })
+
+          describe('isRegistryRangeSpec (#1012)', () => {
+            it('accepts plain version ranges and tags', () => {
+              for (const spec of ['1.2.3', '^1.2.3', '~1.2', 'latest', '>=1 <2']) {
+                expect(isRegistryRangeSpec(spec)).toBe(true)
+              }
+            })
+
+            it('refuses git, path, alias and workspace sources', () => {
+              for (const spec of ['github:o/r', 'git+https://github.com/o/r.git', 'file:../x', 'link:../x', 'workspace:*', 'npm:dsh-genui@1.2.3', 'a/b', '../plugin', '']) {
+                expect(isRegistryRangeSpec(spec)).toBe(false)
+              }
+            })
+          })
+

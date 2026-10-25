@@ -19,6 +19,8 @@
  *       github:owner/repo[+ #path:], or a release archive under that same repo)
  *   E11 no duplicate install identity (same repo+subpath, or same npm package)
  *   E12 top-level `count` matches plugins.length
+ *   E13 previousNpm (#1012) is a non-empty list of valid npm names, none of
+ *       them still live in the catalog, each claimed by one successor only
  *
  * Network existence probes (does the npm package / github repo actually exist)
  * are intentionally out of scope: they need network, are slow, and are flaky in
@@ -48,10 +50,11 @@ import { fileURLToPath } from 'node:url'
  * CI guard that exists because it had happened before).
  *
  * Now the gate reads what users actually get. A local file still wins when
- * present, so an offline run works by dropping one in.
+ * present, so an offline run works by dropping one in (or by pointing
+ * DSHM_REGISTRY_FILE at a draft).
  */
 const CATALOG_URL = process.env.DSHM_REGISTRY_URL ?? 'https://awesome-dsh-plugin.com/plugins.json'
-const LOCAL = fileURLToPath(new URL('../data/registry-snapshot.json', import.meta.url))
+const LOCAL = process.env.DSHM_REGISTRY_FILE ?? fileURLToPath(new URL('../data/registry-snapshot.json', import.meta.url))
 
 /** The catalog and where it came from, or null when neither source answers. */
 async function loadCatalog() {
@@ -270,10 +273,54 @@ async function main() {
       identSeen.set(identity, p.name)
     }
 
+    // E13 — previousNpm (#1012): a renamed package's former npm names. Shape
+    // only here; the cross-entry rules run after the loop, once every live
+    // package name in the catalog is known.
+    if (p.previousNpm !== undefined) {
+      if (!Array.isArray(p.previousNpm) || p.previousNpm.length === 0) {
+        fail(errors, p, 'E13', 'previousNpm must be a non-empty array of npm package names when present')
+      } else {
+        for (const old of p.previousNpm) {
+          if (typeof old !== 'string' || !NPM_NAME_RE.test(old)) {
+            fail(errors, p, 'E13', `previousNpm entry ${JSON.stringify(old)} is not a valid npm package name`)
+          }
+        }
+      }
+    }
+
     // W1 — display-name collision (allowed across distinct authors / monorepos)
     const seen = nameToEntries.get(p.name)
     if (seen) seen.push(p.owner)
     else nameToEntries.set(p.name, [p.owner])
+  }
+
+  // E13 — previousNpm cross-entry rules (#1012). A former name that is still a
+  // live package elsewhere in the catalog would make one name mean two
+  // plugins, so it is refused; and one former name may have exactly one
+  // successor, or discovery is ambiguous and the market would silently offer
+  // nothing.
+  const liveNames = new Map()
+  for (const p of plugins) {
+    for (const n of [p.name, p.npm]) {
+      if (typeof n === 'string' && n !== '') liveNames.set(n.toLowerCase(), p.name)
+    }
+  }
+  const declaredFormer = new Map()
+  for (const p of plugins) {
+    if (!Array.isArray(p.previousNpm)) continue
+    for (const old of p.previousNpm) {
+      if (typeof old !== 'string' || !NPM_NAME_RE.test(old)) continue
+      const key = old.toLowerCase()
+      if (liveNames.has(key)) {
+        fail(errors, p, 'E13', `previousNpm "${old}" is still a live package name in the catalog ("${liveNames.get(key)}")`)
+        continue
+      }
+      if (declaredFormer.has(key)) {
+        fail(errors, p, 'E13', `previousNpm "${old}" is already declared by "${declaredFormer.get(key)}"; one former name can only have one successor`)
+      } else {
+        declaredFormer.set(key, p.name)
+      }
+    }
   }
 
   // E12 — count integrity
@@ -318,3 +365,4 @@ async function main() {
 }
 
 await main()
+

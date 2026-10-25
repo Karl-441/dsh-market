@@ -8,6 +8,7 @@ import { logEvent } from './log.ts'
 import { configuredProxy, marketFetch } from './net.ts'
 import { catalogFromPackage } from './catalog-npm.ts'
 import { activeRegion, catalogSourcesFor, routesFor, type CatalogSource, type Region } from './regions.ts'
+import { NPM_NAME_RE } from './sources.ts'
 
 export interface RegistryPlugin {
   name: string
@@ -54,6 +55,21 @@ export interface RegistryPlugin {
   /** Catalog name of the suggested replacement plugin, when deprecated. */
   replacement?: string
   /**
+   * npm package names this entry used BEFORE its current one (#1012).
+   *
+   * The catalog is the only place a rename can be stated ahead of time: the
+   * old name's npm metadata is gone (no dist-tags, no `deprecated` message),
+   * so nothing the market can fetch still knows the two names are one plugin.
+   * Same trust boundary as `deprecated`/`replacement` — absent for every
+   * normal entry, and a catalog without the field behaves exactly as before.
+   *
+   * Values are validated where they are consumed (normalized by
+   * {@link pluginPreviousNpm}, cross-entry rules in scripts/validate-registry.mjs):
+   * a former name must never be a live package in the catalog, and one former
+   * name may only have one successor.
+   */
+  previousNpm?: string[]
+  /**
    * Capability disclosure (#401): what a static scan of the artifact a user
    * would install reported touching — `shell`, `network`, `credentials`,
    * `fs-read`, `fs-write`, `env`, `llm`, `dynamic-code`, ...
@@ -94,6 +110,36 @@ export interface Registry {
   count: number
   categories: Record<string, Record<string, string>>
   plugins: RegistryPlugin[]
+}
+
+/**
+ * Former npm names for one catalog entry, normalized (#1012).
+ *
+ * Catalog JSON is external input, so a malformed declaration is dropped
+ * rather than trusted: only syntactically valid npm names survive, an entry
+ * may not list itself (its own `npm` or `name`), and duplicates collapse in
+ * declaration order. Cross-entry rules — a former name that is still live
+ * elsewhere, or two entries claiming one former name — cannot be judged per
+ * entry; the validator enforces them for the catalog, and
+ * `findCatalogRename` fails closed on ambiguity at runtime.
+ */
+export function pluginPreviousNpm(
+  plugin: Pick<RegistryPlugin, 'name' | 'npm' | 'previousNpm'>,
+): string[] {
+  const declared: unknown = plugin.previousNpm
+  const values: unknown[] = Array.isArray(declared) ? declared : declared === undefined || declared === null ? [] : [declared]
+  const own = new Set<string>([plugin.name.toLowerCase()])
+  if (typeof plugin.npm === 'string' && plugin.npm !== '') own.add(plugin.npm.toLowerCase())
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const value of values) {
+    if (typeof value !== 'string' || value === '' || !NPM_NAME_RE.test(value)) continue
+    const key = value.toLowerCase()
+    if (own.has(key) || seen.has(key)) continue
+    seen.add(key)
+    names.push(value)
+  }
+  return names
 }
 
 /**
@@ -199,7 +245,14 @@ function asRegistry(value: unknown): Registry {
   const plugins = data.plugins.map((plugin, index) => {
     const category = pluginCategories(plugin)
     if (category.length === 0) throw new Error(`catalog plugin ${String(index)} carries no usable category`)
-    return { ...plugin, category }
+    const previousNpm = pluginPreviousNpm(plugin)
+    // An entry with nothing usable to declare looks exactly like one that
+    // declared nothing, so the field stays absent rather than becoming [].
+    if (previousNpm.length === 0) {
+      const { previousNpm: _declared, ...rest } = plugin
+      return { ...rest, category }
+    }
+    return { ...plugin, category, previousNpm }
   })
   return { ...data, plugins }
 }

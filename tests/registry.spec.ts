@@ -13,7 +13,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { describeFetchFailure, forgetCatalog, loadRegistry } from '../src/registry.ts'
+import { describeFetchFailure, forgetCatalog, loadRegistry, pluginPreviousNpm } from '../src/registry.ts'
 import { configuredProxy, marketFetch } from '../src/net.ts'
 
 /**
@@ -706,3 +706,25 @@ describe('loadRegistry body deadlines (the catalog outgrew a total one)', () => 
     await expect(loadRegistry()).rejects.toThrow(/the catalog response carried no body/)
   })
 })
+
+describe('pluginPreviousNpm (#1012 P1)', () => {
+  it('keeps valid former names and drops anything the runtime cannot trust', async () => {
+    expect(pluginPreviousNpm({ name: 'evo', npm: 'dsh-evo-subagent', previousNpm: ['evo-subagent-old', '@scope/legacy'] }))
+      .toEqual(['evo-subagent-old', '@scope/legacy'])
+  })
+
+  it('drops the entry itself, invalid names and duplicates', async () => {
+    expect(pluginPreviousNpm({
+      name: 'evo',
+      npm: 'dsh-evo-subagent',
+      previousNpm: ['EVO', 'dsh-evo-subagent', 'not a name', '', 'old', 'OLD'],
+    })).toEqual(['old'])
+  })
+
+  it('treats an absent or malformed declaration exactly like no declaration', async () => {
+    expect(pluginPreviousNpm({ name: 'evo', npm: 'evo' })).toEqual([])
+    expect(pluginPreviousNpm({ name: 'evo', npm: 'evo', previousNpm: 'old' })).toEqual(['old'])
+    expect(pluginPreviousNpm({ name: 'evo', npm: 'evo', previousNpm: [] })).toEqual([])
+  })
+})
+

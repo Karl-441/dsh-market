@@ -10,7 +10,7 @@
  * - branch/tag/commit/semver selectors are not migrated in v1;
  * - more than one matching verified npm entry is ambiguous and fails closed.
  */
-import { NPM_NAME_RE, parseSourceUrl, repoOfTarget } from './sources.ts'
+import { NPM_NAME_RE, isGitHostedSpec, isLocalSpec, parseSourceUrl, repoOfTarget } from './sources.ts'
 
 export interface GitToNpmMigration {
   kind: 'git-to-npm'
@@ -100,3 +100,76 @@ export function findNpmTargetEntry<T extends { name: string; npm?: unknown }>(
   })
   return matches.length === 1 ? matches[0]! : null
 }
+
+/**
+ * The catalog entry that declares `from` as a package it used to be (#1012).
+ *
+ * This is the discovery the update failure cannot provide: a user whose old
+ * version range no longer resolves never installs anything, so no
+ * "came back under another name" evidence is produced. The catalog states the
+ * rename up front instead — but it is external input, so two entries claiming
+ * one former name is ambiguity, and ambiguity fails closed exactly like
+ * {@link findGitToNpmMigration}.
+ *
+ * Only entries that can actually be installed from npm qualify: an entry whose
+ * own target is not a valid npm name has no successor this transaction could
+ * install.
+ */
+export function findCatalogRename<T extends { name: string; npm?: unknown; previousNpm?: unknown }>(
+  plugins: readonly T[],
+  from: string,
+): { entry: T; target: string } | null {
+  const wanted = from.toLowerCase()
+  const candidates: { entry: T; target: string }[] = []
+  for (const plugin of plugins) {
+    const previous = Array.isArray(plugin.previousNpm) ? plugin.previousNpm : []
+    if (!previous.some(name => typeof name === 'string' && name.toLowerCase() === wanted)) continue
+    const target = typeof plugin.npm === 'string' && NPM_NAME_RE.test(plugin.npm) ? plugin.npm : null
+    // An entry may never name itself as its own predecessor; the runtime
+    // normalizer drops that, and this keeps a hand-built catalog honest too.
+    if (target === null || target.toLowerCase() === wanted) continue
+    candidates.push({ entry: plugin, target })
+  }
+  return candidates.length === 1 ? candidates[0]! : null
+}
+
+/**
+ * The installed package count that still answers to this entry's former name.
+ *
+ * A renamed package usually re-registers the very same bundle ids, so two
+ * package names that were one plugin cannot coexist in a profile: the trial
+ * boot rejects duplicate loader ids while the two sit side by side. That makes
+ * "install the new name as well" the one obvious move that bricks the next
+ * start, which is why the install route refuses it before pnpm runs (#1012).
+ */
+export function findInstalledPredecessor<T extends { name: string; previousNpm?: unknown }>(
+  plugin: T,
+  installed: Record<string, unknown>,
+): string | null {
+  const previous = Array.isArray(plugin.previousNpm) ? plugin.previousNpm : []
+  for (const value of previous) {
+    if (typeof value !== 'string' || value === '') continue
+    const wanted = value.toLowerCase()
+    for (const name of Object.keys(installed)) {
+      if (name.toLowerCase() === wanted) return name
+    }
+  }
+  return null
+}
+
+/**
+ * True when a dependency spec is a plain registry version range — the only
+ * shape the rename transaction can replace.
+ *
+ * The route refuses anything carrying a protocol, a path prefix or an alias
+ * (`github:`, `file:`, `workspace:`, `npm:` …), because those describe a
+ * source this transaction cannot reproduce for the new name. Discovery is
+ * kept to the exact same test so the market never offers a migration the
+ * route would answer with 400.
+ */
+export function isRegistryRangeSpec(spec: string): boolean {
+  if (spec === '') return false
+  if (isGitHostedSpec(spec) || isLocalSpec(spec)) return false
+  return !/[:/\\]/.test(spec)
+}
+

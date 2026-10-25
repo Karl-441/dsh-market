@@ -41,7 +41,7 @@ import { applyPreset, deletePreset, listPresets, previewPreset, savePreset } fro
 import { createProfileSnapshot, DEFAULT_MAX_SNAPSHOTS, deleteSnapshot, listSnapshots, restoreSnapshot } from './snapshot.ts'
 import { readHostRecoveryView, restoreHostRecoveryBackup } from './host-recovery.ts'
 import { trialValidate } from './trial.ts'
-import { catalogRepoKey, findCatalogEntryForLocal, findInstalledAlias, gitCommitOfTarget, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitRefOfTarget, gitTargetAtCommit, gitUpdateTarget, hostedRepoKey, lookupRepoFromUrl, pinnedAllowBuildsKeys, installTargetFor, isGenerationLink, isGitHostedSpec, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, sourceFallbackFor, workspaceProtocolDeps } from './sources.ts'
+import { catalogRepoKey, findCatalogEntryForLocal, findInstalledAlias, gitCommitOfTarget, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitRefOfTarget, gitTargetAtCommit, gitUpdateTarget, hostedRepoKey, lookupRepoFromUrl, pinnedAllowBuildsKeys, installTargetFor, isGenerationLink, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, sourceFallbackFor, workspaceProtocolDeps } from './sources.ts'
 import { failureDetail, groupConflictsByOwner, installApplied, isHostPortCollision, isStaleUpdate, parseIgnoredBuildEntries, parseIgnoredBuilds, parsePrepareKey, parsePrepareNotAllowed, pnpmBlockedByOpenFiles, pnpmNeverStarted, pnpmRefusedYoungRelease, RELEASE_AGE_OVERRIDE, removeDanglingHostBridge, retargetCollections, updateApplied, validateAddedPlugins, withHoistRecovery } from './install.ts'
 import { classifyPnpmFailure } from './pnpm-compat.ts'
 import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './channels.ts'
@@ -71,7 +71,7 @@ import {
   createGist, fitsGistLimit, GistError, gistErrorCode, parseGistId, readGist, resolveGistTokenSource, updateGist, verifyGistToken,
 } from './gist.ts'
 import { MAX_UPDATE_OPERATIONS_V1, UpdateOperationStoreV1, UPDATE_API_V1_SCHEMA } from './update-api-v1.ts'
-import { findGitToNpmMigration, findNpmTargetEntry, type GitToNpmMigration, type NpmRenameMigration } from './source-migration.ts'
+import { findCatalogRename, findGitToNpmMigration, findInstalledPredecessor, findNpmTargetEntry, isRegistryRangeSpec, type GitToNpmMigration, type NpmRenameMigration } from './source-migration.ts'
 
 export type { LoaderEntry } from './themes.ts'
 export type { UpdateStatus } from './updates.ts'
@@ -3982,6 +3982,18 @@ export function mountMarketRoutes(
               const migration = findGitToNpmMigration(registry.plugins, spec)
               if (migration !== null) sourceMigrationFor.set(name, migration)
             }
+            // A rename declared by the catalog (#1012, P1). This is the only
+            // path that reaches a user whose old range no longer resolves:
+            // their update fails before installing anything, so no offer was
+            // ever recorded. The catalog states the rename up front, and the
+            // row still has to be a plain registry range the transaction can
+            // replace — and the successor must not already be installed.
+            for (const [name, spec] of Object.entries(installed)) {
+              if (sourceMigrationFor.has(name) || !isRegistryRangeSpec(spec)) continue
+              const rename = findCatalogRename(registry.plugins, name)
+              if (rename === null || installed[rename.target] !== undefined) continue
+              sourceMigrationFor.set(name, { kind: 'npm-rename', from: name, target: rename.target })
+            }
             // A rename recorded by an earlier failed update (#1012) outlives
             // the response that discovered it, so the row keeps offering the
             // move after a reload. Only shipped while the catalog still
@@ -3993,7 +4005,7 @@ export function mountMarketRoutes(
               // The rename transaction only replaces a registry dependency; a
               // git, path, alias or workspace spec is refused there, so offering
               // it here would be a button that can only 400 (#1012).
-              if (isGitHostedSpec(spec) || isLocalSpec(spec) || spec.includes(':')) continue
+              if (!isRegistryRangeSpec(spec)) continue
               if (findNpmTargetEntry(registry.plugins, to) === null) continue
               sourceMigrationFor.set(name, { kind: 'npm-rename', from: name, target: to })
             }
@@ -4104,7 +4116,7 @@ sendJson(response, 200, { updates })
               // protocol or a path separator — `github:`, `file:`, `link:`,
               // `workspace:`, `catalog:`, `npm:other@1.0.0`, a tarball URL — and
               // replacing one of those with `to@latest` is not a rename (#1012).
-              if (isGitHostedSpec(spec) || isLocalSpec(spec) || /[:/\\]/.test(spec)) {
+              if (!isRegistryRangeSpec(spec)) {
                 sendJson(response, 400, {
                   error: '当前安装不是 npm 依赖，不能按包名迁移。 / The current install is not an npm dependency, so it cannot be migrated by package name.',
                 })
@@ -6592,6 +6604,21 @@ sendJson(response, 200, { updates })
                 return
               }
             }
+            // Predecessor guard (#1012): the package this entry used to be may
+            // still be installed under its old name. A rename re-registers the
+            // same bundle ids, so two copies cannot coexist — the trial boot
+            // rejects duplicate loader ids and the next start fails. Installing
+            // a successor beside its predecessor is the one obvious move that
+            // bricks the profile, so it is refused here, before pnpm runs, with
+            // the migration that carries the market state across named.
+            const predecessor = findInstalledPredecessor(entry, installedNow)
+            if (predecessor !== null) {
+              logEvent('warn', 'install-rejected', `${entry.name}: predecessor ${predecessor} is installed — migration required`)
+              sendJson(response, 400, {
+                error: `已安装的「${predecessor}」是这个插件改名前用的名字。直接装会装出两份，可能让下次启动失败；用「迁移到新名字」把它换过去，开关、分组和备注都会保留。 / "${predecessor}" is installed under this plugin's previous package name. Installing it alongside would create two copies and can break the next start — migrate it to the new name instead; switches, groups and notes come along.`,
+              })
+              return
+            }
             // Fresh installs ask the host requirement too (#404/#473: the
             // update route refuses a declared-incompatible release before
             // installing; an unguarded fresh install would hit exactly the
@@ -7009,3 +7036,6 @@ sendJson(response, 200, { updates })
     for (const dispose of disposers) dispose()
   }
 }
+
+
+
