@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { installMarketSettings, MarketSettings } from '../src/settings.ts'
+import { installMarketSettings, MarketSettings, settingsNamespaceState } from '../src/settings.ts'
 
 /** Minimal cordis stand-in recording the optional `settings` injection. */
 function fakeContext(hasSettings: boolean) {
@@ -32,6 +32,39 @@ function fakeContext(hasSettings: boolean) {
   }
   return ctx
 }
+
+/** Minimal cordis stand-in whose settings service DOES take a namespace. */
+function fakeContextWithRegister() {
+  const ctx = {
+    inject(services: string[], callback: (scoped: unknown) => void) {
+      if (services.includes('settings')) callback(ctx)
+    },
+    settings: {
+      register: () => ({ get: () => ({ allowRestart: true }), watch: () => {} }),
+    },
+    effect: (run: () => unknown) => { run() },
+    on: () => () => {},
+  }
+  return ctx
+}
+
+describe('what the market reports about its namespace (#677)', () => {
+  // The two answers a reader can get, and they exist because a host
+  // generation changed the contract underneath: 0.1.7 derives settings from
+  // a plugin's Config schema and serves no third-party namespace, so the
+  // market's plugin-configuration card cannot be dispatched there. Without
+  // this the difference is invisible — a test (or a bug report) cannot tell
+  // "the host cannot serve it" from "the market failed to register it".
+  it('is unsupported-by-host when the settings service has no register()', () => {
+    installMarketSettings(fakeContext(true) as never, { allowRestart: true })
+    expect(settingsNamespaceState()).toBe('unsupported-by-host')
+  })
+
+  it('is registered when the host takes the namespace', () => {
+    installMarketSettings(fakeContextWithRegister() as never, { allowRestart: true })
+    expect(settingsNamespaceState()).toBe('registered')
+  })
+})
 
 describe('MarketSettings schema', () => {
   it('defaults allowRestart to on', () => {
@@ -67,6 +100,48 @@ describe('installMarketSettings', () => {
     // registration rides its own scoped fiber.
     expect(ctx.injected.flat()).toContain('settings')
     expect(ctx.injected.flat()).not.toContain('webServer')
+  })
+
+  it('does not throw on a dsh 0.1.7 settings service, which has no register (#677)', () => {
+    // 0.1.7's SettingsService exposes describe/update only; namespaces are
+    // derived from a plugin's Config schema. The service still EXISTS, so the
+    // inject callback runs — and calling register threw a TypeError that
+    // cordis swallowed. The composed entry has to stand, and the host log
+    // has to say why the switch is absent rather than stay silent.
+    const warnings: string[] = []
+    const ctx = {
+      inject(services: string[], callback: (scoped: unknown) => void) {
+        if (services.includes('settings')) callback(ctx)
+      },
+      settings: { describe: () => [], update: async () => {} },
+      effect: (run: () => unknown) => { run() },
+      logger: () => ({ warn: (message: string) => { warnings.push(message) } }),
+    }
+    const resolved = { allowRestart: false }
+    expect(() => installMarketSettings(ctx as never, resolved)).not.toThrow()
+    expect(resolved.allowRestart).toBe(false)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/no register\(\)/)
+  })
+
+  it('still registers on a pre-0.1.7 settings service', () => {
+    // The guard must not swallow a host where register works: that would
+    // quietly remove the switch from every host that has it today.
+    const registered: string[] = []
+    const ctx = {
+      inject(services: string[], callback: (scoped: unknown) => void) {
+        if (services.includes('settings')) callback(ctx)
+      },
+      settings: {
+        register: (ns: string, _schema: unknown, options: { base: unknown }) => {
+          registered.push(ns)
+          return { get: () => options.base, watch: () => () => {} }
+        },
+      },
+      effect: (run: () => unknown) => { run() },
+    }
+    installMarketSettings(ctx as never, { allowRestart: true })
+    expect(registered).toEqual(['dsh-market'])
   })
 
   it('takes nothing from @deepseek-ai/dsh-settings at runtime', () => {

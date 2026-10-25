@@ -15,7 +15,13 @@
  * here because the client bundle is built independently of the host tree.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
-import { Button, IconChevronDownOutline14, IconChevronRightOutline14, IconLoadingOutline16, IconRefreshOutline14, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import {
+  IconChevronDownOutline14,
+  IconChevronRightOutline14,
+  IconLoadingOutline16,
+  IconRefreshOutline14,
+} from './icons.ts'
 import css from './Market.module.css'
 import { api } from './market-data.ts'
 import type { Translate } from './market-data.ts'
@@ -98,6 +104,14 @@ interface OrderConflict {
   reason: string
 }
 
+/** Mirrors ResidualDirectory in src/check.ts. */
+interface ResidualDirectory {
+  name: string
+  path: string
+  kind: 'incomplete-package' | 'tmp-directory'
+  declared: boolean
+}
+
 /** Mirrors CheckReport in src/check.ts. */
 interface CheckReport {
   profile: string
@@ -115,6 +129,22 @@ interface CheckReport {
   duplicateNames?: Array<{ name: string; layers: string[]; count: number }>
   /** #98 opt: LOOT-style suggested community order satisfying every rule. */
   suggestedOrder?: { ok: true; order: string[] } | { ok: false; cycle: string[] } | null
+  /**
+   * Leftover directories: an incomplete package (no readable `package.json`)
+   * and pnpm's `<name>_tmp_<pid>_<n>` staging directories (#663). Not a boot
+   * failure — informational, and the only place that names what is on disk.
+   */
+  residuals?: ResidualDirectory[]
+  /**
+   * Installed plugins whose client reads its config from a name no loader
+   * entry serves (#810). Attached by the /check route, which is the only
+   * caller that pays for reading one client bundle per installed plugin.
+   */
+  configNamespaces?: Array<{
+    name: string
+    namespaces: string[]
+    ownEntryIds: string[]
+  }>
 }
 
 /**
@@ -149,7 +179,6 @@ function Section(props: {
         {alert && <span className={css.diagAlert}>⚠</span>}
         <span className={`${css.collapseTitle}${alert ? ` ${css.diagAlert}` : ''}`}>{title}</span>
         <span className={css.diagCount}>({count})</span>
-        <span className={css.grow} />
       </button>
       {!open && overview !== undefined && <div className={css.sectionOverview}>{overview}</div>}
       <div className={css.collapseBody} style={open ? undefined : { display: 'none' }}>
@@ -174,7 +203,6 @@ function CollapsibleSection(props: { title: string; count?: number; open: boolea
         </span>
         <span className={css.collapseTitle}>{title}</span>
         {count !== undefined && <span className={css.diagCount}>({count})</span>}
-        <span className={css.grow} />
       </button>
       <div className={css.collapseBody} style={open ? undefined : { display: 'none' }}>
         {children}
@@ -792,6 +820,58 @@ export function Diagnostics(props: { t: Translate }) {
               <code className={css.diagVal}>{orphan.id}</code>
               <span className={css.nm}>{orphan.layer}</span>
               <span className={css.spec}>{orphan.reason}</span>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      {/* Leftovers (#663). Informational: nothing here stops a boot, and the
+          user cannot see any of it from the profile's package.json. */}
+      <Section
+        title={t('checkResiduals')}
+        count={report.residuals?.length ?? 0}
+        empty={t('checkResidualsEmpty')}
+        problem={false}
+        overview={report.residuals?.[0]?.path}
+      >
+        <p className={css.panelNote}>{t('checkResidualsHint')}</p>
+        <div className={css.diagList}>
+          {(report.residuals ?? []).map(residual => (
+            <div key={residual.path} className={css.diagRow}>
+              <span className={css.nm}>{residual.name}</span>
+              <span className={css.spec}>
+                {t(residual.kind === 'tmp-directory' ? 'checkResidualTmp' : 'checkResidualIncomplete')}
+              </span>
+              <code className={css.diagVal}>{residual.path}</code>
+            </div>
+          ))}
+        </div>
+      </Section>
+
+      {/* A client that reads its config from a name no loader entry serves
+          (#810). This one IS a defect — the plugin's settings are blank or
+          unwritable right now — but it is the plugin's own, not the
+          profile's, so it stays out of the summary warnings: nothing the user
+          can do to this profile fixes it. The section title says whose
+          problem it is and the hint says who has to change it. */}
+      <Section
+        title={t('checkConfigNamespaces')}
+        count={report.configNamespaces?.length ?? 0}
+        empty={t('checkConfigNamespacesEmpty')}
+        overview={report.configNamespaces?.[0]?.name}
+      >
+        <p className={css.panelNote}>{t('checkConfigNamespacesHint')}</p>
+        <div className={css.diagList}>
+          {(report.configNamespaces ?? []).map(finding => (
+            <div key={finding.name} className={css.diagRow}>
+              <span className={css.nm}>{finding.name}</span>
+              <span className={css.spec}>
+                {finding.namespaces.map(namespace => t('checkConfigNamespaceRow').replace('{0}', namespace)).join('；')}
+                {' — '}
+                {finding.ownEntryIds.length > 0
+                  ? `${t('checkConfigNamespaceOwn')}: ${finding.ownEntryIds.join(', ')}`
+                  : t('checkConfigNamespaceNone')}
+              </span>
             </div>
           ))}
         </div>

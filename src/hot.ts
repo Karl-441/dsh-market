@@ -16,14 +16,14 @@
  * for the in-tree precedent).
  */
 
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { asChannel, type Channel } from './channels.ts'
 import { asRegion, normalizeGithubProxy, type Region } from './regions.ts'
 import { logEvent } from './log.ts'
-import { entryArtifactExists } from './profile.ts'
+import { declaredBundlePatchFiles, entryArtifactExists } from './profile.ts'
 
 interface HotRow {
   id: string
@@ -273,8 +273,116 @@ export interface MarketState {
    * pre-install list, unlike groups/notes which target installed packages.
    */
   favorites?: string[]
+  /**
+   * Package names the user hid from Discover and Themes (#657).
+   *
+   * Local, per-profile, reversible. The Hidden tab lists the same names so
+   * the choice can be undone. Independent of `disabled` (the plugin can keep
+   * running) and of the session-only update ignore (that one dies on restart).
+   * A stored name may be the installed package name or the catalog package
+   * name; the client treats both as one plugin when it can match them.
+   *
+   * Optional on the way in, like `notes` / `favorites`: several callers
+   * build a state object from the few fields they own, and requiring this
+   * one would make every such call a silent way to erase the list (#339).
+   */
+  blocked?: string[]
+  /**
+   * Installed package names the user asked not to be reminded about (#728).
+   *
+   * This is not {@link blocked}. Hiding a plugin takes it off Discover.
+   * This list leaves the plugin where it is, and leaves the update itself
+   * on the installed row. It only stops the reminder: the badge, the
+   * "update all" count, the sort-to-top, and the reminder bar. A new
+   * version is still listed, and the row's own Update button still works.
+   *
+   * Optional on the way in, for the same reason as `blocked` (#339).
+   * An empty array is how the last name is removed.
+   */
+  updateExempt?: string[]
   /** User-supplied HTTPS prefix used when the built-in GitHub routes fail. */
   githubProxy?: string
+  /**
+   * Whether the market also opens from its own row in the sidebar (#846).
+   *
+   * Off unless the user turned it on: the sidebar's global rows are the
+   * host's own pages, and installing plugins is occasional, so a row nobody
+   * asked for would be a permanent fixture for an occasional task. The
+   * settings entry stays either way — it is the way in on hosts with no
+   * sidebar panels, and turning this off must never leave the market
+   * unreachable.
+   *
+   * Omission preserves, an explicit value wins — the githubProxy contract,
+   * because turning it off has to be expressible.
+   */
+  sidebarEntry?: boolean
+  /**
+   * Packages the market removed from the profile's own declarations because
+   * the build on disk can no longer compose (#663).
+   *
+   * The case this exists for: an update blocked by open files leaves the
+   * target directory incomplete, `keepLockedBuild` cannot keep the previous
+   * build, and the profile goes on declaring a package whose `package.json`
+   * is missing. The next start dies in composition — on Desktop the window
+   * never opens — and the only way out was uninstalling the plugin by hand.
+   * So the declaration is dropped instead (a rename or a delete of the
+   * directory itself cannot be attempted: the same lock that stopped pnpm
+   * refuses the market's move too), and this map is what keeps that from
+   * being silent. The plugin disappears from the installed list; this is the
+   * record saying why, and what spec to reinstall.
+   *
+   * Optional on the way in, like `notes`: several callers write a state
+   * object built from the few fields they own, and requiring this one would
+   * make every such call a way to erase every entry (#339's shape).
+   */
+  brokenPlugins?: Record<string, BrokenPlugin>
+
+  /**
+   * The operator's pinned build environment (issue #336) as saved from the
+   * market's own settings card. Absent means "the composition says" — the
+   * entry's `config.buildEnv`, or nothing at all. Present (non-empty) means
+   * a saved editor state REPLACES the composition map, so clearing the
+   * field on the card inherits the composition again rather than freezing
+   * an earlier save. Read live into `config.buildEnv` by the routes; see
+   * src/dsh-cli.ts spawnEnv for the precedence once it reaches a child.
+   */
+  buildEnv?: Record<string, string>
+}
+
+/** Why a package is no longer declared, and what to put back. */
+export interface BrokenPlugin {
+  /** The dependency spec it had before removal — the reinstall target. */
+  spec: string
+  /**
+   * Machine-readable cause; the UI owns the wording. `locked`: pnpm reported
+   * the open-file refusal. `cancelled`: the user cancelled while pnpm was
+   * replacing the directory — the result is the same empty shell, but no cause
+   * was observed, so the notice must not name one (#663).
+   */
+  reason: BrokenReason
+  /** When the market removed the declaration (ISO 8601). */
+  at: string
+}
+
+export type BrokenReason = 'incomplete-build-locked' | 'incomplete-build-cancelled'
+
+const BROKEN_REASONS = new Set<string>(['incomplete-build-locked', 'incomplete-build-cancelled'])
+
+/** The on-disk shape of {@link MarketState.brokenPlugins}, sanitized. */
+function brokenPluginsFromUnknown(value: unknown): Record<string, BrokenPlugin> | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const out: Record<string, BrokenPlugin> = {}
+  for (const [name, raw] of Object.entries(value)) {
+    if (name === '' || raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const record = raw as { spec?: unknown; reason?: unknown; at?: unknown }
+    if (typeof record.reason !== 'string' || !BROKEN_REASONS.has(record.reason)) continue
+    out[name] = {
+      spec: typeof record.spec === 'string' ? record.spec.slice(0, MAX_NOTE) : '',
+      reason: record.reason as BrokenReason,
+      at: typeof record.at === 'string' ? record.at : '',
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 /** Unique non-empty strings in `value`, order preserved. */
@@ -293,9 +401,74 @@ function uniqueStrings(value: unknown): string[] {
 /** Upper bound on bookmarked catalog URLs kept in state.json (#414). */
 export const MAX_FAVORITES = 500
 
+/** Upper bound on blocked package names kept in state.json (#657). */
+export const MAX_BLOCKED = 500
+
+/** Upper bound on the persistent do-not-remind list (#728). */
+export const MAX_UPDATE_EXEMPT = 500
+
+/** npm package names are at most 214 characters. Longer values are not names. */
+export const MAX_BLOCKED_NAME = 214
+
 /** Catalog URLs the user may favorite; http(s) only, order preserved. */
 function favoriteUrls(value: unknown): string[] {
   return uniqueStrings(value).filter(url => url.startsWith('http://') || url.startsWith('https://'))
+}
+
+/** Package names, non-empty, order preserved, capped. */
+function cappedPackageNames(value: unknown, cap: number): string[] {
+  const trimmed = Array.isArray(value)
+    ? value.map(item => typeof item === 'string' ? item.slice(0, MAX_BLOCKED_NAME) : item)
+    : value
+  return uniqueStrings(trimmed).slice(0, cap)
+}
+
+/** Package names the user may block. */
+function blockedNames(value: unknown): string[] {
+  return cappedPackageNames(value, MAX_BLOCKED)
+}
+
+/** Package names the user may stop being reminded about. */
+function updateExemptNames(value: unknown): string[] {
+  return cappedPackageNames(value, MAX_UPDATE_EXEMPT)
+}
+
+/** A POSIX-looking environment variable name: the name part of `KEY=value`. */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/** Upper bound on one pinned env value, so state.json cannot balloon. */
+const MAX_ENV_VALUE = 4096
+
+/**
+ * Sanitize an untrusted build-env map (state.json, or the card route's body)
+ * into the shape spawnEnv can merge.
+ *
+ * An empty map and a non-object both read as undefined: clearing the card
+ * must inherit the composition, and a blank line in state.json must not
+ * disable every pinned variable. Only the merge precedence in
+ * src/dsh-cli.ts spawnEnv — never this — protects PATH and CI, but a value
+ * a user typed for them would silently do nothing there, so it is rejected
+ * here with a reason instead.
+ *
+ * `GIT_ASKPASS` and `SSH_ASKPASS` are deliberately NOT rejected, though they
+ * are the two names that can re-open a credential prompt: pointing them at a
+ * program is the supported non-interactive way to answer one, and #587/#596
+ * close the *terminal* fallback (GIT_TERMINAL_PROMPT, BatchMode) rather than
+ * the program one. A user who pins these has already said where the answer
+ * comes from; a user who does not still gets the closed prompt.
+ */
+export function buildEnvFromUnknown(value: unknown): Record<string, string> | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const out: Record<string, string> = {}
+  for (const [key, raw] of Object.entries(value)) {
+    if (!ENV_KEY_RE.test(key)) continue
+    if (key === 'PATH' || key === 'CI') continue
+    if (typeof raw !== 'string') continue
+    const entry = raw.trim()
+    if (entry === '') continue
+    out[key] = entry.slice(0, MAX_ENV_VALUE)
+  }
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 /**
@@ -318,8 +491,13 @@ export function readMarketState(profileDir: string): MarketState {
       region?: unknown
       regionAuto?: unknown
       githubProxy?: unknown
+      buildEnv?: unknown
       notes?: unknown
       favorites?: unknown
+      blocked?: unknown
+      updateExempt?: unknown
+      brokenPlugins?: unknown
+      sidebarEntry?: unknown
     }
     const disabled = uniqueStrings(state.disabled !== undefined ? state.disabled : state.disabledSkins)
     const groups: Record<string, string[]> = {}
@@ -337,21 +515,76 @@ export function readMarketState(profileDir: string): MarketState {
       }
     }
     const githubProxy = normalizeGithubProxy(state.githubProxy)
+    const brokenPlugins = brokenPluginsFromUnknown(state.brokenPlugins)
+    // The order and the map are two halves of one fact, and a state file can
+    // carry them out of step (#964): the UI then lists a group the routes
+    // cannot find, so "assign to" and even "delete" answer group-not-found
+    // forever. Normalize on read — a name with no group disappears from the
+    // order, and a group with no order entry gets one appended — so the two
+    // cannot disagree however the file got that way.
+    const groupOrder = uniqueStrings(state.groupOrder).filter(name => groups[name] !== undefined)
+    for (const name of Object.keys(groups)) {
+      if (!groupOrder.includes(name)) groupOrder.push(name)
+    }
     return {
       disabled: new Set(disabled),
       groups,
       notes,
-      groupOrder: uniqueStrings(state.groupOrder),
+      groupOrder,
       channel: asChannel(state.channel) ?? undefined,
       region: asRegion(state.region) ?? undefined,
       // Only meaningful beside a region, and only when true: a stray flag
       // with no region would promise a notice about a choice nobody made.
       regionAuto: state.regionAuto === true && asRegion(state.region) !== null ? true : undefined,
       favorites: favoriteUrls(state.favorites),
+      blocked: blockedNames(state.blocked),
+      updateExempt: updateExemptNames(state.updateExempt),
       ...(githubProxy === null ? {} : { githubProxy }),
+      ...(brokenPlugins === undefined ? {} : { brokenPlugins }),
+      // true AND false are both preserved: on a host with no settings page
+      // this switch is the market's only entry, so "the user turned it off"
+      // must be distinguishable from "nobody has chosen yet" (#846).
+      ...(typeof state.sidebarEntry === 'boolean' ? { sidebarEntry: state.sidebarEntry } : {}),
+      buildEnv: buildEnvFromUnknown(state.buildEnv),
     }
-  } catch {
-    return { disabled: new Set(), groups: {}, groupOrder: [], notes: {}, favorites: [] }
+  } catch (error) {
+    // An unreadable state file is the profile's whole market state gone: every
+    // disable, group, favourite and exemption in it. Say so — silently coming
+    // back empty reads to the user as "my disabled plugins all switched
+    // themselves on", with nothing anywhere connecting the two (#582's
+    // narrowest surviving point). Writing it back afterwards replaces the
+    // damaged file, so the log is the only trace there will be.
+    if (!(error !== null && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT')) {
+      logEvent('warn', 'state', `market state could not be read (${error instanceof Error ? error.message : String(error)}) — starting from an empty state`)
+    }
+    return { disabled: new Set(), groups: {}, groupOrder: [], notes: {}, favorites: [], blocked: [], updateExempt: [] }
+  }
+}
+
+/**
+ * Publish a file so that a reader never sees it half-written.
+ *
+ * The state file carries every choice the user made about their plugins, and
+ * it is written on each switch: a process killed or a disk that fills up
+ * mid-write used to leave truncated JSON behind, which reads as an empty
+ * state — all of it gone, silently. A rename is atomic within one filesystem,
+ * so readers see either the old file or the new one.
+ *
+ * A symlinked state file is followed rather than replaced (#582): the write
+ * lands on the link's target, so a user who keeps their profile state
+ * somewhere else keeps it there.
+ */
+function publishFile(path: string, contents: string): void {
+  const target = (() => {
+    try { return realpathSync(path) } catch { return path }
+  })()
+  const temporary = `${target}.new`
+  writeFileSync(temporary, contents)
+  try {
+    renameSync(temporary, target)
+  } catch (error) {
+    rmSync(temporary, { force: true })
+    throw error
   }
 }
 
@@ -397,16 +630,26 @@ export function writeMarketState(profileDir: string, state: MarketState): void {
     ? state.regionAuto
     : onDisk.regionAuto
   const favorites = state.favorites ?? onDisk.favorites ?? []
+  const blocked = state.blocked ?? onDisk.blocked ?? []
+  const updateExempt = state.updateExempt ?? onDisk.updateExempt ?? []
   // This field does have a clear action ("restore automatic"). As with
   // regionAuto, omission preserves while an explicit undefined removes it.
   const githubProxy = Object.prototype.hasOwnProperty.call(state, 'githubProxy')
     ? state.githubProxy
     : onDisk.githubProxy
-  writeFileSync(stateFile(profileDir), JSON.stringify({
+  const broken = Object.prototype.hasOwnProperty.call(state, 'brokenPlugins')
+    ? state.brokenPlugins
+    : onDisk.brokenPlugins
+  const sidebarEntry = Object.prototype.hasOwnProperty.call(state, 'sidebarEntry')
+    ? state.sidebarEntry
+    : onDisk.sidebarEntry
+  publishFile(stateFile(profileDir), JSON.stringify({
     disabled: [...state.disabled],
     groups: state.groups,
     groupOrder: state.groupOrder,
     ...(favorites.length > 0 ? { favorites } : {}),
+    ...(blocked.length > 0 ? { blocked } : {}),
+    ...(updateExempt.length > 0 ? { updateExempt } : {}),
     ...(Object.keys(notes).length > 0 ? { notes } : {}),
     // Omitted while unchosen, so "never picked" survives a round trip and
     // keeps deriving from the running build — but only when disk has not
@@ -417,6 +660,19 @@ export function writeMarketState(profileDir: string, state: MarketState): void {
     ...(region === undefined ? {} : { region }),
     ...(regionAuto === true ? { regionAuto: true } : {}),
     ...(githubProxy === undefined ? {} : { githubProxy }),
+    // Omission preserves, explicit undefined clears — the same contract as
+    // githubProxy above, and the one a repaired plugin needs: the entry
+    // exists only while the declaration is still missing.
+    ...(broken === undefined ? {} : { brokenPlugins: broken }),
+    // Written for both answers: on a host with no settings page this switch
+    // is the market's only entry, so a deliberate OFF has to survive a reload
+    // instead of being read back as "never chosen" (#846).
+    ...(typeof sidebarEntry === 'boolean' ? { sidebarEntry } : {}),
+    ...(state.region === undefined ? {} : { region: state.region }),
+    ...(state.regionAuto === true ? { regionAuto: true } : {}),
+    // Omitted while not saved, so a card that was never touched keeps
+    // inheriting the composition's buildEnv on every boot.
+    ...(state.buildEnv === undefined ? {} : { buildEnv: state.buildEnv }),
   }))
 }
 
@@ -454,6 +710,9 @@ const hotHandles = new Map<string, PluginHandle>()
 /** Activation did not settle within HOT_MOUNT_TIMEOUT_MS. */
 class ActivationTimeout extends Error {}
 
+/** Disposal did not settle within HOT_MOUNT_TIMEOUT_MS (see `hotUnmount`). */
+class DisposalTimeout extends Error {}
+
 /**
  * Race an activation awaitable against the hot-mount ceiling. The handlers
  * stay attached to the original promise, so a late rejection after a timeout
@@ -476,6 +735,13 @@ export interface HotMountResult {
   ok: boolean
   /** Bilingual reason shown to the user instead of a bare restart banner. */
   reason: string | null
+  /**
+   * Set when nothing was attempted because this package can only come up on a
+   * start — its patch holds more than plain inserts. That is a verdict about
+   * the package, not a mount that crashed: the durable switch can still be
+   * written, where a crash must not be persisted (#575, #1010).
+   */
+  deferred?: true
 }
 
 /**
@@ -487,16 +753,46 @@ export interface HotMountResult {
 export async function hotUnmount(packageName: string): Promise<boolean> {
   const handle = hotHandles.get(packageName)
   if (handle === undefined) return false
+  // Dropped from the table BEFORE the wait, so a teardown that never finishes
+  // cannot keep this package registered: a later attempt starts from clean
+  // state instead of reusing a handle already being disposed.
   hotHandles.delete(packageName)
   shimNames.delete(packageName)
+  const disposal = Promise.resolve().then(() => handle.dispose())
+  // Same ceiling as mounting, and the same reason (#582, measured class of
+  // report): a plugin whose teardown waits for something that never arrives
+  // used to hold the toggle route open forever, and every later operation
+  // queued behind the lock it never released — the UI simply stopped
+  // answering until the host restarted. Handlers stay attached to the
+  // original promise, so a late settlement is logged rather than surfacing
+  // as an unhandled rejection.
+  let answered = false
+  void disposal.then(
+    () => { if (answered) logEvent('info', 'hot-unmount', `${packageName}: teardown finished after the wait`) },
+    (error: unknown) => {
+      logEvent('warn', 'hot-unmount', `${packageName}: dispose failed${answered ? ' after the wait' : ''} — ${error instanceof Error ? error.message : String(error)}`)
+    },
+  )
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    await handle.dispose()
+    await Promise.race([
+      disposal,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new DisposalTimeout(`${packageName}: teardown did not settle within ${HOT_MOUNT_TIMEOUT_MS / 1000}s`)), HOT_MOUNT_TIMEOUT_MS)
+      }),
+    ])
+    answered = true
     logEvent('info', 'hot-unmount', `${packageName}: removed live`)
     return true
   } catch (error) {
-    logEvent('warn', 'hot-unmount', `${packageName}: dispose failed — ${error instanceof Error ? error.message : String(error)}`)
+    answered = true
+    if (error instanceof DisposalTimeout) {
+      logEvent('warn', 'hot-unmount', `${packageName}: its teardown did not settle within ${HOT_MOUNT_TIMEOUT_MS / 1000}s, so it could not be confirmed stopped — it is off from the next start`)
+    } else {
+      logEvent('warn', 'hot-unmount', `${packageName}: dispose failed — ${error instanceof Error ? error.message : String(error)}`)
+    }
     return false
-  }
+  } finally { clearTimeout(timer) }
 }
 
 /**
@@ -518,23 +814,50 @@ export async function hotMount(ctx: HotContext, profileDir: string, packageName:
         reason: '宿主不支持热挂载(include 插件不可导入),需重启 / the host cannot hot-mount (include plugin unavailable); restart required',
       }
     }
-    let patchText: string | null
-    try {
-      patchText = readFileSync(
-        join(profileDir, 'node_modules', packageName, 'cordis.patch.yml'),
-        'utf8',
-      )
-    } catch {
-      patchText = null
+    // Where the patch lives is the PACKAGE's decision, declared as
+    // `dsh.bundle.patch` — `aegis` keeps it in `./extensions/dsh/`. Reading
+    // only the package root made a plugin whose patch is declared elsewhere
+    // look like one with no bundle at all, and the user was told "no bundle
+    // patch … nothing to hot-mount" for a package that plainly has one
+    // (#646). The root file stays as the fallback: it is the long-standing
+    // convention, and `profile.ts` resolves the declared field for everything
+    // else, so the two now agree on where a patch is. #792: the declaration
+    // may also be a LIST of files, which the host composes in order — read
+    // every declared one and parse the concatenation, all or nothing: the
+    // host throws on one missing overlay file and skips the entire bundle.
+    const packageRoot = join(profileDir, 'node_modules', packageName)
+    const declared = declaredBundlePatchFiles(packageRoot)
+    const sources = declared.length > 0 ? declared : [join(packageRoot, 'cordis.patch.yml')]
+    let texts: string[] | null = []
+    for (const file of sources) {
+      try {
+        texts.push(readFileSync(file, 'utf8'))
+      } catch {
+        // All or nothing, same rule as readBundlePatchRows: one unreadable
+        // file voids the whole declaration — the host drops the entire
+        // bundle for one missing overlay file, so mounting the readable
+        // remainder would show live what the next boot never loads.
+        texts = null
+        break
+      }
     }
     let rows: HotRow[] | null
-    if (patchText !== null) {
-      rows = parseSimplePatch(patchText)
+    if (texts !== null && texts.length > 0) {
+      rows = parseSimplePatch(texts.join('\n'))
       if (rows === null) {
         return {
           ok: false,
+          deferred: true,
           reason: 'bundle patch 含配置行/表达式,热挂载仅支持纯 insert,重启后生效 / the bundle patch contains config/expression rows; hot-mount only supports plain inserts — it activates on restart',
         }
+      }
+    } else if (declared.length > 0) {
+      // The declaration is VOID — one of its files cannot be read. The host
+      // throws on a missing overlay file and skips the ENTIRE bundle, so no
+      // part of this package can go live, now or after a restart.
+      return {
+        ok: false,
+        reason: '声明的 patch 文件缺失或不可读,宿主会跳过整个 bundle,请修复或重装该包 / a declared patch file is unreadable; the host skips the whole bundle — fix or reinstall the package',
       }
     } else {
       // No host patch. Client-only packages (dsh.client, no dsh.bundle) never

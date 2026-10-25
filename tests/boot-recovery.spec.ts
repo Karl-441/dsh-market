@@ -1,11 +1,11 @@
 /**
  * The recovery surface behind a restart that did not come back.
  *
- * The behaviour under test is the one the #575 report was about: one plugin
- * that cannot load takes the whole DSH process with it, so the tab that
- * clicked restart is left polling an origin nobody answers — and the user's
- * only way back was hand-editing cordis.patch.yml. Everything here exists so
- * that prompt offers "adjust plugins" instead.
+ * The behaviour under test: one plugin that cannot load takes the whole DSH
+ * process with it, so the tab that clicked restart is left polling an origin
+ * nobody answers — and the only way back used to be hand-editing
+ * cordis.patch.yml. Everything here exists so that prompt offers "adjust
+ * plugins" instead.
  *
  * The log shapes in these fixtures are verbatim from
  * @deepseek-ai/dsh-app-boot's assertEntriesLoaded / assertEntriesActivated
@@ -16,18 +16,24 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   applyRecovery, matchFailureToPlugins, parseBootFailure, recoveryPayload,
   respawnAndWatch, runRecovery, startRecoveryServer, type RecoveryConfig, type RecoveryPlugin,
 } from '../src/recovery.ts'
 import { restartHelperSource } from '../src/restart.ts'
 
+vi.mock('node:os', async importOriginal => {
+  const os = await importOriginal<typeof import('node:os')>()
+  return { ...os, homedir: vi.fn(os.homedir) }
+})
+
 const cleanups: Array<() => void | Promise<void>> = []
 afterEach(async () => {
   for (const done of cleanups.splice(0)) await done()
+  vi.mocked(homedir).mockReset()
 })
 
 /** Poll until the predicate holds, or give up — never a bare sleep. */
@@ -105,7 +111,7 @@ const TWO_ENTRIES_FAILED = [
   'needs-service: pending (waiting for service: nonexistent)',
   '    at Fiber.<anonymous> (file:///D:/dsh/node_modules/@deepseek-ai/cordis/lib/index.js:100:5)',
   '',
-  '[dsh-market] the replacement did not bind port 3080 within 20s (it exited with code 1)',
+  '[dsh-market] the replacement never came up on port 3080 (it exited with code 1)',
 ].join('\n')
 
 /** The shape a REAL composition produced (captured from a live dsh web run). */
@@ -296,6 +302,38 @@ describe('startRecoveryServer', () => {
     expect(body.unmatched.map(entry => entry.name)).toEqual(['needs-service'])
   })
 
+  it('opens with the blamed plugins UNTICKED — the promise the prompt makes', async () => {
+    // "The plugins DSH blamed are marked red and left unticked" is the
+    // contract in the README and the copy. It used to be only half true: the
+    // payload flagged them and every surface still ticked them, so the user
+    // had to find and untick the red row themselves. The recommendation lives
+    // in the payload so both surfaces inherit it from one place.
+    const { base } = await serve()
+    const body = await (await fetch(base + '/dsh-market/recovery')).json() as {
+      plugins: Array<{ name: string; enabled: boolean; implicated: boolean; toggleable: boolean }>
+    }
+    const blamed = body.plugins.find(plugin => plugin.name === 'blamed-plugin')
+    expect(blamed?.implicated).toBe(true)
+    expect(blamed?.enabled, 'a blamed, switchable plugin must start unticked').toBe(false)
+    expect(body.plugins.find(plugin => plugin.name === 'good-plugin')?.enabled).toBe(true)
+  })
+
+  it('leaves an untouchable plugin at its own state', async () => {
+    // Nothing the user could do with another position: host infrastructure is
+    // listed for context, not to be switched.
+    const { base, config } = await serve()
+    config.plugins.push({
+      name: '@deepseek-ai/dsh-host-webserver', rows: [], enabled: true, protected: true,
+      carrier: false, toggleable: false, note: 'host infrastructure',
+    })
+    const body = await (await fetch(base + '/dsh-market/recovery')).json() as {
+      plugins: Array<{ name: string; enabled: boolean; toggleable: boolean }>
+    }
+    const hostRow = body.plugins.find(plugin => plugin.name === '@deepseek-ai/dsh-host-webserver')
+    expect(hostRow?.toggleable).toBe(false)
+    expect(hostRow?.enabled).toBe(true)
+  })
+
   it('serves a standalone page for a fresh visit, with the same data', async () => {
     const { base } = await serve()
     const response = await fetch(base + '/', { headers: { 'accept-language': 'zh-CN,zh;q=0.9' } })
@@ -316,6 +354,55 @@ describe('startRecoveryServer', () => {
     // hand the reporter one unreadable line.
     expect(text.split('\n').length).toBeGreaterThan(4)
     expect(text).toContain('## replacement host stderr')
+  })
+
+  it('redacts Windows home variants in HTTP logs while preserving line breaks and credentials masking (#907)', async () => {
+    vi.mocked(homedir).mockReturnValue(String.raw`C:\Users\Alice`)
+    const { base, config } = await serve()
+    const original = [
+      String.raw`C:\Users\Alice\private`,
+      'link:C:/Users/Alice/private',
+      String.raw`link:C:/Users\Alice/private`,
+      'link:c:/uSeRs/ALICE/private',
+      'link:C:/Users/Alice-other/private',
+      'link:C:/Users/Bob/private',
+      'ordinary Alice text',
+      'sk-abcdefgh12345678 ghp_abcdefghijklmnop npm_abcdefghijklmnop',
+      'Bearer secret', 'api-key=secret',
+    ].join('\r\n') + '\nlast line\n'
+    const expected = [
+      String.raw`~\private`, 'link:~/private', 'link:~/private', 'link:~/private',
+      'link:C:/Users/Alice-other/private', 'link:C:/Users/Bob/private', 'ordinary Alice text',
+      'sk-*** gh*_*** npm_***', 'Bearer ***', 'api-key=***',
+    ].join('\r\n') + '\nlast line\n'
+    for (const file of [config.logs.out, config.logs.err, `${config.logs.err}.recovery.log`]) {
+      writeFileSync(file, original)
+    }
+    const response = await fetch(base + '/dsh-market/logs')
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text.split(expected)).toHaveLength(4)
+    expect(text).not.toContain('secret')
+    expect(text).not.toContain('C:/Users/Alice/private')
+  })
+
+  it.each([
+    ['C:\\Users\\Alice\\', String.raw`c:/Users\ALICE\private`, String.raw`~\private`],
+    ['C:/Users/Alice/', 'c:/USERS/alice/private', '~/private'],
+    ['/home/alice/', '/home/alice/private', '~/private'],
+  ])('redacts trailing-separator home %s in HTTP recovery logs (#907)', async (directory, path, masked) => {
+    vi.mocked(homedir).mockReturnValue(directory)
+    const { base, config } = await serve()
+    const original = `link:${path}\r\napi-key=secret\nlast line\n`
+    const expected = `link:${masked}\r\napi-key=***\nlast line\n`
+    for (const file of [config.logs.out, config.logs.err, `${config.logs.err}.recovery.log`]) {
+      writeFileSync(file, original)
+    }
+    const response = await fetch(base + '/dsh-market/logs')
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text.split(expected)).toHaveLength(4)
+    expect(text).not.toContain('secret')
   })
 
   it('refuses a cross-site write and accepts a same-origin one', async () => {
@@ -345,6 +432,94 @@ describe('startRecoveryServer', () => {
       body: '{}',
     })
     expect(await finished).toEqual({ kind: 'released' })
+  })
+})
+
+describe('the replacement is given time to be dead (#719)', () => {
+  /** Whether the recovery surface answers on this port right now. */
+  const answers = async (port: number): Promise<boolean> => {
+    try {
+      await fetch(`http://127.0.0.1:${String(port)}/dsh-market/recovery`, { signal: AbortSignal.timeout(1000) })
+      return true
+    } catch {
+      return false
+    }
+  }
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+  it('waits for a still-starting replacement instead of taking its port', async () => {
+    // The deadlock #719 describes in full: the helper gave up at 28s, this
+    // surface bound the port, and the replacement — which binds at ~42-45s on
+    // a source-run host — died on EADDRINUSE. The real host was the process
+    // just killed, so nothing could bring the origin back.
+    const { port, release } = await hold()
+    await release()
+    const { dir, patchPath } = makeProfile()
+    const config = makeConfig(dir, patchPath, [makePlugin('blamed-plugin')])
+    config.port = port
+    config.logs.err = join(dir, 'err.log')
+    writeFileSync(config.logs.err, TWO_ENTRIES_FAILED)
+
+    // A live stand-in for a slow boot: still running, then gone on its own.
+    const slow = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 3000)'], { stdio: 'ignore' })
+    cleanups.push(() => { slow.kill() })
+
+    const running = runRecovery(config, { exitCode: null, bound: false, replacementPid: slow.pid })
+    const base = 'http://127.0.0.1:' + String(port)
+    cleanups.push(async () => {
+      await fetch(base + '/dsh-market/recovery/release', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: base },
+        body: '{}',
+      }).catch(() => undefined)
+      await Promise.race([running.catch(() => 'released'), sleep(3000)])
+    })
+
+    // While that process is alive the port stays unanswered. Before the fix
+    // this answered immediately, which is the whole bug.
+    await sleep(1500)
+    expect(await answers(port), 'the surface took the port from a starting replacement').toBe(false)
+
+    // And once it is gone, the surface that was waiting comes up.
+    const deadline = Date.now() + 20_000
+    let up = false
+    while (Date.now() < deadline && !up) {
+      up = await answers(port)
+      if (!up) await sleep(250)
+    }
+    expect(up, 'the surface never came up after the replacement exited').toBe(true)
+  })
+
+  it('stands down when the port is already served, whatever the pid says (#854)', async () => {
+    // The pid the helper hands over is the process IT spawned, and on Windows
+    // that is the `powershell.exe` wrapper rather than the node host that binds
+    // the port — the reporter's log shows the guard judging a live host dead by
+    // exactly that pid, which is how the surface came to take a port out from
+    // under a boot that was still running. A socket that answers settles the
+    // same question without a pid.
+    const { port } = await hold()
+    const { dir, patchPath } = makeProfile()
+    const config = makeConfig(dir, patchPath, [makePlugin('blamed-plugin')])
+    config.port = port
+    config.logs.err = join(dir, 'err.log')
+    writeFileSync(config.logs.err, TWO_ENTRIES_FAILED)
+    // A pid that is already gone — deliberately the unhelpful handover.
+    const dead = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' })
+    cleanups.push(() => { dead.kill() })
+    await sleep(300)
+
+    const startedAt = Date.now()
+    const outcome = await runRecovery(config, { exitCode: null, bound: false, replacementPid: dead.pid })
+    const elapsed = Date.now() - startedAt
+
+    expect(outcome).toBe('booted')
+    // Fast, because it never reached the port-free wait (30s) that a surface
+    // which intended to bind would sit through first. Without the guard this
+    // test ends 'released' half a minute later.
+    expect(elapsed, 'the surface waited on a port it should have left alone').toBeLessThan(5000)
+    // The note goes to the recovery log beside the boot log, like every other
+    // stage line this surface writes.
+    expect(readFileSync(`${config.logs.err}.recovery.log`, 'utf8')).toContain('already answering')
   })
 })
 
@@ -425,6 +600,73 @@ describe('runRecovery', () => {
     const written = readFileSync(patchPath, 'utf8')
     expect(written).toContain('- id: blamed-plugin')
     expect(written).toContain('  disabled: true')
+    await fetch(base + '/dsh-market/recovery/release', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: '{}',
+    }).catch(() => undefined)
+    expect(await running).toBe('released')
+  }, 90_000)
+  it('comes back with the write errors instead of booting a partial choice', async () => {
+    // A write that lands for some plugins and not others leaves the profile
+    // as neither what the user asked for nor what it was. Booting that is
+    // booting a guess, so the surface has to come back and say what failed.
+    const { port, release } = await hold()
+    await release()
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-partial-'))
+    const patchPath = join(dir, 'cordis.patch.yml')
+    writeFileSync(patchPath, '# dsh profile root\n[]\n')
+    const mark = join(dir, 'booted.txt')
+    const spawnScript = join(dir, 'replacement.cjs')
+    writeFileSync(spawnScript, 'require("node:fs").writeFileSync(' + JSON.stringify(mark) + ', "booted")\n')
+    // A row id the patch layer refuses (space + punctuation) is how a partial
+    // write happens for real: the plugin is fine, its row is not writable.
+    const config = makeConfig(dir, patchPath, [makePlugin('blamed-plugin', { rows: ['bad row!'] })])
+    config.port = port
+    config.spawn = { file: process.execPath, args: [spawnScript], viaShell: false, detached: false }
+    const running = runRecovery(config, { exitCode: 1, bound: false })
+    const base = 'http://127.0.0.1:' + String(port)
+    cleanups.push(async () => {
+      await fetch(base + '/dsh-market/recovery/release', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: base },
+        body: '{}',
+      }).catch(() => undefined)
+      await Promise.race([running.catch(() => 'released'), new Promise(resolve => setTimeout(resolve, 3000))])
+    })
+
+    /** Poll the surface until it answers, or give up. */
+    const readView = async (): Promise<{ lastErrors: string[] } | null> => {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        try {
+          const response = await fetch(base + '/dsh-market/recovery', { cache: 'no-store' })
+          if (response.ok) return await response.json() as { lastErrors: string[] }
+        } catch { /* not up yet */ }
+        await new Promise(resolve => setTimeout(resolve, 200))
+      }
+      return null
+    }
+
+    const first = await readView()
+    expect(first).not.toBeNull()
+    await fetch(base + '/dsh-market/recovery/apply', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ enabled: [] }),
+    })
+
+    // The surface returns — with the errors — and nothing was booted.
+    const deadline = Date.now() + 30_000
+    let errors: string[] = []
+    while (Date.now() < deadline && errors.length === 0) {
+      const view = await readView()
+      errors = view?.lastErrors ?? []
+      if (errors.length === 0) await new Promise(resolve => setTimeout(resolve, 200))
+    }
+    expect(errors.length, 'the write failure never reached the surface').toBeGreaterThan(0)
+    expect(errors[0]).toContain('bad row!')
+    expect(existsSync(mark), 'a partial write was booted anyway').toBe(false)
     await fetch(base + '/dsh-market/recovery/release', {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: base },
@@ -539,7 +781,7 @@ describe('restartHelperSource handoff', () => {
     expect(argv).toContain('--exit=1')
     expect(argv).toContain('--bound=0')
     const log = readFileSync(errLog, 'utf8')
-    expect(log).toContain('did not bind')
+    expect(log).toContain('never came up on port')
     expect(log).toContain('starting the recovery surface')
   }, 40_000)
 
@@ -556,7 +798,7 @@ describe('restartHelperSource handoff', () => {
     )
     const child = spawn(process.execPath, ['-e', source], { stdio: 'ignore' })
     cleanups.push(() => { child.kill() })
-    const wrote = await until(() => existsSync(errLog) && readFileSync(errLog, 'utf8').includes('did not bind'), 20_000)
+    const wrote = await until(() => existsSync(errLog) && readFileSync(errLog, 'utf8').includes('never came up on port'), 20_000)
     expect(wrote).toBe(true)
     expect(readFileSync(errLog, 'utf8')).not.toContain('recovery surface')
   }, 40_000)

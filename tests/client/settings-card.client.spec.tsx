@@ -12,10 +12,11 @@
  * stubbed at fetch.
  */
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SettingsCard, clearBrowserState } from '../../src/client/SettingsCard.tsx'
 import { en } from '../../src/client/locales.ts'
+import type { SidebarEntry } from '../../src/client/sidebar-entry.ts'
 
 const t = (key: string): string => (en as Record<string, string>)[key] ?? key
 
@@ -27,6 +28,7 @@ function stubFetch(options: {
   channel?: string; channelSwitch?: string; channelError?: string
   region?: string; regionAuto?: boolean; regionError?: string; githubProxy?: string | null
   githubProxyCustom?: string | null; githubProxyManaged?: boolean; githubProxyError?: string
+  buildEnv?: Record<string, string>; buildEnvError?: string
 } = {}): void {
   calls = []
   let githubProxyCustom = options.githubProxyCustom ?? null
@@ -53,7 +55,15 @@ function stubFetch(options: {
         githubProxyCustom,
         githubProxyManaged: options.githubProxyManaged === true,
         selfManaged: options.selfManaged !== false,
+        buildEnv: options.buildEnv ?? {},
       })
+    }
+    if (path.endsWith('/dsh-market/build-env')) {
+      // The server answers with what it APPLIED — here, the same map sent
+      // back, exactly like the region endpoint echoes its choice.
+      return options.buildEnvError !== undefined
+        ? json({ ok: false, error: options.buildEnvError })
+        : json({ ok: true, buildEnv: (JSON.parse(String(init?.body)) as { buildEnv: Record<string, string> }).buildEnv })
     }
     if (path.includes('/dsh-market/updates')) {
       return json({ updates: { dshmarket: options.channelSwitch !== undefined
@@ -367,6 +377,83 @@ describe('SettingsCard — channels', () => {
   })
 })
 
+describe('SettingsCard — sidebar shortcut (#846)', () => {
+  /** A stand-in controller: the card's contract is with this, not with fetch. */
+  function fakeSidebar(options: { supported: boolean; enabled?: boolean; refuse?: string; onlyDoor?: boolean }): SidebarEntry & { sets: boolean[]; support(): void } {
+    let supported = options.supported
+    let enabled = options.enabled === true
+    const listeners = new Set<() => void>()
+    const sets: boolean[] = []
+    return {
+      sets,
+      supported: () => supported,
+      enabled: () => enabled,
+      ready: () => true,
+      onlyDoor: () => options.onlyDoor === true,
+      refresh: () => {},
+      subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener) } },
+      markSupported: () => {},
+      load: async () => {},
+      support: () => { supported = true; for (const l of listeners) l() },
+      set: async (next) => {
+        sets.push(next)
+        if (options.refuse !== undefined) throw new Error(options.refuse)
+        enabled = next
+        for (const l of listeners) l()
+        return next
+      },
+    }
+  }
+
+  async function openWith(sidebar: SidebarEntry): Promise<void> {
+    render(<SettingsCard t={t} sidebar={sidebar} />)
+    fireEvent.click(screen.getByRole('button', { expanded: false }))
+    await waitFor(() => { expect(screen.getByText(t('setSelfRemove'), { selector: 'div' })).toBeTruthy() })
+  }
+
+  it('offers no switch on a host without sidebar panels', async () => {
+    await openWith(fakeSidebar({ supported: false }))
+    expect(screen.queryByText(t('setSidebar'))).toBeNull()
+  })
+
+  it('appears once the host declares sidebar panels, off by default', async () => {
+    const sidebar = fakeSidebar({ supported: false })
+    await openWith(sidebar)
+    act(() => { sidebar.support() })
+    await waitFor(() => { expect(screen.getByText(t('setSidebar'))).toBeTruthy() })
+    expect(screen.getByRole('button', { name: t('setSidebarOff') }).getAttribute('aria-pressed')).toBe('true')
+    const sidebarLabel = screen.getByText(t('setSidebar'))
+    const regionLabel = screen.getByText(t('setRegion'))
+    expect(sidebarLabel.compareDocumentPosition(regionLabel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('turns the row on, and says the settings entry stays', async () => {
+    const sidebar = fakeSidebar({ supported: true })
+    await openWith(sidebar)
+    expect(screen.getByText(t('setSidebarHint'))).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: t('setSidebarOn') }))
+    await waitFor(() => { expect(sidebar.sets).toEqual([true]) })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: t('setSidebarOn') }).getAttribute('aria-pressed')).toBe('true')
+    })
+  })
+
+  it('does not re-send the choice already in force', async () => {
+    const sidebar = fakeSidebar({ supported: true, enabled: true })
+    await openWith(sidebar)
+    fireEvent.click(screen.getByRole('button', { name: t('setSidebarOn') }))
+    expect(sidebar.sets).toEqual([])
+  })
+
+  it('keeps the old choice selected and shows why when saving fails', async () => {
+    const sidebar = fakeSidebar({ supported: true, refuse: 'untrusted origin' })
+    await openWith(sidebar)
+    fireEvent.click(screen.getByRole('button', { name: t('setSidebarOn') }))
+    await waitFor(() => { expect(screen.getByText('untrusted origin')).toBeTruthy() })
+    expect(screen.getByRole('button', { name: t('setSidebarOff') }).getAttribute('aria-pressed')).toBe('true')
+  })
+})
+
 describe('SettingsCard — download region', () => {
   it('offers the two regions the server named, with the current one selected', async () => {
     await open()
@@ -482,5 +569,55 @@ describe('SettingsCard — a channel switch is not an update', () => {
     await open()
     await waitFor(() => { expect(screen.getByText(`${t('setSelfUpdateReady')} 1.14.0`)).toBeTruthy() })
     expect(screen.getByRole('button', { name: t('setSelfUpdate') })).toBeTruthy()
+  })
+})
+
+describe('SettingsCard — build environment (#336)', () => {
+  const editor = (): HTMLElement => screen.getByRole('textbox', { name: t('setBuildEnv') })
+
+  it('renders the effective build environment as one KEY=value line each', async () => {
+    stubFetch({ buildEnv: { CC: '/usr/bin/gcc-11', CXX: '/usr/bin/g++-11' } })
+    await open()
+    await waitFor(() => {
+      expect((editor() as HTMLTextAreaElement).value).toContain('CC=/usr/bin/gcc-11')
+      expect((editor() as HTMLTextAreaElement).value).toContain('CXX=/usr/bin/g++-11')
+    })
+  })
+
+  it('saves the edited list back to the server in the map shape the route wants', async () => {
+    stubFetch({ buildEnv: { CC: '/usr/bin/gcc-11' } })
+    await open()
+    await waitFor(() => { expect((editor() as HTMLTextAreaElement).value).toContain('CC=/usr/bin/gcc-11') })
+    fireEvent.change(editor(), { target: { value: 'CC=/usr/bin/gcc-12\nCXX=/usr/bin/g++-12' } })
+    fireEvent.click(screen.getByRole('button', { name: t('setBuildEnvSave') }))
+    await waitFor(() => {
+      expect(calls.find(call => call.path.endsWith('/dsh-market/build-env'))?.body)
+        .toEqual({ buildEnv: { CC: '/usr/bin/gcc-12', CXX: '/usr/bin/g++-12' } })
+    })
+    // What the textarea shows afterwards is the SERVER's applied answer,
+    // not the draft: same contract as the channel/region rows.
+    await waitFor(() => {
+      expect((editor() as HTMLTextAreaElement).value).toContain('CXX=/usr/bin/g++-12')
+    })
+  })
+
+  it('sends an empty map when the editor is cleared, so the save clears the override', async () => {
+    stubFetch({ buildEnv: { CC: '/usr/bin/gcc-11' } })
+    await open()
+    await waitFor(() => { expect((editor() as HTMLTextAreaElement).value).toContain('CC=/usr/bin/gcc-11') })
+    fireEvent.change(editor(), { target: { value: '  \n ' } })
+    fireEvent.click(screen.getByRole('button', { name: t('setBuildEnvSave') }))
+    await waitFor(() => {
+      expect(calls.find(call => call.path.endsWith('/dsh-market/build-env'))?.body).toEqual({ buildEnv: {} })
+    })
+  })
+
+  it('surfaces a refusal instead of pretending the save landed', async () => {
+    stubFetch({ buildEnvError: 'PATH is managed by the market' })
+    await open()
+    await waitFor(() => { expect(screen.getByRole('button', { name: t('setBuildEnvSave') })).toBeTruthy() })
+    fireEvent.change(editor(), { target: { value: 'CC=/usr/bin/gcc-11' } })
+    fireEvent.click(screen.getByRole('button', { name: t('setBuildEnvSave') }))
+    await waitFor(() => { expect(screen.getByText(/PATH is managed by the market/)).toBeTruthy() })
   })
 })

@@ -26,13 +26,31 @@
  * what actually mounts at boot.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { createRequire, isBuiltin } from 'node:module'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { JSON_SCHEMA, Type, load } from 'js-yaml'
-import { findDshInstallDir } from './dsh-install.ts'
+import { desktopApplicationRoots, findDshInstallDir } from './dsh-install.ts'
 import { resolveDshHome } from './home-paths.ts'
+import { hostNodeModulesRoot } from './install.ts'
 import { INBOX_BUNDLES, readBundleRules, suggestOrder, validateOrder } from './order.ts'
+
+// Electron's app.asar packages can be loadable by the host while invisible to
+// filesystem probes made from a profile plugin. This is a property of the
+// LAYOUT, not of any particular package: inside an archive every probe
+// answers "absent" for every name, so the fallback keys on the layout, on
+// whether the name is DeepSeek's (`@deepseek-ai/` — only they publish the
+// host), and on nothing else.
+//
+// It used to be two fixed name lists — `dsh-experimental-agent-team-profile`
+// as a bundle, `dsh-mcp-client` as a loader — and every name a Desktop build
+// shipped that was not on them reproduced the same false "will fail to boot"
+// (#676: two reporters, `dsh-experimental-agent-team-profile` AND
+// `dsh-experimental-agent-team-web-profile`). A list of which bundles a host
+// ships cannot be maintained from inside a market that cannot see the host.
+function isPackagedDesktopInstall(dshInstallDir: string | null): boolean {
+  return dshInstallDir !== null && /[/\\]app\.asar[/\\]/iu.test(dshInstallDir)
+}
 
 export { findDshInstallDir } from './dsh-install.ts'
 
@@ -62,6 +80,8 @@ export interface BundleLayer {
   directory: string | null
   /** Absolute path of the layer's patch file; null when undeclared/missing. */
   patchPath: string | null
+  /** Every declared patch file, in declaration order; `patchPath` is the first (#688). */
+  patchPaths: string[]
   /**
    * An in-box bundle whose directory could not be located — a gap in what
    * this process can see, not a defect in the profile (#369). Distinct from
@@ -90,6 +110,30 @@ export interface LoaderRow {
   layer: string
   kind: 'insert' | 'patch'
   name?: string
+}
+
+/**
+ * A directory in `node_modules` that no declaration accounts for and that
+ * cannot be used either (#663).
+ *
+ * The shape this exists for: an update blocked by open files leaves the
+ * target directory without its `package.json`, and the declaration that
+ * pointed at it is gone (the market drops it so the next start can compose).
+ * What remains is invisible — nothing in the profile references it, and
+ * `pnpm install` will not repair an empty shell ("Already up to date", #663)
+ * — so a user who goes looking finds an empty directory and no explanation.
+ */
+export interface ResidualDirectory {
+  /** Package name when it can be read, else the directory's own name. */
+  name: string
+  /** Path relative to the profile, for the diagnostics listing. */
+  path: string
+  kind: 'incomplete-package' | 'tmp-directory'
+  /**
+   * The profile still declares it. Then this is not junk: composition will
+   * try to load it, and the bundle layers above already report why it fails.
+   */
+  declared: boolean
 }
 
 /** An id present in more than one composed row — the #98 duplicate-id boot failure. */
@@ -201,6 +245,14 @@ export interface CheckReport {
   orderConflicts: Array<{ name: string; reason: string }>
   /** LOOT-style auto-fix: a community order satisfying every declared rule. */
   suggestedOrder: { ok: true; order: string[] } | { ok: false; cycle: string[] } | null
+  /**
+   * Leftover directories: incomplete packages and pnpm temp directories.
+   * Reported structurally rather than as warnings — same reasoning as
+   * `duplicateNames` above: a leftover that nothing references harms nothing
+   * today, and a warning on every profile that ever had an interrupted
+   * install would train people to ignore the list.
+   */
+  residuals: ResidualDirectory[]
   summary: CheckSummary
 }
 
@@ -330,7 +382,20 @@ export function corePackageNames(dshInstallDir: string | null): Set<string> {
     // The install's own node_modules is the authoritative host-core inventory:
     // everything under @deepseek-ai whose bare name starts with dsh or cordis,
     // plus the app package itself.
-    for (const entry of readdirSync(join(dshInstallDir, 'node_modules', '@deepseek-ai'), { withFileTypes: true })) {
+    //
+    // `dshHostInfo()` answers either a PACKAGE directory (the CLI layout
+    // `<prefix>/node_modules/@deepseek-ai/dsh`, and the #778 nested form
+    // `<resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh`) or a flat
+    // Desktop deployment root — never a constant "installation root".
+    // Splicing `node_modules` onto whichever arrived only happened to work
+    // for the flat shape. For a package directory the splice landed two
+    // levels deep and readdirSync threw, so the curated seed silently stood
+    // in for the real inventory — and when the host package carries its own
+    // nested `@deepseek-ai` scope (pnpm isolated trees), it read that
+    // truncated subset instead (#676: every package the real inventory has
+    // and the answer lacked became a fresh "will fail to boot").
+    // hostNodeModulesRoot() already derives the shared root from both shapes.
+    for (const entry of readdirSync(join(hostNodeModulesRoot(dshInstallDir), '@deepseek-ai'), { withFileTypes: true })) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
       if (/^(?:dsh|cordis)/.test(entry.name)) names.add(`@deepseek-ai/${entry.name}`)
     }
@@ -455,6 +520,31 @@ function parseSemver(value: string): Semver | null {
   }
 }
 
+/**
+ * Parse a comparator's target the way node-semver does: a PARTIAL version in
+ * a range is zero-filled, so `<0.3` is `<0.3.0` and `>=2` is `>=2.0.0`.
+ *
+ * Without this, every prerelease floor written as a partial — the
+ * `@deepseek-ai/dsh-*` peers of a whole family of connector plugins say
+ * `>=0.1.5 <0.3`, `>=0.1.7-rc <2`, `>=0.2.0-rc.0 <0.3` — parsed as unknown,
+ * `satisfiesRange` answered null, and the gate stood aside: measured against
+ * the host's own evaluator over 699 live catalog manifests, those were the
+ * last 7 of 2796 (package, runtime) pairs where the host refuses a plugin
+ * and the market still promised a restart would apply it.
+ *
+ * A BARE partial (`1.2`) is a different thing in semver — an x-range that
+ * means `>=1.2.0 <1.3.0` — so it deliberately stays unknown here rather than
+ * being mistaken for the exact version `1.2.0`.
+ */
+function parseComparatorTarget(target: string, op: string): Semver | null {
+  const direct = parseSemver(target)
+  if (direct !== null) return direct
+  if (op === '') return null
+  const parts = target.trim().split('.')
+  if (parts.length > 3 || parts.some(part => !/^\d+$/u.test(part))) return null
+  return parseSemver([...parts, ...Array<string>(3 - parts.length).fill('0')].join('.'))
+}
+
 function comparePre(a: string[], b: string[]): number {
   const len = Math.max(a.length, b.length)
   for (let i = 0; i < len; i += 1) {
@@ -474,6 +564,11 @@ function comparePre(a: string[], b: string[]): number {
 }
 
 /** Compare two semver strings: negative | zero | positive (prerelease < release of same base). */
+/** Whether a string is a well-formed semver `compareSemver` can order. */
+export function isSemver(value: string): boolean {
+  return parseSemver(value) !== null
+}
+
 export function compareSemver(a: string, b: string): number {
   const av = parseSemver(a)
   const bv = parseSemver(b)
@@ -498,6 +593,27 @@ function semverStr(v: Semver): string {
 }
 
 /**
+ * The exclusive ceiling `^` / `~` compares against, in node-semver's own
+ * notation: `0.2.0` becomes `0.2.0-0`, never the bare release.
+ *
+ * `^0.1.1-rc.2` and `~0.1.7` both expand to a ceiling of `0.2.0`, and npm's
+ * ceiling is exclusive. Comparing against the bare release made the test
+ * `0.2.0 > 0.2.0-rc.2` true — the ceiling outranks the prerelease of its own
+ * base version — so `0.2.0-rc.2` slipped under every `^0.1.x` range. That is
+ * the host line every plugin on the 0.1 release train declares, judged by the
+ * 0.2 host it is being installed onto: the market answered "compatible" for
+ * releases the dsh gate (node-semver, `evaluatePluginCompatibility`) refuses.
+ *
+ * node-semver writes the ceiling as `<0.2.0-0`, which sorts below every
+ * prerelease of `0.2.0` and still excludes the release itself. `compatibility.
+ * ts` has always built its bounds this way (`nextBound`); this is the
+ * comparator catching up with it.
+ */
+function exclusiveUpperBound(release: string): string {
+  return `${release}-0`
+}
+
+/**
  * Minimal range matcher for the peer-range check: `*`, exact, ^, ~, >=, >,
  * <=, <, whitespace-separated pairs, and `||` alternatives. Anything else
  * returns null (unknown — reported, not asserted).
@@ -512,6 +628,11 @@ function semverStr(v: Semver): string {
  * Discovery can opt into npm's `includePrerelease` behaviour because every
  * published DSH host line is itself prerelease; diagnostics retain the npm
  * default unless a caller explicitly asks for that wider admission.
+ *
+ * `includePrerelease` widens ADMISSION only — which prereleases may be
+ * considered at all. It does not move a `^` / `~` ceiling, so a cross-minor
+ * host line stays outside a range that declared the previous minor, exactly
+ * as node-semver decides it (see {@link exclusiveUpperBound}).
  */
 export function satisfiesRange(
   version: string,
@@ -547,7 +668,7 @@ export function satisfiesRange(
     const m = /^(\^|~|>=|<=|>|<)?(.*)$/.exec(p)
     const op = m?.[1] ?? ''
     const target = (m?.[2] ?? '').trim()
-    const tv = parseSemver(target)
+    const tv = parseComparatorTarget(target, op)
     if (tv === null) return null
     const major = tv.major
     const minor = tv.minor
@@ -565,17 +686,16 @@ export function satisfiesRange(
         return compareSemver(version, target) < 0
       case '^': {
         // npm caret semantics: >= given, strictly < the next breaking bump.
-        const upper: Semver = major > 0
-          ? { major: major + 1, minor: 0, patch: 0, pre: [] }
+        const bound = major > 0
+          ? `${major + 1}.0.0`
           : minor > 0
-            ? { major: 0, minor: minor + 1, patch: 0, pre: [] }
-            : { major: 0, minor: 0, patch: patch + 1, pre: [] }
-        return gte(v, tv) && compareSemver(semverStr(upper), version) > 0
+            ? `0.${minor + 1}.0`
+            : `0.0.${patch + 1}`
+        return gte(v, tv) && compareSemver(exclusiveUpperBound(bound), version) > 0
       }
       case '~': {
         // npm tilde semantics: >= given, strictly < the next minor.
-        const upper: Semver = { major, minor: minor + 1, patch: 0, pre: [] }
-        return gte(v, tv) && compareSemver(semverStr(upper), version) > 0
+        return gte(v, tv) && compareSemver(exclusiveUpperBound(`${major}.${minor + 1}.0`), version) > 0
       }
       default:
         return null
@@ -593,7 +713,7 @@ export function satisfiesRange(
     // prerelease admission gate. Otherwise an unknown protocol such as
     // `workspace:^` or `catalog:default` is misreported as a definite false
     // whenever the resolved version happens to carry a prerelease tag.
-    if (parseSemver(target) === null) return null
+    if (parseComparatorTarget(target, m[1] ?? '') === null) return null
     return { op: m[1] ?? '', target }
   }
 
@@ -842,6 +962,45 @@ export function composeLayers(layers: LayerInput[]): Composed {
   return { rows, resolvableRows, duplicates, overrides, orphans }
 }
 
+/**
+ * Whether two rows sharing one loader id still stop the boot (#853).
+ *
+ * It depends on the loader, and the loader changed: up to
+ * `cordis-plugin-loader@1.0.3` `EntryGroup.update` threw
+ * `duplicate loader entry id` for a config array holding one id twice
+ * (measured against the published packages — 1.0.3 has the throw, 1.0.4 and
+ * 1.0.5 do not). From 1.0.4 the same array is folded into a Map keyed by id,
+ * so the LATER row wins and the earlier one is silently dropped.
+ *
+ * The market's rule was written against the old loader (#122: two bundles on
+ * one id really did refuse to start), and it is right on one. On a new one it
+ * is not a boot failure but a silent override — which is worth SAYING and not
+ * worth refusing every operation over. The reported shape is a package's own
+ * patch row plus a user-patch row on the same id: fatal forever meant every
+ * update of every plugin rolled back.
+ *
+ * An empty answer from the PROFILE lockfile is not "unknown" on the official
+ * Desktop: that host embeds the loader in `app.asar` and provides it to every
+ * profile, so no profile can ever name it (#943). Reading that as an old
+ * loader made the gate fatal for every update on 0.2.1-rc.2 — the exact report
+ * #853's fix was supposed to close. The host installation is asked before the
+ * evidence is treated as missing; only when both are silent does the
+ * conservative answer stand.
+ */
+export function duplicateEntryIdsAreFatal(profileDirectory: string, dshInstallDir?: string | null): boolean {
+  const versions = lockfileCoreVersions(profileDirectory).get('@deepseek-ai/cordis-plugin-loader') ?? []
+  if (versions.length > 0) {
+    const newest = versions.reduce((a, b) => (compareSemver(a, b) >= 0 ? a : b))
+    return compareSemver(newest, '1.0.4') < 0
+  }
+  const install = dshInstallDir === undefined ? findDshInstallDir() : dshInstallDir
+  const host = install === null
+    ? null
+    : readNodeModulesVersion(dirname(hostNodeModulesRoot(install)), '@deepseek-ai/cordis-plugin-loader')
+  if (host === null) return true
+  return compareSemver(host, '1.0.4') < 0
+}
+
 /** Distinct versions of `@deepseek-ai/{dsh,cordis}*` packages in the lockfile. */
 function lockfileCoreVersions(profileDir: string): Map<string, string[]> {
   const found = new Map<string, Set<string>>()
@@ -888,13 +1047,16 @@ export function buildBundleLayers(
   dshInstallDir: string | null,
 ): { bundles: BundleLayer[]; layers: LayerInput[] } {
   const bundles: BundleLayer[] = bundleNames.map((name) => {
+    const officialScope = name.startsWith('@deepseek-ai/')
+    const hostProvided = INBOX_BUNDLES.has(name)
+      || (isPackagedDesktopInstall(dshInstallDir) && officialScope)
     // The real loader gives the DSH installation first refusal for in-box
     // bundles. Desktop keeps that installation private from plugins, so a
     // DIRECT profile-local copy with the same official name is only a stale
     // shadow, never evidence for the layer the running host loaded (#371).
     // Keep walking the profile anchor's parent search paths: Desktop heals an
     // authoritative host fallback at <profiles>/node_modules.
-    const ignoredProfilePackage = dshInstallDir === null && INBOX_BUNDLES.has(name)
+    const ignoredProfilePackage = dshInstallDir === null && hostProvided
       ? join(profileDirectory, 'node_modules', name)
       : undefined
     const anchors: Array<{ anchor: string | null; ignoredPackageDirectory?: string }> = [
@@ -913,9 +1075,10 @@ export function buildBundleLayers(
     const layer: BundleLayer = {
       name,
       source: specs[name] ?? '(not a direct dependency)',
-      kind: INBOX_BUNDLES.has(name) ? 'official' : 'community',
+      kind: hostProvided ? 'official' : 'community',
       directory,
       patchPath: null,
+      patchPaths: [],
       error: null,
       entries: [],
       parseError: null,
@@ -931,7 +1094,24 @@ export function buildBundleLayers(
       // fatal verdict and rolled back a good update (#369) — while `dsh
       // --dump-config` on the same profile exited 0. Unknown has to read as
       // unknown; the profile's own bundles are still judged normally.
-      if (INBOX_BUNDLES.has(name)) {
+      //
+      // The same holds for an official bundle (#676). Two independent reasons
+      // one can be absent from every probe and still be supplied by the
+      // running host:
+      //
+      //   - the installation is out of sight entirely — `dshHostInfo` found
+      //     no anchor at all, which is what a packaged Desktop looks like
+      //     from in here (#553, and the reporter who could not produce a
+      //     `dsh --dump-config` because there is no `dsh` on PATH at all);
+      //   - we have an anchor but it is an ARCHIVE, where a filesystem probe
+      //     answers "absent" for every name, including the host's own.
+      //
+      // `hostProvided` is the second case; the first is the check below. Both
+      // are gaps in what this process can see, not defects in the profile, so
+      // both read as unknown. Community bundles are untouched by this: they
+      // resolve through the profile's own node_modules ancestry, which this
+      // process CAN probe, so a missing one stays fatal.
+      if (hostProvided || (officialScope && dshInstallDir === null)) {
         layer.error = null
         layer.unresolvedInbox = true
         return layer
@@ -946,23 +1126,34 @@ export function buildBundleLayers(
       layer.error = 'bundle package.json is unreadable'
       return layer
     }
+    // A bundle may declare ONE patch file or a LIST of them: dsh 0.1.7's own
+    // `@deepseek-ai/dsh-web-app` ships five (a base patch plus four presets),
+    // and the official headless template includes that bundle — so requiring
+    // a string reported "the profile will fail to boot" for the DEFAULT
+    // layout, while `dsh --dump-config` composed it fine (#676).
     const declared = bundleManifest.dsh?.bundle?.patch
-    if (typeof declared !== 'string') {
+    const declaredList = typeof declared === 'string'
+      ? [declared]
+      : Array.isArray(declared) ? declared.filter((item): item is string => typeof item === 'string') : []
+    if (declaredList.length === 0) {
       layer.error = 'bundle declares no dsh.bundle.patch — the profile will fail to boot'
       return layer
     }
-    const patchPath = join(directory, declared)
-    if (!existsSync(patchPath)) {
-      layer.error = `declared patch ${declared} is missing — the profile will fail to boot`
+    const missing = declaredList.find(relative => !existsSync(join(directory, relative)))
+    if (missing !== undefined) {
+      layer.error = `declared patch ${missing} is missing — the profile will fail to boot`
       return layer
     }
-    layer.patchPath = patchPath
-    const patches = parsePatchFile(patchPath)
-    if (patches === null) {
+    // The first declared file is the layer's patch for reporting; every one
+    // of them contributes entries, because the composer applies them all.
+    layer.patchPath = join(directory, declaredList[0]!)
+    layer.patchPaths = declaredList.map(relative => join(directory, relative))
+    const parsed = declaredList.map(relative => parsePatchFile(join(directory, relative)))
+    if (parsed.some(patches => patches === null)) {
       layer.parseError = 'patch file is not a valid entry list'
       return layer
     }
-    layer.entries = collectInsertIds(patches)
+    layer.entries = parsed.flatMap(patches => collectInsertIds(patches!))
     const order = bundleManifest.dsh?.bundle?.order
     if (order !== null && typeof order === 'object' && !Array.isArray(order)) {
       const listOf = (value: unknown): string[] | undefined => Array.isArray(value)
@@ -979,10 +1170,205 @@ export function buildBundleLayers(
   const layers: LayerInput[] = bundles.map((bundle) => ({
     label: bundle.name,
     kind: 'bundle' as const,
-    patches: bundle.patchPath !== null && bundle.parseError === null ? parsePatchFile(bundle.patchPath) ?? [] : [],
+    // EVERY declared file, not the first: the composer applies them all, and
+    // a composition built from one file would miss the preset rows — so a
+    // duplicate id or an orphan in a second file was invisible here (#688).
+    patches: bundle.parseError === null
+      ? bundle.patchPaths.flatMap(path => parsePatchFile(path) ?? [])
+      : [],
     parseError: bundle.parseError,
   }))
   return { bundles, layers }
+}
+
+/**
+ * The installation's own bundle layer, when the installation package declares
+ * one — the Desktop shell's `cordis.patch.yml`.
+ *
+ * The Desktop launcher applies that file by hand rather than through the
+ * profile's `dsh.profile.bundles`, and splices it in directly behind the
+ * `@deepseek-ai/dsh-web-app` layer. Composing without it made every user-patch
+ * or home-patch row aimed at a row the shell inserts — `desktop-shell`,
+ * `desktop-notifications`, `desktop-terminal`, `desktop-pnpm`, … — read as an
+ * orphan ("patch target not found") although the running host resolves it. It
+ * is not noise: those rows are the shell's own settings persistence, so a user
+ * who believes the warning and deletes them loses the window mode and every
+ * notification preference.
+ *
+ * WHERE that package root is is not where `dshInstallDir` points; see
+ * {@link desktopApplicationRoots} for the candidates and why. A plain CLI
+ * install is unaffected: `@deepseek-ai/dsh` declares no bundle patch, and
+ * neither does any ancestor of a global install, so this returns null and the
+ * composer sees exactly the layers it saw before.
+ *
+ * A candidate is accepted only when it is actually an installation — it must
+ * ship the in-box `@deepseek-ai/dsh-web-app` bundle this overlay is spliced
+ * behind (see the check below). A declared patch alone is not evidence: any
+ * project may declare one.
+ *
+ * @param dshInstall - install directory the analysis located, or null.
+ * @returns the overlay layer, or null when this installation declares none.
+ */
+function installOverlayLayer(
+  dshInstall: string | null,
+  profileDirectory: string,
+  declaredBundles: readonly string[],
+): LayerInput | null {
+  for (const directory of desktopApplicationRoots(dshInstall)) {
+    // A DSH installation ships the in-box web bundle, and the launcher splices
+    // this very overlay directly behind that bundle's layer — where it is
+    // absent, the launcher applies no overlay either, so composing one here
+    // would describe a composition nobody runs (#749 review).
+    const layer = overlayFromDirectory(directory, manifest =>
+      readNodeModulesVersion(directory, '@deepseek-ai/dsh-web-app') !== null)
+    if (layer !== null) return layer
+  }
+  // The official Desktop shell plugin's own patch (#807). On a build that packs
+  // the whole runtime into one app.asar, no application-root candidate declares
+  // it: the asar's root is `@deepseek-ai/dsh-desktop` and the nested
+  // `app.asar/dsh` is `@deepseek-ai/dsh-desktop-runtime`, neither with a
+  // `dsh.bundle.patch`, while the file that really supplies the shell's rows
+  // (`desktop-shell`, `desktop-notifications`, …) is this package's own
+  // `cordis.patch.yml`. Without it every user-patch row aimed at a shell row is
+  // reported as an orphan, and a user who believes the warning deletes rows
+  // that carry the window material and the notification preferences.
+  //
+  // Bounded by identity, not by location: the candidate must BE that package,
+  // resolved from the profile's own module search, and must declare a patch.
+  // A profile that lists it in `dsh.profile.bundles` gets it as an ordinary
+  // bundle layer instead — composing both would add every row twice.
+  if (!declaredBundles.includes(DESKTOP_SHELL_PLUGIN)) {
+    const directory = resolvePackageDir(join(profileDirectory, 'package.json'), DESKTOP_SHELL_PLUGIN)
+    if (directory !== null) {
+      return overlayFromDirectory(directory, manifest => manifest.name === DESKTOP_SHELL_PLUGIN)
+    }
+  }
+  return null
+}
+
+/** The official Desktop shell plugin, whose patch the launcher applies by hand (#807). */
+const DESKTOP_SHELL_PLUGIN = 'dsh-plugin-desktop'
+
+/**
+ * The overlay one candidate directory declares, or null when it declares none.
+ *
+ * `accept` is the caller's bound on what may stand in for the installation;
+ * resolution and parsing are shared, because a second parsing path would be a
+ * second set of answers about the same file.
+ */
+function overlayFromDirectory(
+  directory: string,
+  accept: (manifest: { name?: unknown }) => boolean,
+): LayerInput | null {
+  let manifest: { name?: unknown; dsh?: { bundle?: { patch?: unknown } } }
+  try {
+    manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')) as typeof manifest
+  } catch {
+    return null
+  }
+  const declared = manifest.dsh?.bundle?.patch
+  const declaredList = typeof declared === 'string'
+    ? [declared]
+    : Array.isArray(declared)
+      ? declared.filter((relative): relative is string => typeof relative === 'string')
+      : []
+  // A bundle patch alone does not make a directory an installation: ANY package
+  // can declare one — this repository does, and so does every plugin repo.
+  // Without the caller's bound the ancestor walk accepted the nearest such
+  // project above the install directory and composed its rows as if they were
+  // the installation's own, which invents rows and can mask a real orphan
+  // warning (#749 review).
+  if (declaredList.length === 0 || !accept(manifest)) return null
+  const label = typeof manifest.name === 'string' && manifest.name !== '' ? manifest.name : 'install-overlay'
+  const paths = declaredList.map(relative => join(directory, relative))
+  if (paths.some(path => !existsSync(path))) {
+    return { label, kind: 'bundle', patches: [], parseError: 'declared patch is missing' }
+  }
+  const parsed = paths.map(path => parsePatchFile(path))
+  if (parsed.some(patches => patches === null)) {
+    return { label, kind: 'bundle', patches: [], parseError: 'patch file is not a valid entry list' }
+  }
+  return { label, kind: 'bundle', patches: parsed.flatMap(patches => patches), parseError: null }
+}
+
+/**
+ * Which directories in `node_modules` are leftovers (#663).
+ *
+ * Two shapes, and both need to be VISIBLE rather than cleaned: a directory
+ * without a readable `package.json` (what a lock-blocked update leaves), and
+ * pnpm's `<name>_tmp_<pid>_<n>` staging directory (what an interrupted one
+ * leaves). Neither can be removed from in here in the case that produces
+ * them — the plugin's own process holds the directory open, so the rename
+ * and delete that would clear it are the operations that were just refused.
+ * Telling the user what is on disk, and which of it is merely junk, is the
+ * part this process can do.
+ *
+ * Bounded on purpose. The top level is scanned in full (that is where the
+ * profile's own packages live), plus one level inside the virtual store:
+ * pnpm stages a package's update in the `node_modules` beside it, so that is
+ * where a dependency's temp directory appears. It does NOT recurse through
+ * the whole virtual store: on a large Windows profile that is thousands of
+ * directories for a page the user opens by hand, and the store's OWN temp
+ * directories are already reclaimed by `cleanOrphanedStoreTmp`.
+ */
+export function findResidualDirectories(
+  profileDirectory: string,
+  declared: ReadonlySet<string>,
+): ResidualDirectory[] {
+  const out: ResidualDirectory[] = []
+  // pnpm's staging name, from its own rename: `<name>_tmp_<pid>_<n>`.
+  const tmpShape = /^(.+)_tmp_\d+_\w+$/
+
+  const consider = (directory: string, entry: string, relative: string): void => {
+    // pnpm's own bookkeeping lives in here beside the packages: `.pnpm` (the
+    // virtual store), `.bin`, `.modules.yaml`, `.ignored`. None of them is a
+    // package, so none of them is a broken one.
+    if (entry.startsWith('.')) return
+    let stats: ReturnType<typeof lstatSync>
+    try {
+      stats = lstatSync(join(directory, entry))
+    } catch {
+      return
+    }
+    // A symlink is how pnpm links every installed package to its store
+    // entry. A DANGLING one is a different failure (and `#708` cleans the
+    // market's own); counting healthy links as leftovers would flag every
+    // profile in existence.
+    if (!stats.isDirectory()) return
+    const tmp = tmpShape.exec(entry)
+    if (tmp !== null) {
+      out.push({ name: tmp[1]!, path: join(relative, entry), kind: 'tmp-directory', declared: declared.has(tmp[1]!) })
+      return
+    }
+    if (declared.has(entry)) return
+    let readable = false
+    try {
+      JSON.parse(readFileSync(join(directory, entry, 'package.json'), 'utf8'))
+      readable = true
+    } catch { /* missing or unparseable — that is the finding */ }
+    if (!readable) out.push({ name: entry, path: join(relative, entry), kind: 'incomplete-package', declared: false })
+  }
+
+  const nodeModules = join(profileDirectory, 'node_modules')
+  try {
+    for (const entry of readdirSync(nodeModules)) consider(nodeModules, entry, 'node_modules')
+  } catch { /* no node_modules: nothing to report */ }
+
+  const pnpmDirectory = join(nodeModules, '.pnpm')
+  let pnpmEntries: string[] = []
+  try {
+    pnpmEntries = readdirSync(pnpmDirectory)
+  } catch { /* no virtual store */ }
+  for (const entry of pnpmEntries) {
+    const nested = join(pnpmDirectory, entry, 'node_modules')
+    const relative = join('node_modules', '.pnpm', entry, 'node_modules')
+    try {
+      for (const name of readdirSync(nested)) consider(nested, name, relative)
+    } catch { /* unreadable nested node_modules */ }
+  }
+
+  out.sort((left, right) => left.path.localeCompare(right.path))
+  return out
 }
 
 /**
@@ -1009,9 +1395,23 @@ export function analyzeProfile(profileDirectory: string, options: CheckOptions =
     ? manifest.dsh.profile.bundles.filter((name): name is string => typeof name === 'string')
     : []
   const specs = manifest?.dependencies ?? {}
+  // Declared = what the profile asks to load. A leftover directory under one
+  // of these names is a boot problem (the bundle layers above judge it), and
+  // an undeclared one is junk the user can clear — the distinction is the
+  // whole point of the listing (#663).
+  const declaredNames = new Set([...Object.keys(specs), ...bundleNames])
   const built = buildBundleLayers(profileDirectory, bundleNames, specs, dshInstall)
   const bundles = built.bundles
   const bundleLayers = built.layers
+  // The installation's own overlay rides directly behind the bundle the
+  // Desktop launcher keys off, exactly where the launcher splices it — see
+  // installOverlayLayer.
+  const installOverlay = installOverlayLayer(dshInstall, profileDirectory, bundleNames)
+  if (installOverlay !== null) {
+    const overlayAfter = bundleLayers.findIndex(layer => layer.label === '@deepseek-ai/dsh-web-app')
+    if (overlayAfter < 0) bundleLayers.push(installOverlay)
+    else bundleLayers.splice(overlayAfter + 1, 0, installOverlay)
+  }
 
   // --- 2. composed loader rows / duplicates / overrides / orphans ---
   const layers: LayerInput[] = [...bundleLayers]
@@ -1051,16 +1451,53 @@ export function analyzeProfile(profileDirectory: string, options: CheckOptions =
       const key = `${plugin}\u0000${name}\u0000peer`
       if (seenDeps.has(key)) continue
       seenDeps.add(key)
-      const hoisted = readProfileVisibleVersion(profileDirectory, name)
+      // A HOST-PLANE peer never takes its version from the shared workspace
+      // root: `<profiles>/node_modules` is shared by every profile, and on a
+      // machine that also runs a second DSH installation — a global npm CLI
+      // beside the Desktop app — that tree is the OTHER installation's
+      // closure. Reading a host version from it reported a healthy install as
+      // "introduced host-compatibility risks … vs 0.1.5-rc.2" and offered a
+      // rollback, while the running host was 0.1.7-rc.2 (#726). What the
+      // plugin itself resolves still counts (a nested copy, a profile-local
+      // one), and the located installation is asked as `host` below; with
+      // neither, the version is unknown rather than wrong — the rule #676
+      // settled for bundles. Non-host peers keep the hoisted fallback.
+      const hostPlane = name.startsWith('@deepseek-ai/')
+      const hoisted = hostPlane
+        ? readNodeModulesVersion(profileDirectory, name)
+        : readProfileVisibleVersion(profileDirectory, name)
       const nested = readNodeModulesVersion(pluginDir, name)
-      const host = dshInstall !== null ? readNodeModulesVersion(dshInstall, name) : null
+      // The located installation is asked as `host` here — and `dshInstall` is
+      // the PACKAGE directory `dshHostInfo()` answers (the CLI layout
+      // `<prefix>/node_modules/@deepseek-ai/dsh`, and the #778 nested form
+      // `<resources>/app.asar/dsh/node_modules/@deepseek-ai/dsh`), or a flat
+      // Desktop deployment root. `readNodeModulesVersion` takes a package root
+      // and appends `node_modules` itself, so passing a package directory read
+      // `<package>/node_modules/<name>`: absent in most layouts, which silently
+      // left the located installation unasked while the comment above promises
+      // it is asked; and where the host package carries its own nested
+      // `@deepseek-ai` scope (pnpm isolated trees) it answered from that
+      // truncated subset instead — the opposite of the "unknown rather than
+      // wrong" this rule promises. `hostNodeModulesRoot()` derives the shared
+      // root from both shapes (#804's fix, same arithmetic).
+      const host = dshInstall !== null
+        ? readNodeModulesVersion(dirname(hostNodeModulesRoot(dshInstall)), name)
+        : null
       // Node resolves a plugin's peer from its OWN node_modules first
       // (nested), then the profile tree (hoisted), then the host install.
       const resolved = nested ?? hoisted ?? host
       // Peer checks cover EVERY declared peer, not just host core packages:
       // plugin-to-plugin peer mismatches break runtime registration just as
       // hard (issue #98 optimization round).
-      const satisfied = resolved !== null ? satisfiesRange(resolved, spec) : null
+      // #1000: the same prerelease admission the discovery and verify checks
+      // already use. A peer range written for the host line (`>=0.2.0-rc.0
+      // <0.3.0`) can only ever be satisfied by a prerelease host version, and
+      // npm's default rule refuses it unless a comparator pins the exact
+      // [major, minor, patch] tuple — so a healthy profile carried the same
+      // six permanent warnings, with no way to clear them but pinning exact
+      // rc versions. The flag widens admission only; `^`/`~` ceilings still
+      // apply (exclusiveUpperBound), so a cross-minor host line stays out.
+      const satisfied = resolved !== null ? satisfiesRange(resolved, spec, { includePrerelease: true }) : null
       const optional = pkg.peerDependenciesMeta?.[name]?.optional === true
       peerMismatches.push({
         plugin, name, range: spec, resolved,
@@ -1126,12 +1563,34 @@ export function analyzeProfile(profileDirectory: string, options: CheckOptions =
   }
   for (const { row, packageName } of candidates.values()) {
     if (profilePackageInstalled(profileDirectory, packageName)) continue
+    // Official Electron keeps built-in packages beside app.asar, not inside
+    // the writable profile. The loader can resolve them from this anchor.
+    if (dshInstall !== null && core.has(packageName)
+      && resolvePackageDir(join(dshInstall, 'package.json'), packageName) !== null) continue
+    // Same rule as the bundle stack above: inside an archive the probe is
+    // blind for EVERY `@deepseek-ai/` name, so the verdict depends on the
+    // name being DeepSeek's and not on whether it appears on a list of the
+    // ones we happen to have seen. `dsh-mcp-client` was that list's only
+    // entry, and the next host-shipped loader would have been a fresh fatal
+    // error (#676).
+    if (isPackagedDesktopInstall(dshInstall) && packageName.startsWith('@deepseek-ai/')) {
+      warnings.push(`${row.layer}: bundled Desktop loader ${packageName} could not be independently resolved from app.asar`)
+      continue
+    }
     const message = `${row.layer}: loader package ${packageName} is not installed in the profile`
     if (row.activation === 'required') errors.push(`${message} — the profile will fail to boot`)
     else warnings.push(`${message} — boot will fail if its disabled expression enables the entry`)
   }
+  // Rows on one id: a boot failure on an old loader, a silent override on a
+  // new one (see duplicateEntryIdsAreFatal). Refusing an operation over the
+  // second shape rolled back every update for the reporter's profile.
+  const duplicateFatal = duplicateEntryIdsAreFatal(profileDirectory, dshInstall)
   for (const dup of composed.duplicates) {
-    errors.push(`duplicate loader entry id ${JSON.stringify(dup.id)} (${dup.count} rows: ${dup.layers.join(', ')})`)
+    if (duplicateFatal) {
+      errors.push(`duplicate loader entry id ${JSON.stringify(dup.id)} (${dup.count} rows: ${dup.layers.join(', ')})`)
+      continue
+    }
+    warnings.push(`${dup.layers.join(' 与 ')}：同一个条目 id ${JSON.stringify(dup.id)} 各有 ${String(dup.count)} 行，当前宿主会让后一层覆盖前一层，启动不受影响，但前面那行会静默失效——删除其中一行即可消除歧义 / the layers ${dup.layers.join(' and ')} each declare entry id ${JSON.stringify(dup.id)} (${String(dup.count)} rows); this host lets the LATER row win, so the boot is fine but the earlier row is silently dropped — remove one of them to make the intent unambiguous`)
   }
   for (const orphan of composed.orphans) {
     warnings.push(`${orphan.layer}: ${orphan.id} — ${orphan.reason}`)
@@ -1230,6 +1689,7 @@ export function analyzeProfile(profileDirectory: string, options: CheckOptions =
     multiVersion,
     orderConflicts,
     suggestedOrder,
+    residuals: findResidualDirectories(profileDirectory, declaredNames),
     summary: {
       ok: errors.length === 0,
       errors,

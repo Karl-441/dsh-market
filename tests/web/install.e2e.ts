@@ -52,14 +52,14 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
 
   /** The install route is same-origin only, like the browser's own POST. */
   const post = async (path: string, body: unknown): Promise<Response> =>
-    fetch(`${base}${path}`, {
+    scaffold.api(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify(body),
     })
 
   const state = async (): Promise<InstalledState> =>
-    (await fetch(`${base}/dsh-market/installed`)).json() as never
+    (await scaffold.api(`/dsh-market/installed`)).json() as never
 
   /**
    * Ground truth. The fixture writes this marker from inside its webServer
@@ -76,7 +76,7 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
   /** Wait out post-install work (validation, patch write, hot mount). */
   const settle = async (): Promise<void> => {
     for (let attempt = 0; attempt < 90; attempt++) {
-      const status = (await (await fetch(`${base}/dsh-market/status`)).json()) as { busy?: boolean; active?: boolean }
+      const status = (await (await scaffold.api(`/dsh-market/status`)).json()) as { busy?: boolean; active?: boolean }
       if (status.busy !== true && status.active !== true) return
       await new Promise(done => setTimeout(done, 2000))
     }
@@ -97,6 +97,28 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
     // Ground truth agrees they are absent, so no later pass can be a leftover.
     expect(reallyLive(A)).toBe(false)
     expect(reallyLive(B)).toBe(false)
+  })
+
+  it('refuses a client with no session and installs nothing, while a logged-in one is served (#603)', async () => {
+    // The reported exposure, against the REAL host gate: a client that can
+    // reach the port but holds no session. Bare `fetch` is that client.
+    const anonymous = await fetch(`${base}/dsh-market/installed`)
+    if (anonymous.status === 200) {
+      // A host without the browser login (0.1.0-rc.8) has no gate to ask. Said
+      // here rather than passed silently, so a green run says which it was.
+      expect(await (await scaffold.api('/dsh-market/installed')).json()).toEqual(await anonymous.json())
+      return
+    }
+    expect(anonymous.status).toBe(401)
+    const before = await state()
+    const write = await fetch(`${base}/dsh-market/install`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ url: `https://github.com/dshm-e2e/${A}` }),
+    })
+    expect(write.status).toBe(401)
+    expect(reallyLive(A)).toBe(false)
+    expect(await state()).toEqual(before)
   })
 
   it('installs through the route and cordis really mounts it', async () => {
@@ -150,7 +172,7 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
       'content-type': 'application/json',
       ...(exchange === null ? {} : { cookie: `${exchange.cookie.name}=${exchange.cookie.value}` }),
     }
-    const request = (path: string, method: string): Promise<Response> => fetch(`${base}${path}`, {
+    const request = (path: string, method: string): Promise<Response> => scaffold.api(path, {
       method: 'POST',
       headers,
       body: JSON.stringify({ type: 'client-request', rpcId: '1', method, payload: { args: {} } }),
@@ -177,7 +199,27 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
     const served = body.result?.value?.namespaces
     expect(served, `settings.describe returned: ${JSON.stringify(body).slice(0, 300)}`).toBeDefined()
     const names = (served ?? []).map(entry => entry.ns)
-    expect(names, `served namespaces: ${names.join(', ')}`).toContain('dsh-market')
+
+    // Which host generation this is decided by the MARKET, not guessed from
+    // a version string: it is the side that offered the namespace and knows
+    // what the service answered (#677). 0.1.7 derives settings from a
+    // plugin's Config schema and serves no third-party namespace at all —
+    // asserted in its own direction below, so this spec cannot pass by
+    // demanding something a host cannot do, nor by asserting nothing.
+    const status = await (await scaffold.api(`/dsh-market/status`)).json() as {
+      settingsNamespace?: string
+    }
+    expect(status.settingsNamespace, 'the market has booted and must have an answer').not.toBe('pending')
+    if (status.settingsNamespace === 'registered') {
+      expect(names, `served namespaces: ${names.join(', ')}`).toContain('dsh-market')
+    } else {
+      expect(status.settingsNamespace).toBe('unsupported-by-host')
+      expect(names, `served namespaces: ${names.join(', ')}`).not.toContain('dsh-market')
+      // The host's new model is not "less settings": the market's own
+      // configuration still has a home — its Config, read by the routes —
+      // and that is asserted by the running market answering this at all.
+      expect(names.length, 'a host that serves no plugin namespace still serves its own').toBeGreaterThan(0)
+    }
   }, 120_000)
 
   it('refuses a source that is not in the curated registry', async () => {
@@ -192,40 +234,45 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
     expect(reallyLive(A)).toBe(true)
   }, 600_000)
 
-  it('a patch with config rows activates on restart, as the market says', async () => {
+  it('a patch with config rows is live once the host can compose it (#827, #156)', async () => {
     const { status } = await install(CROSS)
     expect(status).toBe(200)
-    // The market declines to hot-mount this shape and says so. Take it at
-    // its word — then check the word was true.
-    expect((await state()).activation[CROSS]?.state).toBe('restart')
-    expect(reallyLive(CROSS)).toBe(false)
-
-    await scaffold.restart()
-    // Booting is itself the assertion: a profile the install logic corrupted
-    // would not come up, and the bundle layer now has to load this entry.
-    expect(reallyLive(CROSS)).toBe(true)
+    // The market itself cannot hot-mount config rows. Hosts with a live
+    // profile watcher compose the bundle instead (#827); older hosts still
+    // need a restart. Either way the market must not say "restart" about a
+    // plugin that is already running (#156).
+    const afterInstall = (await state()).activation[CROSS]?.state
+    if (afterInstall === 'live') {
+      expect(reallyLive(CROSS)).toBe(true)
+    } else {
+      expect(afterInstall).toBe('restart')
+      expect(reallyLive(CROSS)).toBe(false)
+      await scaffold.restart()
+      expect(reallyLive(CROSS)).toBe(true)
+      expect((await state()).activation[CROSS]?.state).toBe('live')
+    }
+    // Booting / adopting must leave neighbours alone.
     expect(reallyLive(A)).toBe(true)
     expect(reallyLive(B)).toBe(true)
-
-    // ...and the market has to AGREE once the restart it asked for happened
-    // (#156). Saying "restart to activate" about a plugin that is already
-    // running sends users hunting for a failure that is not there.
-    expect((await state()).activation[CROSS]?.state).toBe('live')
   }, 600_000)
 
-  it('a carrier bundle reads as live once its restart happened (#156)', async () => {
+  it('a carrier bundle reads as live once the host can compose it (#156, #827)', async () => {
     // It ships no plugin of its own: its patch inserts an entry named after
     // ANOTHER package, with config — the shape of @tt-a1i/archify-dsh, which
     // mounts @deepseek-ai/dsh-skill-filesystem. Nothing in the live loader
     // inventory is ever called by the carrier's own name.
     const { status } = await install(CARRIER)
     expect(status).toBe(200)
-    expect((await state()).activation[CARRIER]?.state).toBe('restart')
-
-    await scaffold.restart()
-    // The profile came up, so the carrier's row IS in the running tree.
-    // Still reporting "restart to activate" sends users hunting for a
-    // failure that already resolved — the whole of #156.
+    const afterInstall = (await state()).activation[CARRIER]?.state
+    if (afterInstall === 'live') {
+      // Profile watcher composed the foreign rows (#827).
+    } else {
+      expect(afterInstall).toBe('restart')
+      await scaffold.restart()
+      expect((await state()).activation[CARRIER]?.state).toBe('live')
+    }
+    // Still reporting "restart to activate" about a plugin that is already
+    // running sends users hunting for a failure that already resolved — #156.
     expect((await state()).activation[CARRIER]?.state).toBe('live')
     expect(reallyLive(B)).toBe(true)
   }, 600_000)
@@ -269,7 +316,7 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real install chain', () => {
     expect(Object.keys((await state()).installed)).toContain(CARRIER)
 
     const abort = new AbortController()
-    const abandoned = fetch(`${base}/dsh-market/uninstall`, {
+    const abandoned = scaffold.api(`/dsh-market/uninstall`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify({ name: CARRIER }),

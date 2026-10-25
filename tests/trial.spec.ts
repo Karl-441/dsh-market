@@ -93,6 +93,42 @@ describe('an unlocatable in-box bundle must not fail the trial (#369)', () => {
     expect(result.ok, 'a passing composition was called unbootable').toBe(true)
   })
 
+  it('passes the trial when the in-box bundle declares a patch LIST (#688, #676)', () => {
+    // dsh 0.1.7's own @deepseek-ai/dsh-web-app declares five patch files,
+    // and an in-box bundle is supplied by the dsh INSTALLATION — so it has to
+    // be modelled there, not in the profile (a profile copy is a stale
+    // shadow the trial ignores). The trial is what the update route runs
+    // before it lets an update stand: a string-only reading did not just
+    // mis-diagnose, on 0.1.7-alpha.1 it rejected EVERY plugin update and
+    // rolled it back, with a message blaming a field the updated package
+    // plainly declared.
+    const dir = pdir()
+    writeProfile(dir, ['@deepseek-ai/dsh-web-app', 'dsh-cost-meter'])
+    writeBundle(dir, 'dsh-cost-meter', '1.7.34', [{ insert: [{ id: 'cost-meter', name: 'dsh-cost-meter' }] }])
+    const dshInstall = join(tmp, 'dsh-install')
+    mkdirSync(dshInstall, { recursive: true })
+    writeFileSync(join(dshInstall, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.1.7-alpha.1' }))
+    const official = join(dshInstall, 'node_modules', '@deepseek-ai', 'dsh-web-app')
+    mkdirSync(join(official, 'presets'), { recursive: true })
+    writeFileSync(join(official, 'package.json'), JSON.stringify({
+      name: '@deepseek-ai/dsh-web-app',
+      version: '0.1.7-alpha.1',
+      dsh: { bundle: { patch: ['./cordis.patch.yml', './presets/standard.patch.yml'] } },
+    }))
+    writeFileSync(join(official, 'cordis.patch.yml'), dump([{ insert: [{ id: 'web-app', name: '@deepseek-ai/dsh-web-app' }] }]))
+    writeFileSync(join(official, 'presets', 'standard.patch.yml'), dump([{ insert: [{ id: 'preset-standard', name: 'preset-standard' }] }]))
+
+    const result = trialValidate(dir, ['dsh-cost-meter'], {
+      dshInstallDir: dshInstall,
+      homeDir: join(tmp, 'empty-home'),
+    })
+
+    expect(result.errors.map(e => `${e.layer}: ${e.message}`)).toEqual([])
+    expect(result.ok, 'an update on the official 0.1.7 layout was called unbootable').toBe(true)
+    // Both of the official bundle's files contributed rows.
+    expect(result.rows.map(r => r.id)).toEqual(expect.arrayContaining(['web-app', 'preset-standard', 'cost-meter']))
+  })
+
   it('ignores a stale profile copy that the hidden in-box host outranks', () => {
     const dir = pdir()
     writeProfile(dir, ['@deepseek-ai/dsh-base', 'dsh-smooth-stream'])
@@ -177,6 +213,31 @@ describe('trialValidate (#98 trial boot)', () => {
     expect(result.duplicates[0]?.id).toBe('dup-entry')
     expect(result.duplicates[0]?.count).toBe(2)
     expect(result.duplicates[0]?.layers).toEqual(['beta', 'alpha'])
+  })
+
+  it('downgrades a shared id to a warning on a loader that folds it (#853)', () => {
+    // The trial gate is what rolled the update back: the same pair the check
+    // report calls an override also failed here, so the market refused to
+    // install over a profile whose boot was fine. Same version gate, same
+    // evidence: only the published 1.0.4+ fold the array instead of throwing.
+    const dir = pdir('trial-fold')
+    writeProfile(dir, ['alpha', 'beta'])
+    writeBundle(dir, 'alpha', '1.0.0', [{ insert: [{ id: 'dup-entry', name: 'alpha' }] }])
+    writeBundle(dir, 'beta', '1.0.0', [{ insert: [{ id: 'dup-entry', name: 'beta' }] }])
+    writeFileSync(join(dir, 'pnpm-lock.yaml'), [
+      "lockfileVersion: '9.0'",
+      'packages:',
+      "  '@deepseek-ai/cordis-plugin-loader@1.0.5':",
+      '    version: 1.0.5',
+      '',
+    ].join('\n'))
+
+    const result = trialValidate(dir, ['beta', 'alpha'])
+    expect(result.ok).toBe(true)
+    expect(result.errors.some(e => e.message.includes('duplicate'))).toBe(false)
+    // Still reported — the earlier row silently loses, the user should know.
+    expect(result.warnings.some(w => w.message.includes('duplicate'))).toBe(true)
+    expect(result.duplicates).toHaveLength(1)
   })
 
   it('flags a bundle whose package is listed but not installed', () => {
@@ -317,5 +378,56 @@ describe('trialValidate (#98 trial boot)', () => {
     // current order) and no new duplicate loader ids.
     expect(result.diff.orphans).toEqual([])
     expect(result.diff.duplicates).toEqual([])
+  })
+})
+
+describe('the host anchor is what trial validation judges with (#781 review)', () => {
+  /**
+   * The disagreement this pins: `analyzeProfile` (the diagnostics panel) is
+   * handed the running installation's anchor by the host, while every
+   * `trialValidate` call site re-derived one with `findDshInstallDir()`. Two
+   * answers about one composition therefore came from two different inputs.
+   *
+   * #369 deliberately tolerates an in-box bundle it cannot locate, so the
+   * observable difference is not ok/not-ok — it is whether the installation's
+   * own patch rows are in the composition at all. With the anchor they are;
+   * without it the bundle contributes nothing, which is the state every call
+   * site was in, and on a host whose own probe fails the fallback can instead
+   * resolve an official bundle out of a profile tree belonging to a DIFFERENT
+   * dsh installation (#781).
+   */
+  const anchor = (): string => {
+    const dir = join(tmp, 'host')
+    // The install root the host would name: a package.json to anchor on, with
+    // the in-box bundle beside it — NOT in the profile, so the only way this
+    // layer can reach the composition is through the anchor.
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+    writeBundle(dir, '@deepseek-ai/dsh-web-app', '0.2.0-rc.2', [
+      { insert: [{ id: 'desktop-shell', name: 'cordis-plugin-desktop-shell' }] },
+    ])
+    return dir
+  }
+
+  it('composes the installation\'s own layer when the anchor is passed', () => {
+    const profile = pdir()
+    writeProfile(profile, ['@deepseek-ai/dsh-web-app', 'dsh-loop'])
+    writeBundle(profile, 'dsh-loop', '1.0.0', [{ insert: [{ id: 'loop', name: 'dsh-loop' }] }])
+
+    const withAnchor = trialValidate(profile, ['dsh-loop'], { dshInstallDir: anchor() })
+    expect(withAnchor.rows.map(row => row.id)).toContain('desktop-shell')
+  })
+
+  it('contributes nothing from that bundle when the anchor is missing', () => {
+    // The same profile and the same in-box bundle; only the input differs.
+    const profile = pdir('no-anchor')
+    writeProfile(profile, ['@deepseek-ai/dsh-web-app', 'dsh-loop'])
+    writeBundle(profile, 'dsh-loop', '1.0.0', [{ insert: [{ id: 'loop', name: 'dsh-loop' }] }])
+
+    const without = trialValidate(profile, ['dsh-loop'], {
+      dshInstallDir: null,
+      homeDir: join(tmp, 'empty-home'),
+    })
+    expect(without.rows.map(row => row.id)).not.toContain('desktop-shell')
   })
 })

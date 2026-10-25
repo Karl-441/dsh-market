@@ -48,6 +48,15 @@ export interface RegistryPlugin {
    * package. Absent means "no npm package" — a coverage gap, not a zero.
    */
   downloads?: number | null
+  /** Source-reported download window; absent dates must not be inferred. */
+  downloadsStart?: string | null
+  downloadsEnd?: string | null
+  downloadsCheckedAt?: string | null
+  /**
+   * Catalog npm `latest` (awesome-dsh-plugin / dsh-market#348). Shown in the
+   * discover byline only when it is a non-empty string.
+   */
+  version?: string | null
   added?: string
   install?: string
   /**
@@ -57,6 +66,18 @@ export interface RegistryPlugin {
   deprecated?: boolean
   /** Catalog name of the suggested replacement plugin, when deprecated. */
   replacement?: string
+  /**
+   * Capability disclosure (#401), scanned at catalog build time from the
+   * artifact a user would install. ABSENT means "never scanned" and `[]`
+   * means "scanned, nothing detected" — the card renders those two as
+   * different sentences (未扫描 / 未检出), because only one of them is a
+   * statement about the plugin. Never a verdict: see `capabilityNote`.
+   */
+  capabilities?: string[]
+  capabilityRedLines?: string[]
+  capabilityCheckedAt?: string | null
+  /** Catalog-declared storefront tile; same image gate as screenshots; optional. */
+  icon?: string | null
   /** Author-curated screenshot URLs from the registry (#61); optional. */
   screenshots?: string[]
 }
@@ -104,6 +125,43 @@ export type InstalledMap = Record<string, string>
  * must keep using the dependency-only map because a Bundle supplied by the
  * dsh installation is not owned by the profile package manager.
  */
+/** Why a queued operation may no longer be run. */
+export type QueuedRowStaleReason = 'gone' | 'no-update'
+
+/**
+ * Whether a queued operation still applies — `null` when it does.
+ *
+ * A queued row drains with NO confirmation; that is what queueing means. So a
+ * row restored from an old session is a destructive operation launched from a
+ * decision the user may have taken back since: queue an uninstall at 10:00,
+ * remove the plugin by hand, open the market at 15:00 and it would run. Every
+ * kind therefore has to be true RIGHT NOW, and this is the one place that
+ * decides — the restore in MarketSection reports what it returns instead of
+ * executing it.
+ *
+ * `install` asks the catalog (the entry may have been delisted), `uninstall`
+ * asks the installed map (it may be gone, or the user may have reinstalled
+ * it), and `update` asks both plus the update check (the pending release may
+ * have landed already).
+ */
+export function queuedRowApplies(
+  row: { kind: 'install' | 'update' | 'uninstall'; name: string; url?: string; restore?: boolean },
+  world: { installed: InstalledMap; updates: Record<string, UpdateStatus>; plugins: readonly RegistryPlugin[] },
+): QueuedRowStaleReason | null {
+  if (row.kind === 'install') {
+    if (row.url === undefined) return 'gone'
+    return world.plugins.some(plugin => plugin.url === row.url) ? null : 'gone'
+  }
+  if (world.installed[row.name] === undefined) return 'gone'
+  if (row.kind === 'update' && world.updates[row.name]?.updateAvailable !== true) {
+    // A local restore replaces a checkout, not a newer release.
+    if (row.restore === true && world.updates[row.name]?.kind === 'linked' &&
+        findCatalogEntryForLocal(world.plugins, row.name) !== null) return null
+    return 'no-update'
+  }
+  return null
+}
+
 export function installedForCatalog(installed: InstalledMap, bundles: readonly string[]): InstalledMap {
   return Object.fromEntries([
     ...bundles.map(name => [name, '*'] as const),
@@ -145,8 +203,21 @@ export interface UpdateStatus {
       the range between them in whichever form reads best. */
   current?: string | null
   latest?: string | null
+  /** A plain dependency, not a plugin (#793): a newer release may exist but is never offered. */
+  notAPlugin?: boolean
+  /** A newer build on a tag other than `latest` (#867): named so a pin ahead of
+      `latest` does not read as "up to date", never an automatic offer. */
+  newerPrerelease?: string
+  /** Floating git install whose line moved without a release (#824): the
+      unreleased HEAD, shown as a neutral badge — newer commits exist, but the
+      market installs versions, not branch heads. */
+  unreleasedCommit?: string
   /** Updating this local package switches it to its matched online release. */
   restoreRequired?: boolean
+  /** A newer release exists but the profile's fresh-release wait has not
+      passed yet (#945). `updateAvailable` is false and this names the wait;
+      on the official Desktop there is no bypass to offer. */
+  heldUpdate?: { latest: string; until: string; estimated?: true }
   /** Explicit source migration; never part of update-all. */
   sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
 }
@@ -190,6 +261,12 @@ export interface MarketStatus {
    */
   busy?: boolean
   /**
+   * Ids of currently running agents, sampled from the same guard that refuses
+   * mutations while agents run. The client's install queue drains when this
+   * is empty and the operation lock is free; absent means idle.
+   */
+  runningAgents?: string[]
+  /**
    * The process supervisor the host detected around itself (systemd, pm2),
    * or null/absent when none. Present so the UI can explain WHY the restart
    * button is missing instead of just omitting it (#229).
@@ -201,16 +278,93 @@ export interface MarketStatus {
    * `restart` so `allowRestart` settings are not conflated with debug state.
    */
   debugger?: string | null
+  /**
+   * Whether a restart asked for from THIS page could pass the host's fence
+   * (#782). False behind a reverse proxy: the restart request is refused there
+   * every time, so the banner explains instead of offering a button that cannot
+   * work. Absent from an older host, which reads as "reachable" — the old
+   * behaviour, never a button taken away on a guess.
+   */
+  restartReachable?: boolean
+  /**
+   * Whether this profile offers a market restart route at all. Absent from an
+   * older host, which reads as "no button": the banner explains instead.
+   */
+  restart?: boolean
+}
+
+/**
+ * Which explanation the restart banner carries when it has one (#229, #447,
+ * #782). Order matters and is the point: a debugger is the strongest reason (the
+ * host will not stop at all), then a proxy (the request itself cannot pass),
+ * then a supervisor (restart is someone else's job), else the plain how-to.
+ *
+ * A pure function so the order is pinned by a test and not by the shape of a JSX
+ * ternary — the three earlier states each added a branch to that ternary, and
+ * the position of a new one is exactly what is easy to get wrong.
+ */
+export type RestartHintKey = 'restartHintDebugged' | 'restartHintViaProxy' | 'restartHintSupervised' | 'restartHint'
+export function restartHintKey(state: {
+  debuggerLatch: string | null
+  restartReachable: boolean
+  supervisor: string | null
+}): RestartHintKey {
+  if (state.debuggerLatch !== null) return 'restartHintDebugged'
+  if (!state.restartReachable) return 'restartHintViaProxy'
+  if (state.supervisor !== null) return 'restartHintSupervised'
+  return 'restartHint'
 }
 
 /** Post-install activation state (P0-2), per installed package. */
-export type ActivationState = 'live' | 'restart' | 'inert' | 'broken' | 'missing' | 'disabled'
+export type ActivationState = 'live' | 'restart' | 'incompatible' | 'inert' | 'broken' | 'missing' | 'disabled'
 
 export interface ActivationInfo {
   state: ActivationState
   reasons: string[]
   bundle: boolean
   hot: boolean
+  /** Set when this package is a library another installed plugin pulled in (#634). */
+  dependencyOf?: string
+  /** Loaded by the user's own setup, which the market cannot see (#813). */
+  loadedByProfile?: true
+  /** Explicit dsh.kind library, without a plugin surface. */
+  library?: true
+}
+
+/**
+ * The install command shown on a plugin's card, corrected for THIS profile
+ * (#872).
+ *
+ * awesome-dsh-plugin generates the string once, for the catalog — always
+ * `dsh plugin --profile web add <spec>` — which is right on a `web` profile
+ * and wrong on every other one. On a desktop profile it is more than wrong:
+ * the DSH CLI refuses a profile by that name, so the command as printed
+ * cannot install anything there at all. Two outcomes, and the caller renders
+ * them differently because the user's next step differs:
+ *
+ * - `command`: the text to show and copy, with the profile it names corrected;
+ * - `unusable`: show no command at all (the market's own button is the way),
+ *   because handing over a command that cannot work is worse than handing
+ *   over none.
+ *
+ * A command with no `--profile` token is passed through untouched: it is not
+ * this function's business to add one.
+ */
+export function installCommandFor(
+  command: unknown,
+  profile: string | null | undefined,
+): { command: string | null; unusable: boolean } {
+  if (typeof command !== 'string' || command.trim() === '') return { command: null, unusable: false }
+  const named = /--profile(?:=|\s+)(\S+)/u.exec(command)
+  if (named === null) return { command, unusable: false }
+  const wanted = typeof profile === 'string' ? profile.trim() : ''
+  if (wanted === '') return { command, unusable: false }
+  // The CLI refuses the desktop profile by name — inside the running app it
+  // can never be used, whatever the install layout is (src/index.ts states
+  // the same rule where it chooses the plugin manager).
+  if (wanted.toLowerCase() === 'desktop') return { command: null, unusable: true }
+  if (named[1] === wanted) return { command, unusable: false }
+  return { command: command.replace(named[0], `--profile ${wanted}`), unusable: false }
 }
 
 /** The /dsh-market/installed payload (fields the market UI consumes). */
@@ -289,15 +443,21 @@ export function readSession(key: string): any {
 
 /** Heuristic: plugins that target a terminal surface rather than the web UI. */
 export function looksTerminal(plugin: RegistryPlugin, lang: string): boolean {
+  // The package NAME is a claim about the package itself: `dsh-tui` is a
+  // terminal surface. Descriptions are not — they mention the terminal for
+  // many reasons, including a companion CLI that ships from the same
+  // repository (#931). A bare "CLI"/"terminal" mention in prose used to be
+  // enough to warn that a web plugin "may not work in the web app", and a
+  // warning that fires on ordinary plugins is one users learn to ignore.
+  if (/\b(tui|cli|tty|terminal)\b|终端|命令行/i.test(plugin.name)) return true
   const desc = (plugin.description && (plugin.description[lang] || plugin.description.en)) || ''
-  // A description can mention a CLI only to say it is NOT required. Treating
-  // that as positive evidence labels web plugins as terminal-only. Strip
-  // bounded negated clauses before applying the deliberately broad heuristic;
-  // the package name remains untouched and therefore stays strong evidence.
+  // A description can also mention a CLI only to say it is NOT required
+  // (#237). Strip bounded negated clauses first.
   const positiveDesc = desc
     .replace(/\b(?:no|without)\b[^.!?;:，。！？；\n]{0,80}\b(?:tui|cli|tty|terminal)\b/gi, '')
     .replace(/(?:无需|无须|不需要|不用)[^。！？；\n]{0,48}(?:tui|cli|tty|terminal|终端|命令行)/gi, '')
-  return /\b(tui|cli|tty|terminal)\b|终端|命令行/i.test(plugin.name + ' ' + positiveDesc)
+  // Only phrases that assert THIS plugin's own surface count.
+  return /\b(?:terminal|cli)[ -]only\b|\btui (?:app|plugin|client)\b|\bterminal (?:ui|app|plugin|client)\b|\bcommand[- ]line (?:tool|interface|app|client|plugin)\b|命令行(?:工具|插件|应用|界面|客户端)|终端(?:工具|插件|应用|界面|客户端)|只在终端|仅在终端|需要(?:一个)?终端|在终端(?:里|中)运行/i.test(positiveDesc)
 }
 
 /** Sortable field for the Discover list. */
@@ -398,8 +558,13 @@ function cachedPluginSearchText(plugin: RegistryPlugin, value: string): string {
 }
 
 /**
- * Relevance within one field. Exact and prefix matches beat phrase matches;
- * for a multi-word query every word must occur in the same field.
+ * Relevance within one field. Exact matches beat phrase matches, which beat
+ * words scattered through the field; for a multi-word query every word must
+ * occur in the same field. A prefix match is NOT ranked above a phrase match
+ * anywhere else in the field: most catalog names start with `dsh-`, so that
+ * distinction mostly punished the naming convention and overrode the sort
+ * the user picked (#815: `computer-use-vision` with 355 downloads above
+ * `dsh-computer-use` with 3.6k, under "downloads").
  */
 function fieldRelevance(
   plugin: RegistryPlugin,
@@ -412,7 +577,6 @@ function fieldRelevance(
   const text = cachedPluginSearchText(plugin, value)
   if (text === '' || !tokens.every(token => text.includes(token))) return 0
   if (text === query) return weight + 300
-  if (text.startsWith(query)) return weight + 250
   if (text.includes(query)) return weight + 200
   return weight + 150
 }
@@ -691,10 +855,20 @@ function entryRepoIds(plugin: RegistryPlugin): Set<string> {
  * dependency's spec pins a github repo AND the entry states one, the repos
  * decide — the loose name/npm identities only apply when at least one side
  * carries no repo evidence (npm installs, non-github entries).
+ *
+ * Repo evidence only ever decides by repository ROOT. A monorepo catalog
+ * entry states `owner/repo#path:/pkg` while an npm-installed manifest
+ * usually states the bare `owner/repo` (it rarely declares
+ * `repository.directory`), and reading that asymmetry as a source conflict
+ * kept a genuinely installed subpackage from ever reading as installed.
  */
+/** Repository root: the part before any `#path:/…` subpath selection. */
+function repoRoots(ids: ReadonlySet<string>): Set<string> {
+  return new Set([...ids].map(id => id.split('#path:/')[0]!))
+}
 function sameSourceConflict(plugin: RegistryPlugin, spec: string, repoIdentities: readonly string[] = []): boolean {
-  const entry = entryRepoIds(plugin)
-  const dep = depRepoIds(spec, repoIdentities)
+  const entry = repoRoots(entryRepoIds(plugin))
+  const dep = repoRoots(depRepoIds(spec, repoIdentities))
   if (entry.size === 0 || dep.size === 0) return false
   for (const id of dep) if (entry.has(id)) return false
   return true
@@ -960,24 +1134,91 @@ export interface ScreenshotMeasurement {
   height: number
 }
 
-/** Return one safe screenshot URL without applying the public list limit. */
-function safeScreenshot(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  let parsed: URL
-  try { parsed = new URL(value) } catch { return null }
-  if (parsed.protocol !== 'https:' || !SCREENSHOT_HOSTS.has(parsed.hostname)) return null
-  if (/\.svg$/iu.test(parsed.pathname)) return null
-  return value
+/** One refused candidate and the reason the image gate refused it. */
+export interface ScreenshotRejection {
+  value: unknown
+  reason: string
 }
 
-/** Keep only https URLs on allowlisted image hosts; SVG dropped (logos/badges). */
-export function safeScreenshots(urls: unknown): string[] {
+/** The single acceptance rule: the URL to load, or the sentence explaining the refusal. */
+type ScreenshotGate = { ok: true; src: string } | { ok: false; reason: string }
+
+function gateScreenshot(value: unknown): ScreenshotGate {
+  if (typeof value !== 'string') return { ok: false, reason: 'not a string' }
+  let parsed: URL
+  try { parsed = new URL(value) } catch { return { ok: false, reason: 'not a parseable URL' } }
+  if (parsed.protocol !== 'https:') return { ok: false, reason: 'not https' }
+  if (!SCREENSHOT_HOSTS.has(parsed.hostname)) return { ok: false, reason: `host not allowlisted (${parsed.hostname})` }
+  if (/\.svg$/iu.test(parsed.pathname)) return { ok: false, reason: 'svg is not rendered' }
+  return { ok: true, src: value }
+}
+
+/** Return one safe screenshot URL without applying the public list limit. */
+function safeScreenshot(value: unknown): string | null {
+  const gate = gateScreenshot(value)
+  return gate.ok ? gate.src : null
+}
+
+/**
+ * A catalog-declared storefront tile. Same https/GitHub-only gate as
+ * screenshots (an icon URL is still a request carrying the user's IP) and
+ * raster-only, because an SVG tile is a document, not an image.
+ */
+export function safeIcon(value: unknown): string | null {
+  return safeScreenshot(value)
+}
+
+/**
+ * Prepare a GitHub release body for the update-notes dialog's tiny markdown
+ * renderer. HTML — especially pasted `<img>` tags — must not surface as
+ * literal text; markdown syntax is left intact for the dialog to render.
+ */
+export function sanitizeReleaseNotesBody(md: string): string {
+  let s = md.replace(/<!--[\s\S]*?-->/g, '')
+  s = s.replace(/<img\b[^>]*>/gi, '')
+  // Drop remaining tags, keep inner text (`<a href=…>label</a>` → `label`).
+  s = s.replace(/<\/?[a-zA-Z][\w:-]*\b[^>]*>/g, '')
+  s = s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n')
+  return s.trim()
+}
+
+/**
+ * A whole-line markdown image with an allowlisted https URL, or null.
+ * Relative paths and non-GitHub hosts stay out of the dialog (same gate as
+ * install screenshots).
+ */
+export function releaseNotesHttpsImage(line: string): { alt: string; src: string } | null {
+  const match = /^!\[([^\]]*)\]\(\s*(?:<(https:\/\/[^>]+)>|(https:\/\/[^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)$/u
+    .exec(line.trim())
+  if (match === null) return null
+  const src = safeScreenshot(match[2] ?? match[3] ?? '')
+  if (src === null) return null
+  return { alt: match[1] ?? '', src }
+}
+
+/**
+ * Keep only https URLs on allowlisted image hosts; SVG dropped (logos/badges).
+ *
+ * `onReject` is opt-in, because whether a refusal deserves a word depends on
+ * where the list came from: a README contributes mostly badges, logos and
+ * third-party hosts, where refusing IS the intended outcome. A curated
+ * catalog list is different — every URL in it is declared intent — so
+ * `pluginScreenshotCandidates` is the caller that reports (see there).
+ */
+export function safeScreenshots(
+  urls: unknown,
+  options: { onReject?: (rejection: ScreenshotRejection) => void } = {},
+): string[] {
   if (!Array.isArray(urls)) return []
+  const { onReject } = options
   const safe: string[] = []
   for (const value of urls) {
-    const src = safeScreenshot(value)
-    if (src === null) continue
-    if (!safe.includes(src)) safe.push(src)
+    const gate = gateScreenshot(value)
+    if (!gate.ok) {
+      onReject?.({ value, reason: gate.reason })
+      continue
+    }
+    if (!safe.includes(gate.src)) safe.push(gate.src)
     if (safe.length >= MAX_SCREENSHOTS) break
   }
   return safe
@@ -1159,9 +1400,35 @@ export function rankThemeScreenshots(
 
 const readmeShotsCache = new Map<string, Promise<ScreenshotCandidate[]>>()
 
-/** Clear README-derived media at the boundary of an accepted catalog generation. */
+/**
+ * Declared screenshots the market refuses, reported once per catalog entry.
+ *
+ * A curated entry is the publisher's declaration, and the registry gate that
+ * accepts it (`scripts/validate-registry.mjs`, E12) allows any https URL on
+ * the four GitHub hosts, while this client additionally refuses `.svg`. An
+ * entry can therefore pass CI with a screenshot the market then drops, and
+ * until this existed nothing said so: the card rendered fewer previews, or —
+ * when every declared shot was refused — the client quietly fell back to
+ * scraping the README. Keyed by entry plus the refused values, so a re-render,
+ * a dialog and a theme card report one line between them, and cleared with the
+ * README cache at each accepted catalog generation.
+ */
+const refusedCuratedScreenshots = new Set<string>()
+
+function warnRefusedCuratedScreenshots(plugin: RegistryPlugin, rejections: ScreenshotRejection[]): void {
+  const details = [...new Set(rejections.map(({ value, reason }) => `${reason}: ${String(value)}`))]
+  const key = `${plugin.url}\n${details.join('\n')}`
+  if (refusedCuratedScreenshots.has(key)) return
+  refusedCuratedScreenshots.add(key)
+  console.warn(
+    `[dsh-market] catalog entry "${plugin.name}" declares ${details.length} screenshot(s) the market will not load — ${details.join('; ')}`,
+  )
+}
+
+/** Clear README-derived media and refusal reporting at the boundary of an accepted catalog generation. */
 export function resetScreenshotsCache(): void {
   readmeShotsCache.clear()
+  refusedCuratedScreenshots.clear()
 }
 
 /**
@@ -1169,7 +1436,9 @@ export function resetScreenshotsCache(): void {
  * present, otherwise lazily extracted and semantically ranked from README.
  */
 export function pluginScreenshotCandidates(plugin: RegistryPlugin): Promise<ScreenshotCandidate[]> {
-  const curated = safeScreenshots(plugin.screenshots)
+  const refused: ScreenshotRejection[] = []
+  const curated = safeScreenshots(plugin.screenshots, { onReject: rejection => { refused.push(rejection) } })
+  if (refused.length > 0) warnRefusedCuratedScreenshots(plugin, refused)
   if (curated.length > 0) {
     return Promise.resolve(curated.map((src, order) => ({ src, order, semanticScore: 1_000 - order, curated: true })))
   }
@@ -1256,6 +1525,95 @@ export function humanOutput(raw: string): string {
 }
 
 /**
+ * One failed operation's sentence for the user: the market's own when the
+ * route sent one, otherwise the tail of pnpm's own output.
+ *
+ * The tail is for the stack, not for our sentences (#848). A route's message
+ * is one bilingual sentence — Chinese first, then English — so keeping the
+ * last 600 characters of it kept the English and threw the Chinese away, which
+ * is the half a Chinese reader needs, and it cut the classifier's
+ * `unused-patch` sentence through the middle of its actionable clause. Every
+ * route sentence is bounded by construction; pnpm's output is not.
+ */
+export function failureText(
+  body: { error?: unknown; stderr?: unknown; stdout?: unknown; exitCode?: unknown },
+  options: { tail?: number; fallback?: string } = {},
+): string {
+  const { tail = 600, fallback = '' } = options
+  const field = (value: unknown): string => typeof value === 'string'
+    ? value
+    : value && typeof (value as { text?: unknown }).text === 'string'
+      ? (value as { text: string }).text
+      : value == null ? '' : JSON.stringify(value)
+  const own = field(body.error)
+  if (own !== '') return own
+  const machine = humanOutput([field(body.stderr), field(body.stdout)].filter(Boolean).join('\n'))
+  if (machine !== '') return machine.slice(-tail)
+  const exit = field(body.exitCode)
+  return exit === '' ? fallback : `exit ${exit}`
+}
+
+/** CJK ideographs — enough to tell a Chinese half from a Latin one. */
+const CJK_RE = /[\u3400-\u9FFF\uF900-\uFAFF]/gu
+
+/** Count CJK code points in a string. */
+function cjkCount(text: string): number {
+  return text.match(CJK_RE)?.length ?? 0
+}
+
+/**
+ * Pick one language from a `中文 / English` (or reverse) pair. Ambiguous
+ * strings stay unchanged. Callers that prepend `t(…)` must localize the
+ * server half first, then concatenate — this function does not strip UI chrome.
+ */
+function pickBilingualPair(text: string, lang: 'zh' | 'en'): string {
+  const sep = ' / '
+  const parts = text.split(sep)
+  if (parts.length < 2) return text
+
+  // Prefer the split with the largest CJK contrast when the text has more
+  // than one ` / ` (English prose can contain the same separator).
+  let bestLeft = parts[0]
+  let bestRight = parts.slice(1).join(sep)
+  let bestScore = Math.abs(cjkCount(bestLeft) - cjkCount(bestRight))
+  for (let i = 1; i < parts.length - 1; i++) {
+    const left = parts.slice(0, i + 1).join(sep)
+    const right = parts.slice(i + 1).join(sep)
+    const score = Math.abs(cjkCount(left) - cjkCount(right))
+    if (score > bestScore) {
+      bestScore = score
+      bestLeft = left
+      bestRight = right
+    }
+  }
+  if (bestScore === 0) return text
+  const zhPart = cjkCount(bestLeft) > cjkCount(bestRight) ? bestLeft : bestRight
+  const enPart = cjkCount(bestLeft) > cjkCount(bestRight) ? bestRight : bestLeft
+  return lang === 'zh' ? zhPart : enPart
+}
+
+/**
+ * Pick the locale half of a server bilingual string (`中文 / English` or
+ * `English / 中文`). Multiline input is handled line by line. Ambiguous
+ * strings are returned unchanged.
+ */
+export function localizeBilingual(text: string, lang: 'zh' | 'en'): string {
+  if (text.includes('\n')) {
+    return text.split('\n').map(line => localizeBilingual(line, lang)).join('\n')
+  }
+  return pickBilingualPair(text, lang)
+}
+
+/**
+ * Localize each bilingual reason and join for display. Reasons are separate
+ * diagnoses; do not rejoin them with ` / `, which is the bilingual separator.
+ */
+export function localizeBilingualList(parts: string[], lang: 'zh' | 'en'): string {
+  const sep = lang === 'zh' ? '；' : '; '
+  return parts.map(part => localizeBilingual(part, lang)).filter(part => part !== '').join(sep)
+}
+
+/**
  * The plugin's own name, for display.
  *
  * The catalog's `name` is an IDENTITY, and for the 104 entries that live in
@@ -1274,19 +1632,48 @@ export function humanOutput(raw: string): string {
  *
  * The repository name IS the plugin name in the ordinary case, because a
  * repository holding one plugin is named after it. Only the compound form
- * needs unpicking, and its last segment is the plugin's own directory.
+ * needs unpicking. Prefer its mapped npm package when available: a generic
+ * directory such as `plugin` is not the product name. Without that mapping,
+ * keep the directory-leaf fallback for source-only entries.
  *
  * Not a substitute for the identity: every key, lookup and install still
  * uses `name` unchanged.
  */
-export function pluginName(name: string): string {
+export function pluginName(name: string, npm?: string | null): string {
   const hash = name.indexOf('#')
   if (hash === -1) return name
+  if (typeof npm === 'string' && npm.trim() !== '') return npm.trim()
   const sub = name.slice(hash + 1)
   const leaf = sub.slice(sub.lastIndexOf('/') + 1)
   // A sub-path that is empty or trailing-slashed tells us nothing; the
   // repository half is a better answer than an empty title.
   return leaf === '' ? name.slice(0, hash) : leaf
+}
+
+/**
+ * The catalog package name used for the local block list (#657).
+ *
+ * Prefer the npm package when the catalog carries one. Fall back to the
+ * repository name for entries that have not published one yet.
+ */
+export function blockPackageName(plugin: Pick<RegistryPlugin, 'name' | 'npm'>): string {
+  return typeof plugin.npm === 'string' && plugin.npm !== '' ? plugin.npm : plugin.name
+}
+
+/**
+ * Names that count as one blocked plugin (#657).
+ *
+ * A linked checkout can be installed under a package name the catalog does
+ * not use. The installed name comes first so a new block is stored as the
+ * name Update all already filters on; the catalog name stays in the list so
+ * a block made from either side still matches the other.
+ */
+export function blockAliases(plugin: Pick<RegistryPlugin, 'name' | 'npm'>, installedName?: string | null): string[] {
+  const catalogName = blockPackageName(plugin)
+  if (typeof installedName === 'string' && installedName !== '' && installedName !== catalogName) {
+    return [installedName, catalogName]
+  }
+  return [catalogName]
 }
 
 /**

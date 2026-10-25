@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   classifyPeer,
+  crossesImplicitCeiling,
   introducedDuplicateNames,
   introducedRisks,
   type CompatibilityAssessment,
@@ -60,6 +61,29 @@ describe('classifyPeer', () => {
   it('returns none for unparseable ranges and missing resolutions', () => {
     expect(classifyPeer('p', 'x', 'workspace:*', '1.0.0', false)).toMatchObject({ kind: 'none' })
     expect(classifyPeer('p', 'x', '^1.0.0', null, false)).toMatchObject({ kind: 'none' })
+  })
+})
+
+describe('crossesImplicitCeiling', () => {
+  it('separates a host past the declared line from one merely outside the prerelease tuple', () => {
+    // Past the line: ^0.1.x judged by a 0.2 host is the release-line break.
+    expect(crossesImplicitCeiling('0.2.0-rc.2', '^0.1.1-rc.2')).toBe(true)
+    expect(crossesImplicitCeiling('0.2.0-rc.1', '^0.1.0-rc.7')).toBe(true)
+    expect(crossesImplicitCeiling('0.2.0-rc.2', '~0.1.7')).toBe(true)
+    // Still on the declared line — the leftover failure is the prerelease gate.
+    expect(crossesImplicitCeiling('0.1.2-alpha.2', '^0.1.1-rc.2')).toBe(false)
+    expect(crossesImplicitCeiling('0.1.9', '^0.1.1-rc.2')).toBe(false)
+  })
+
+  it('excludes sloppy ceilings, explicit bounds and exact pins', () => {
+    // ^0.0.x names no minor line to fall behind, and has always been noise.
+    expect(crossesImplicitCeiling('0.1.2-alpha.2', '^0.0.1')).toBe(false)
+    // An explicit upper bound is already a risk, not a leniency question.
+    expect(crossesImplicitCeiling('0.2.0', '>=0.1.0-rc.7 <0.2.0')).toBe(false)
+    expect(crossesImplicitCeiling('0.1.0-rc.7', '0.1.0-rc.6')).toBe(false)
+    // Open-ended and unparseable ranges declare no ceiling at all.
+    expect(crossesImplicitCeiling('0.2.0-rc.2', '>=0.1.1-rc.2')).toBe(false)
+    expect(crossesImplicitCeiling('0.2.0-rc.2', 'workspace:*')).toBe(false)
   })
 })
 

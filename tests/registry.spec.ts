@@ -17,23 +17,32 @@ import { describeFetchFailure, forgetCatalog, loadRegistry } from '../src/regist
 import { configuredProxy, marketFetch } from '../src/net.ts'
 
 /**
- * undici stands in for the real outbound path. `marketFetch` routes through
- * EnvHttpProxyAgent only when a proxy is configured, and the assertion that
- * matters is exactly which proxy URLs the agent was built with —
- * npm_config_* is invisible to EnvHttpProxyAgent, so the explicit handoff
- * is what makes the npm fallback real instead of a name the failure message
- * claims was tried.
+ * undici stands in for the real outbound path. Every `marketFetch` goes
+ * through it with an explicit dispatcher (#742): `EnvHttpProxyAgent` when a
+ * proxy is configured, a plain `Agent` otherwise. The assertion that matters
+ * for a proxy is exactly which URLs the agent was built with — npm_config_*
+ * is invisible to EnvHttpProxyAgent, so the explicit handoff is what makes
+ * the npm fallback real instead of a name the failure message claims was
+ * tried. `fetch` forwards to the global stub when one is installed, so the
+ * catalog script below still observes the request.
  */
 const undici = vi.hoisted(() => ({
-  fetch: vi.fn(async () => new Response('ok', { status: 200 })),
+  fetch: vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (vi.isMockFunction(globalThis.fetch)) return globalThis.fetch(input, init)
+    return new Response('ok', { status: 200 })
+  }),
   EnvHttpProxyAgent: vi.fn(function (this: unknown, opts?: unknown) {
     return { opts }
+  }),
+  Agent: vi.fn(function (this: unknown) {
+    return { direct: true }
   }),
 }))
 
 vi.mock('undici', () => ({
   fetch: undici.fetch,
   EnvHttpProxyAgent: undici.EnvHttpProxyAgent,
+  Agent: undici.Agent,
 }))
 
 const CATALOG = {
@@ -98,6 +107,21 @@ const ok = (body: unknown): Response =>
   new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
 
 describe('loadRegistry', () => {
+  it('passes through source download dates without inventing them for legacy entries', async () => {
+    const stats = { downloads: 42, downloadsStart: '2026-08-25', downloadsEnd: '2026-09-23', downloadsCheckedAt: '2026-09-24' }
+    scriptedFetch(ok({
+      ...CATALOG,
+      count: 2,
+      plugins: [{ ...CATALOG.plugins[0], ...stats }, { ...CATALOG.plugins[0], name: 'legacy', downloads: 0 }],
+    }))
+    const registry = await loadRegistry()
+    expect(registry.plugins[0]).toMatchObject(stats)
+    expect(registry.plugins[1]).not.toHaveProperty('downloadsStart')
+    expect(registry.plugins[1]).not.toHaveProperty('downloadsEnd')
+    expect(registry.plugins[1]).not.toHaveProperty('downloadsCheckedAt')
+    expect(registry.plugins[1]?.downloads).toBe(0)
+  })
+
   it('goes to the network every single time it is asked', async () => {
     // The one-hour cache is gone deliberately. The catalog grows by roughly
     // 250 entries a day, so an hour-old listing answers "does this plugin
@@ -135,10 +159,13 @@ describe('loadRegistry', () => {
     expect(stub).toHaveBeenCalledTimes(2)
   })
 
-  it('gives up after the second attempt rather than hammering', async () => {
+  it('gives up after the second attempt at each source rather than hammering', async () => {
+    // Two sources in the global region's list, two attempts each (#891's
+    // package rides the region's own registry, so the region whose own
+    // sources work never reaches it — but a dead network reaches it twice).
     const stub = scriptedFetch(new Error('fetch failed'))
     await expect(loadRegistry()).rejects.toThrow(/fetch failed/)
-    expect(stub).toHaveBeenCalledTimes(2)
+    expect(stub).toHaveBeenCalledTimes(4)
   })
 
   it('reports a failure instead of answering with an empty catalog', async () => {
@@ -176,7 +203,7 @@ describe('loadRegistry', () => {
     // operation was aborted due to timeout" on its own — the exact text a
     // reporter sent us — cannot tell a slow link from a blocked one.
     scriptedFetch(new Error('The operation was aborted due to timeout'))
-    await expect(loadRegistry()).rejects.toThrow(/aborted due to timeout.*\ds, 2 attempts/s)
+    await expect(loadRegistry()).rejects.toThrow(/aborted due to timeout.*\ds, 4 attempts/s)
   })
 })
 
@@ -224,6 +251,55 @@ describe('loadRegistry download regions', () => {
   it('reports every attempt it made when the whole list fails', async () => {
     byUrl([[/./, new Error('fetch failed')]])
     await expect(loadRegistry('china')).rejects.toThrow(/4 attempts/)
+  })
+
+  it('stops at its own region when that region answers (#891)', async () => {
+    // The cross-region list is a fallback, not a second opinion: a network
+    // where the official domain works must not also fetch a mirror.
+    const stub = byUrl([[/awesome-dsh-plugin\.com/, ok(CATALOG)]])
+    await loadRegistry('global')
+    expect(stub).toHaveBeenCalledTimes(1)
+  })
+
+  it('reads on past its own region when every one of its sources is dead (#891)', async () => {
+    // The probe that picks a region measures the npm REGISTRY, and the
+    // catalog hangs off a second, independently blockable host. So "npm fast,
+    // GitHub Pages blocked" — the exact shape the mainland route exists for —
+    // measures `global`, whose only source is that host; and because the
+    // region is decided once and persisted, nothing ever reconsiders. The
+    // catalog's published package is the route that still works.
+    const stub = byUrl([[/./, new Error('fetch failed')]])
+    await expect(loadRegistry('global')).rejects.toThrow(/4 attempts/)
+    const asked = stub.mock.calls.map(call => String(call[0]))
+    // The origin twice (global's only own source), then the catalog's
+    // published package on the registry the probe measured, twice — and the
+    // failure message names it, so the route actually tried is the one a
+    // report will show.
+    expect(asked[0]).toContain('awesome-dsh-plugin.com')
+    expect(asked[2]).toContain('registry.npmjs.org')
+    expect(asked[2]).toContain('dsh-plugin-catalog')
+  })
+
+  it('keeps the primary source\'s own reason instead of the fallback\'s (#750)', async () => {
+    // The report: the primary was failing for a reason worth acting on (DNS,
+    // refusal, 404) while the fallback timed out, and the message named only
+    // the timeout — the one failure the user cannot act on, from a mirror they
+    // never chose. Which source said what IS the diagnosis, so every failed
+    // source has to appear in it.
+    byUrl([
+      [/mirrors\.cloud\.tencent\.com/, new Error('getaddrinfo ENOTFOUND mirrors.cloud.tencent.com')],
+      [/awesome-dsh-plugin\.com/, new Error('no new data for 15s while downloading the catalog (received 4096 bytes)')],
+    ])
+    const message = await loadRegistry('china').then(
+      () => { throw new Error('expected the whole list to fail') },
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    )
+    // The last failure keeps the leading slot (that is what the client shows),
+    // and the primary's reason is in there too, not discarded.
+    expect(message).toContain('no new data for 15s while downloading the catalog')
+    expect(message).toContain('earlier:')
+    expect(message).toContain('getaddrinfo ENOTFOUND mirrors.cloud.tencent.com')
+    expect(message.indexOf('earlier:')).toBeLessThan(message.indexOf('getaddrinfo ENOTFOUND'))
   })
 
   it('never sends one origin the validator another one issued', async () => {
@@ -464,6 +540,7 @@ describe('marketFetch', () => {
   beforeEach(() => {
     undici.fetch.mockClear()
     undici.EnvHttpProxyAgent.mockClear()
+    undici.Agent.mockClear()
   })
 
   it('hands npm-config proxies to the agent explicitly — EnvHttpProxyAgent cannot see them', async () => {
@@ -482,9 +559,150 @@ describe('marketFetch', () => {
     )
   })
 
-  it('stays on the global fetch when there is no proxy anywhere', async () => {
+  it('uses its own dispatcher when no proxy is configured (#742)', async () => {
+    // Node 22's global fetch shares a dispatcher symbol with undici 8. After
+    // the host's first web_fetch import, that symbol points at a wrapper the
+    // builtin fetch cannot decompress, so a direct catalog read comes back
+    // as gzip. Carrying an Agent this module created is what keeps the body
+    // decoded; calling global fetch, or undici's fetch with no dispatcher,
+    // both fail. The agent is reused, so a second call does not build another.
     vi.stubGlobal('fetch', vi.fn(async () => new Response('ok', { status: 200 })))
     await marketFetch('https://catalog.example/plugins.json')
-    expect(undici.fetch).not.toHaveBeenCalled()
+    await marketFetch('https://catalog.example/plugins.json')
+    expect(undici.EnvHttpProxyAgent).not.toHaveBeenCalled()
+    const calls = undici.fetch.mock.calls
+    expect(calls).toHaveLength(2)
+    const first = calls[0]?.[1] as { dispatcher?: unknown } | undefined
+    const second = calls[1]?.[1] as { dispatcher?: unknown } | undefined
+    expect(first?.dispatcher).toEqual({ direct: true })
+    expect(second?.dispatcher).toBe(first?.dispatcher)
+  })
+})
+
+describe('loadRegistry body deadlines (the catalog outgrew a total one)', () => {
+  // The catalog is not the 295 KB file the 15s budget was sized for any
+  // more: it passed 5 MB in September 2026, and on an ordinary slow but
+  // healthy path (measured ~60 KB/s against 1.22 MB gzipped) the first
+  // fetch needs on the order of 90s. A total deadline of 15s, tried twice,
+  // makes that first fetch impossible — the market never opens (#188,
+  // #750 both measured the same wall from their regions). The two guards
+  // below pin the split that fixes it: the server must START answering
+  // fast, and after that only silence — not duration — ends the read.
+  //
+  // Fake timers drive both the chunk schedule and the watchdogs, so no
+  // test here waits real seconds. The real-time counterpart of this
+  // evidence lives in the linked issue: 15s total budget aborts a flowing
+  // body at 15005ms; the same link finishes in 89.9s when allowed to.
+
+  /** A body whose pieces arrive at scripted moments of fake time. */
+  const jsonStream = (schedule: Array<{ at: number, piece: string }>): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const { at, piece } of schedule) {
+          setTimeout(() => {
+            // A reader that gave up cancels the stream; pieces still on the
+            // script have nowhere to go and are dropped, not thrown.
+            try { controller.enqueue(new TextEncoder().encode(piece)) } catch { /* reader is gone */ }
+          }, at)
+        }
+        const last = schedule[schedule.length - 1]?.at ?? 0
+        setTimeout(() => {
+          try { controller.close() } catch { /* cancelled already */ }
+        }, last + 1)
+      },
+    })
+
+  /** A body that says one thing and then never speaks again. */
+  const stalledStream = (): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"plugins":')) },
+    })
+
+  const streamingOk = (body: ReadableStream<Uint8Array>): Response =>
+    new Response(body, { status: 200, headers: { 'content-type': 'application/json' } })
+
+  it('keeps reading a slow body that never stalls, past the old 15s total budget', async () => {
+    vi.useFakeTimers()
+    try {
+      const full = JSON.stringify(CATALOG)
+      const piece = Math.ceil(full.length / 20)
+      const schedule = Array.from({ length: 20 }, (_, i) => ({
+        at: i * 1_000,
+        piece: full.slice(i * piece, (i + 1) * piece),
+      }))
+      scriptedFetch(streamingOk(jsonStream(schedule)))
+      const pending = loadRegistry()
+      // Chunks land at t=0..19s and the body closes at t=20s: still
+      // arriving at t=15s, where the old total budget used to cut it off.
+      await vi.advanceTimersByTimeAsync(25_000)
+      const registry = await pending
+      expect(registry.plugins).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 10_000)
+
+  it('ends a body that goes silent and says so, on every attempt', async () => {
+    vi.useFakeTimers()
+    try {
+      // The origin's two attempts carry the stalled body; the catalog
+      // package's two fail on the metadata request that comes before any
+      // body, which is a different watchdog's business (#891).
+      scriptedFetch(streamingOk(stalledStream()), streamingOk(stalledStream()),
+        new Error('fetch failed'), new Error('fetch failed'))
+      // Handler first: the rejection lands while the clock is being advanced,
+      // and a promise that rejects before anyone is listening takes the whole
+      // run down as an unhandled rejection even though the test then passes.
+      const rejection = expect(loadRegistry()).rejects.toThrow(/no new data for 15s while downloading the catalog/)
+      // One chunk at t=0, then nothing. Silence — not slowness — is what
+      // the body deadline is for, and both attempts must end in it.
+      await vi.advanceTimersByTimeAsync(33_000)
+      await rejection
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 8_000)
+
+  it('refuses a body larger than any catalog instead of buffering it all', async () => {
+    // 256 MB is the cap the source ships with (MAX_CATALOG_BODY_BYTES).
+    // Both places say the number out loud, so resizing one shows the other
+    // in review. Before the cap, a firehose mirror was buffered whole,
+    // decoded, and died in JSON.parse behind a message about parsing.
+    const flood = new Uint8Array(256 * 1024 * 1024 + 1024)
+    const firehose = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(flood); controller.close() },
+    })
+    scriptedFetch(streamingOk(firehose))
+    await expect(loadRegistry()).rejects.toThrow(/the catalog response grew past 256 MB/)
+  }, 20_000)
+
+  it('ends a body that trickles forever at a 10-minute ceiling, not the stall watchdog', async () => {
+    vi.useFakeTimers()
+    try {
+      // One byte inside every 15s stall window keeps the watchdog quiet
+      // forever; without a total ceiling neither this read nor this test
+      // would end. Each attempt gets its own trickle, built the moment
+      // that attempt starts, so every one is cut by the ceiling at its
+      // own 10-minute mark — a scripted replay of one shared body would
+      // instead hand the later attempts a fully buffered, parseable copy.
+      // The last two bytes land after the ceiling fires; the point is
+      // that progress alone cannot save it.
+      const schedule = Array.from({ length: 45 }, (_, i) => ({ at: i * 14_000, piece: 'a' }))
+      vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(streamingOk(jsonStream(schedule)))))
+      const rejection = expect(loadRegistry()).rejects.toThrow(/did not finish within 600s \(received 43 bytes\)/)
+      // Advancing far past the last ceiling is free on fake time and
+      // covers however many attempts the retry loop makes.
+      await vi.advanceTimersByTimeAsync(5_000_000)
+      await rejection
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 8_000)
+
+  it('says the response carried no body instead of failing to parse one', async () => {
+    scriptedFetch(new Response(null, { status: 200, headers: { 'content-type': 'application/json' } }))
+    // Before the guard an empty body surfaced as "Unexpected end of JSON
+    // input" — a parse error that told the user nothing about the network.
+    await expect(loadRegistry()).rejects.toThrow(/the catalog response carried no body/)
   })
 })

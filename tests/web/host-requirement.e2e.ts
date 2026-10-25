@@ -42,7 +42,7 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the host-version pre-check (#404)
   afterAll(async () => { await scaffold?.close() })
 
   const post = async (path: string, body: unknown): Promise<Response> =>
-    fetch(`${base}${path}`, {
+    scaffold.api(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify(body),
@@ -84,8 +84,101 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the host-version pre-check (#404)
     // its version makes a satisfiable requirement look unsatisfied — so the
     // check is a question, not a lock.
     const forced = await post('/dsh-market/update', { name: A, force: true })
-    expect(forced.status).toBe(200)
-    expect(await forced.json()).toMatchObject({ ok: true })
-    expect(installedVersion()).toBe('2.0.0')
+    // DSH 0.2.1 moved this gate into the CLI: it refuses the install itself
+    // and names an exact-version exemption, so "the user insists" is no
+    // longer enough on that line. Both answers are honest; what must hold
+    // either way is that the profile is left in ONE state, not half-updated.
+    if (forced.status === 200) {
+      expect(await forced.json()).toMatchObject({ ok: true })
+      expect(installedVersion()).toBe('2.0.0')
+    } else {
+      expect(forced.status).toBe(502)
+      const body = await forced.json() as { stderr?: string }
+      expect(body.stderr).toContain('incompatible with dsh')
+      expect(installedVersion()).toBe('1.0.0')
+    }
+  }, 300_000)
+})
+
+describe.skipIf(!HAS_DSH).sequential('web e2e: the fresh-install host-version pre-check (Phase 1)', () => {
+  let scaffold: WebScaffold
+  let base: string
+  const B = 'dshm-e2e-fixture-b'
+
+  beforeAll(async () => {
+    // 1.0.0 installable; 2.0.0 claims a far-future host — and here 2.0.0 IS
+    // `latest`, because this block never moves the tag: the first case has to
+    // meet the refusal on a plain fresh install, and the forced one then lands
+    // 2.0.0. (The block above leaves 1.0.0 as `latest` and calls publish() to
+    // move it, because there the refusal belongs to the UPDATE path.)
+    scaffold = await launchMarketScaffold({
+      fixtures: [
+        { dir: 'fixture-b', version: '1.0.0', manifest: { engines: { dsh: '>=0.0.0' } } },
+        { dir: 'fixture-b', version: '2.0.0', manifest: { engines: { dsh: '>=99.0.0' } } },
+      ],
+    })
+    base = scaffold.baseUrl
+  }, 600_000)
+
+  afterAll(async () => { await scaffold?.close() })
+
+  const post = async (path: string, body: unknown): Promise<Response> =>
+    scaffold.api(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify(body),
+    })
+
+  const installedVersion = (): string | null => {
+    try {
+      return (JSON.parse(readFileSync(
+        join(scaffold.home, 'profiles', 'web', 'node_modules', B, 'package.json'),
+        'utf8',
+      )) as { version: string }).version
+    } catch {
+      return null
+    }
+  }
+
+  it('installs a selected compatible release while latest is incompatible', async () => {
+    const installed = await post('/dsh-market/install', {
+      url: `https://github.com/dshm-e2e/${B}`,
+      version: '1.0.0',
+    })
+    expect(installed.status).toBe(200)
+    expect(installedVersion()).toBe('1.0.0')
+
+    const removed = await post('/dsh-market/uninstall', { name: B })
+    expect(removed.status).toBe(200)
+    expect(installedVersion()).toBeNull()
+  }, 300_000)
+
+  it('refuses a fresh install whose release declares an incompatible host', async () => {
+    const refused = await post('/dsh-market/install', { url: `https://github.com/dshm-e2e/${B}` })
+    expect(refused.status).toBe(400)
+    const body = await refused.json() as { hostIncompatible?: { requirement?: string; hostVersion?: string } }
+    expect(body.hostIncompatible).toBeDefined()
+    expect(body.hostIncompatible?.requirement).toContain('99')
+    expect(body.hostIncompatible?.hostVersion).toMatch(/^\d+\.\d+\./)
+    expect(installedVersion()).toBeNull()
+  }, 300_000)
+
+  it('lets the user through the fresh install when they insist', async () => {
+    const forced = await post('/dsh-market/install', {
+      url: `https://github.com/dshm-e2e/${B}`,
+      force: true,
+    })
+    // Same split as the update above: the CLI owns the gate from 0.2.1 on, so
+    // an insisted install either lands or is refused by the host with the
+    // exemption path spelled out — never a silent half-install.
+    if (forced.status === 200) {
+      expect(await forced.json()).toMatchObject({ ok: true })
+      expect(installedVersion()).toBe('2.0.0')
+    } else {
+      expect(forced.status).toBe(502)
+      const body = await forced.json() as { stderr?: string }
+      expect(body.stderr).toContain('incompatible with dsh')
+      expect(installedVersion()).toBeNull()
+    }
   }, 300_000)
 })

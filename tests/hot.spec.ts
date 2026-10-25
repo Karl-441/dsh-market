@@ -8,10 +8,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { hotMount, hotUnmount, listHotMounts, mountClientOnlyDeps, parseSimplePatch, resolveProfileEntry } from '../src/hot.ts'
+import { configurePersistentLog, readPersistentLog } from '../src/log.ts'
 
 // The harness-vendored Include class is not importable in the unit lane;
 // a minimal stand-in lets hotMount succeed so the skip logic is observable.
@@ -32,6 +33,186 @@ function clientOnlyPkg(dir: string, name: string): void {
 
 afterEach(async () => {
   for (const name of listHotMounts()) await hotUnmount(name)
+})
+
+describe('hotMount finds a patch the package declares in a subdirectory (#646)', () => {
+  it('reads dsh.bundle.patch wherever it points, instead of only the package root', async () => {
+    // The reported shape: `aegis` declares `./extensions/dsh/cordis.patch.yml`,
+    // so the package root holds no cordis.patch.yml at all. Reading only the
+    // root found nothing, fell through to the `dsh.client` check, and told a
+    // user whose package plainly HAS a bundle patch that there was "nothing
+    // to hot-mount" — a message about our lookup, not about their package.
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      const pkg = join(dir, 'node_modules', 'subpath-patch')
+      mkdirSync(join(pkg, 'extensions', 'dsh'), { recursive: true })
+      writeFileSync(join(pkg, 'package.json'), JSON.stringify({
+        name: 'subpath-patch',
+        dsh: { bundle: { patch: './extensions/dsh/cordis.patch.yml' } },
+      }))
+      writeFileSync(join(pkg, 'extensions', 'dsh', 'cordis.patch.yml'),
+        '- insert:\n    - id: subpath-patch-host\n      name: subpath-patch/dist/host.js\n')
+
+      const result = await hotMount(ctx, dir, 'subpath-patch')
+      expect(result.ok).toBe(true)
+      expect(result.reason).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still reads the package-root cordis.patch.yml when nothing is declared', async () => {
+    // The long-standing convention must keep working: this is the shape most
+    // bundles ship, and it has no manifest field at all.
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      const pkg = join(dir, 'node_modules', 'root-patch')
+      mkdirSync(pkg, { recursive: true })
+      writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'root-patch' }))
+      writeFileSync(join(pkg, 'cordis.patch.yml'),
+        '- insert:\n    - id: root-patch-host\n      name: root-patch\n')
+
+      const result = await hotMount(ctx, dir, 'root-patch')
+      expect(result.ok).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still reports a package with neither a patch nor a client surface', async () => {
+    // The message the reporter saw must survive for the packages it is
+    // actually true of — a bare dependency with no dsh surface at all.
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      const pkg = join(dir, 'node_modules', 'plain-lib')
+      mkdirSync(pkg, { recursive: true })
+      writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'plain-lib' }))
+
+      const result = await hotMount(ctx, dir, 'plain-lib')
+      expect(result.ok).toBe(false)
+      expect(String(result.reason)).toContain('无 bundle patch')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * #792: the host composes an ARRAY `dsh.bundle.patch` in order, so hotMount
+ * must read EVERY declared file, not just a string — an array declaration
+ * used to read as "no patch at all" and the user was told there was nothing
+ * to hot-mount for a package that plainly has patches.
+ */
+describe('hotMount reads every declared patch file (#792)', () => {
+  function target(dir: string, name: string): void {
+    const pkg = join(dir, 'node_modules', name)
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name, main: 'index.js' }))
+    writeFileSync(join(pkg, 'index.js'), '')
+  }
+
+  function carrier(dir: string, name: string, patch: unknown, files: Record<string, string>): void {
+    const pkg = join(dir, 'node_modules', name)
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name, dsh: { bundle: { patch } } }))
+    for (const [rel, text] of Object.entries(files)) writeFileSync(join(pkg, rel), text)
+  }
+
+  /** The hot input files still on disk, concatenated. */
+  function mountedRows(dir: string): string {
+    try {
+      return readdirSync(join(dir, '.dsh-market'))
+        .filter(file => /^hot-\d+\.yml$/.test(file))
+        .map(file => readFileSync(join(dir, '.dsh-market', file), 'utf8'))
+        .join('')
+    } catch {
+      return ''
+    }
+  }
+
+  it('mounts rows from every file of an array declaration, in order', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      target(dir, 'dep-a')
+      target(dir, 'dep-b')
+      carrier(dir, 'array-carrier', ['./a.patch.yml', './b.patch.yml'], {
+        'a.patch.yml': '- insert:\n    - id: arr-a\n      name: dep-a\n',
+        'b.patch.yml': '- insert:\n    - id: arr-b\n      name: dep-b\n',
+      })
+
+      const result = await hotMount(ctx, dir, 'array-carrier')
+      expect(result.ok).toBe(true)
+      // Both files contributed, in declaration order, into ONE input file.
+      const rows = readdirSync(join(dir, '.dsh-market'))
+        .filter(file => /^hot-\d+\.yml$/.test(file))
+        .map(file => readFileSync(join(dir, '.dsh-market', file), 'utf8'))
+        .find(text => text.includes('mkt-arr-a'))
+      expect(rows).toBeDefined()
+      expect(rows!.indexOf('mkt-arr-b')).toBeGreaterThan(rows!.indexOf('mkt-arr-a'))
+    } finally {
+      for (const name of listHotMounts()) await hotUnmount(name)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a carrier whose declared list names a missing file', async () => {
+    // All or nothing, same rule as readBundlePatchRows: the host drops the
+    // entire bundle when one declared overlay file is missing, so nothing
+    // of this package may go live off the readable remainder.
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      target(dir, 'dep-b')
+      carrier(dir, 'partial-carrier', ['./gone.patch.yml', './b.patch.yml'], {
+        'b.patch.yml': '- insert:\n    - id: arr-b\n      name: dep-b\n',
+      })
+
+      const result = await hotMount(ctx, dir, 'partial-carrier')
+      expect(result.ok).toBe(false)
+      expect(String(result.reason)).toContain('声明的 patch 文件缺失')
+      expect(mountedRows(dir)).not.toContain('mkt-arr-b')
+    } finally {
+      for (const name of listHotMounts()) await hotUnmount(name)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * #1010: a refusal that only says "this comes up on a start" must be told
+ * apart from a mount that was tried and failed — the toggle route persists the
+ * first and refuses to persist the second (#575).
+ */
+describe('hotMount: restart-only versus failed', () => {
+  function bundle(dir: string, name: string, patch: string | null): void {
+    const pkg = join(dir, 'node_modules', name)
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name, dsh: { bundle: { patch: './cordis.patch.yml' } } }))
+    if (patch !== null) writeFileSync(join(pkg, 'cordis.patch.yml'), patch)
+  }
+
+  it('marks a patch with disables or config as deferred, not as a crash', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      bundle(dir, 'swapper', '- id: ui-chat\n  disabled: true\n- insert:\n    - id: swap-chat\n      name: swapper\n')
+      const result = await hotMount(ctx, dir, 'swapper')
+      expect(result.ok).toBe(false)
+      expect(result.deferred).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not mark an unreadable declaration as deferred — no restart can load it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      bundle(dir, 'broken', null)
+      const result = await hotMount(ctx, dir, 'broken')
+      expect(result.ok).toBe(false)
+      expect(result.deferred).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('mountClientOnlyDeps vs the user patch layer (#58)', () => {
@@ -345,6 +526,64 @@ describe('failed hotMount cleanup — no leftover file, no wedged fiber', () => 
     } finally {
       vi.doUnmock('@deepseek-ai/cordis-plugin-include')
       vi.resetModules()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('a teardown that never finishes cannot hold the market open (#582)', () => {
+  /** Mount one client-only package through the stand-in inclusion plugin. */
+  async function mounted(dir: string, name: string, plugin: (options?: unknown) => unknown): Promise<void> {
+    clientOnlyPkg(dir, name)
+    writeFileSync(join(dir, 'cordis.patch.yml'), `- insert:\n    - id: ${name}\n      name: '${name}'\n`)
+    const result = await hotMount({ plugin } as never, dir, name)
+    expect(result.ok).toBe(true)
+  }
+
+  it('gives up on a hanging teardown at the same ceiling as mounting, and says it could not be confirmed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    vi.useFakeTimers()
+    const logFile = join(dir, 'log.ndjson')
+    configurePersistentLog(logFile)
+    const logged = (): string => readPersistentLog(logFile).join('\n')
+    try {
+      let rejectsLate: (error: unknown) => void = () => {}
+      await mounted(dir, 'stuck-plugin', () => ({
+        await: () => Promise.resolve(),
+        dispose: () => new Promise<void>((_resolve, reject) => { rejectsLate = reject }),
+      }))
+      const pending = hotUnmount('stuck-plugin')
+      // Not resolved yet: the teardown is still hanging.
+      let settled: boolean | null = null
+      void pending.then(value => { settled = value })
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(settled).toBeNull()
+      await vi.advanceTimersByTimeAsync(6000)
+      expect(await pending).toBe(false)
+      // The package is no longer registered, so a later attempt starts clean
+      // rather than reusing a handle already being disposed.
+      expect(listHotMounts()).not.toContain('stuck-plugin')
+      expect(logged()).toContain('could not be confirmed stopped')
+      // A late settlement is reported, not thrown: this rejection arrives
+      // after the market has already answered.
+      rejectsLate(new Error('teardown finally gave up'))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(logged()).toContain('dispose failed after the wait')
+    } finally {
+      configurePersistentLog(null)
+      vi.useRealTimers()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('still reports a teardown that fails at once, and one that succeeds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-hot-'))
+    try {
+      await mounted(dir, 'failing-plugin', () => ({ await: () => Promise.resolve(), dispose: () => Promise.reject(new Error('nope')) }))
+      expect(await hotUnmount('failing-plugin')).toBe(false)
+      await mounted(dir, 'fine-plugin', () => ({ await: () => Promise.resolve(), dispose: () => {} }))
+      expect(await hotUnmount('fine-plugin')).toBe(true)
+    } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })

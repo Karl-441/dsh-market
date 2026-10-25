@@ -16,7 +16,7 @@
 
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-
+import { CHINA_NPM_REGISTRY } from './regions.ts'
 
 /**
  * Decide the argv for a `dsh plugin <add|remove> …` call in the given profile.
@@ -46,9 +46,12 @@ export const HOST_NAMESPACE_RE = /^@deepseek-ai\//
 export interface PnpmFailure {
   code: 'adding-to-root' | 'not-a-workspace' | 'hoist-pattern-diff' | 'pnpm-missing' | 'release-age-violation'
     | 'ignored-builds' | 'git-prepare-not-allowed' | 'git-prepare-failed' | 'tarball-url-mismatch'
-    | 'fetch-404' | 'no-matching-version' | 'transient-network' | 'fetch-timeout'
-    | 'unexpected-store' | 'patch-failed' | 'missing-tarball-integrity' | 'windows-file-locked'
-    | 'pnpm-unusable' | 'missing-local-dependency'
+    | 'fetch-404' | 'no-matching-version' | 'exact-version-missing' | 'transient-network' | 'fetch-timeout'
+    | 'unexpected-store' | 'patch-failed' | 'unused-patch' | 'missing-tarball-integrity' | 'windows-file-locked'
+    | 'profile-file-locked'
+    | 'pnpm-unusable' | 'missing-local-dependency' | 'unparseable-build-key' | 'native-oom' | 'ssh-auth-failed'
+    | 'host-incompatible-install'
+    | 'lockfile-broken' | 'lockfile-outdated' | 'pnpm-stalled' | 'profile-write-lock'
   /** Bilingual, actionable message shown to the user instead of the raw wall of text. */
   message: string
   /** True when re-running `pnpm install` in the profile is the documented recovery. */
@@ -84,6 +87,46 @@ export interface PnpmFailure {
  */
 export function isTransientPnpmFailure(output: string): boolean {
   return /ERR_PNPM_FETCH_5\d\d|ERR_PNPM_META_FETCH_FAIL|FetchError|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|network timeout/i.test(output)
+}
+
+/**
+ * China download route reset a package tarball mid-download (#926).
+ *
+ * Same-argv retry (#83) hits the same host again, so the generic "try again
+ * shortly" advice is wrong. Matched on ONE line: the China npm registry
+ * tarball URL and the reset must appear together — a China-mirror `.tgz`
+ * mention plus an unrelated `ECONNRESET` elsewhere (e.g. codeload) must not
+ * push the user to switch Download region.
+ */
+function isChinaMirrorTarballReset(output: string): boolean {
+  const hostPath = CHINA_NPM_REGISTRY.replace(/^https?:\/\//i, '')
+  const escaped = hostPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(
+    `${escaped}/\\S+/-/\\S+\\.tgz[^\\n]*(?:ECONNRESET|socket hang up)`,
+    'i',
+  ).test(output)
+}
+
+/**
+ * The package a tarball URL belongs to: `…/@types/retry/-/retry-0.12.0.tgz`
+ * → `@types/retry`, `…/lodash/-/lodash-4.17.21.tgz` → `lodash`. Scoped names
+ * arrive percent-encoded often enough to be worth decoding first. `undefined`
+ * when the URL is not a tarball path, so the caller keeps the segment it had.
+ */
+function tarballOwner(output: string): string | undefined {
+  const url = /GET\s+(\S+)/.exec(output)?.[1]
+  if (url === undefined) return undefined
+  const marker = url.replace(/%2[Ff]/g, '/').indexOf('/-/')
+  if (marker === -1) return undefined
+  // The segment before `/-/` is the name; the one before THAT is the scope
+  // only when it starts with `@` — which is what keeps a registry mounted
+  // under a path prefix (`…/api/npm/npm-remote/lodash/-/…`) from being read
+  // as `npm-remote/lodash`.
+  const segments = url.replace(/%2[Ff]/g, '/').slice(0, marker).split('/').filter(Boolean)
+  const name = segments.at(-1)
+  if (name === undefined) return undefined
+  const scope = segments.at(-2)
+  return scope !== undefined && scope.startsWith('@') ? `${scope}/${name}` : name
 }
 
 /**
@@ -184,6 +227,41 @@ function integrityViolators(diagnostic: string): string[] {
  * @returns the classified failure, or null when unrecognized (raw output is then shown as-is).
  */
 export function classifyPnpmFailure(output: string, exitCode?: number | null): PnpmFailure | null {
+  // #817: the host's silence watchdog (@deepseek-ai/dsh-plugin-manager,
+  // `idleTimeoutMs`, 10 minutes by default) killed pnpm. Checked first: it is
+  // the last thing that happened, so whatever pnpm printed before is not the
+  // cause. The usual culprit is a dependency's install script downloading a
+  // binary from a host this network cannot reach — the reporter's cloudflared
+  // postinstall fetching from GitHub Releases — so the last lifecycle line
+  // pnpm printed names the package that went quiet.
+  const stalled = /printed nothing for (\d+)ms and was terminated/.exec(output)
+  if (stalled !== null) {
+    const minutes = Math.max(1, Math.round(Number(stalled[1]) / 60000))
+    const scripts = [...output.matchAll(/node_modules[\\/]((?:@[^\\/\s]+[\\/])?[^\\/\s]+) (?:pre|post)?install[:$]/g)]
+    const culprit = scripts.at(-1)?.[1]?.replace('\\', '/')
+    return {
+      code: 'pnpm-stalled',
+      recoverable: false,
+      message: culprit !== undefined
+        ? `依赖 ${culprit} 的安装脚本 ${minutes} 分钟没有任何输出，被终止了，什么都没装上。这类脚本通常在从网上下载文件，多半是当前网络连不上下载地址；插件本身没有问题。换个网络或开启代理后重试；仍然不行就联系插件作者。 / the install script of the dependency ${culprit} printed nothing for ${minutes} minutes and was stopped, so nothing was installed. Scripts like this usually download a file, and this network most likely cannot reach where it comes from; the plugin itself is not at fault. Try again on another network or through a proxy, and contact the plugin's author if it still fails.`
+        : `pnpm ${minutes} 分钟没有任何输出，被终止了，什么都没装上。通常是网络卡住了。检查网络后重试。 / pnpm printed nothing for ${minutes} minutes and was stopped, so nothing was installed. This usually means the network stalled. Check the connection and try again.`,
+    }
+  }
+  // #914: the host's atomic-write could not take the profile's write lock.
+  // Either a concurrent operation is legitimately holding it, or an earlier
+  // update was killed hard and left the file behind — on Windows the host
+  // cannot always tell a dead PID from a live one, so it never takes over.
+  // The market does not delete the file: it belongs to the host, and a wrong
+  // deletion races a live operation. Say where it is and what is safe.
+  const writerLock = /timed out waiting for the writer lock at "?([^"\n]+)"?/.exec(output)
+  if (writerLock !== null) {
+    const path = writerLock[1]!.trim()
+    return {
+      code: 'profile-write-lock',
+      recoverable: true,
+      message: `profile 的写锁等了太久没等到：${path}。要么另一个插件操作还在跑（等它结束再试），要么某次被中断的更新把锁留在了那里。确认没有安装或更新正在进行后，删掉这个文件再重试即可；市场不会替你去动它。 / the profile's writer lock was never released: ${path}. Either another plugin operation is still running (wait for it), or an interrupted update left the lock behind. Once nothing is installing or updating, delete that file and try again; the market does not remove it for you.`,
+    }
+  }
   if (output.includes('ERR_PNPM_PUBLIC_HOIST_PATTERN_DIFF')
     || output.includes('ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF')) {
     return {
@@ -211,13 +289,31 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   if (output.includes('ERR_PNPM_UNEXPECTED_STORE')) {
     const linked = /currently linked from the store at "([^"]+)"/.exec(output)?.[1]
     const wanted = /wants to use the store at "([^"]+)"/.exec(output)?.[1]
+    const modulesDir = /The dependencies at "([^"]+)"/.exec(output)?.[1]
     const detail = linked !== undefined && wanted !== undefined
       ? `\n  node_modules → ${linked}\n  pnpm 现在想用 / pnpm now wants → ${wanted}`
       : ''
+    // DSH Desktop installs market plugins in a staging workspace under
+    // $DSH_HOME/profiles/.generations/staging/. When that staging tree
+    // carries no pnpm-workspace.yaml of its own, pnpm resolves the
+    // workspace root by walking the ancestor chain — and a
+    // pnpm-workspace.yaml ABOVE the staging tree (a home folder used as a
+    // pnpm workspace is the usual one) claims the install together with
+    // ITS store. The profile's own node_modules is not the one that
+    // mismatched, so the ordinary profile-relink advice is wrong here.
+    // Match only .generations/staging — a .generations/live path is not
+    // the disposable staging workspace.
+    if (modulesDir !== undefined && /[/\\]\.generations[/\\]staging[/\\]/.test(modulesDir)) {
+      return {
+        code: 'unexpected-store',
+        recoverable: false,
+        message: `桌面端的插件安装暂存目录（.generations/staging）被上层的 pnpm workspace 接管（通常是 ~/pnpm-workspace.yaml，它的 node_modules 链到另一个 store），pnpm 因此拒绝在暂存目录里安装。这不是 profile 的 node_modules。处理办法（任选其一）：用那个上层 workspace 自己的 pnpm 大版本重新链接它的 node_modules；或不需要那份祖先 workspace 的话，删掉它的 pnpm-workspace.yaml。暂存目录 → ${modulesDir}${detail} / the desktop client's install staging directory (.generations/staging) was claimed by a pnpm workspace above it (usually ~/pnpm-workspace.yaml, whose node_modules links a different pnpm store), so pnpm refuses to install there. This is not the profile's node_modules. Fix (any one): relink that outer workspace's node_modules with its own pnpm major; or remove that ancestor pnpm-workspace.yaml if you do not need it. Staging directory → ${modulesDir}${detail}`,
+      }
+    }
     return {
       code: 'unexpected-store',
       recoverable: false,
-      message: `这个 profile 的 node_modules 链接到的 pnpm store，和当前 pnpm 默认使用的 store 不是同一个，pnpm 因此拒绝所有安装与卸载。${detail}\n在 profile 目录里执行一次 \`pnpm install --store-dir <上面第一个路径>\` 重新链接即可（dsh 运行时可能占用文件，必要时先退出 dsh）/ this profile's node_modules is linked to a different pnpm store than the one pnpm now resolves, so pnpm refuses every install and uninstall.${detail}\nRelink by running \`pnpm install --store-dir <the first path above>\` once in the profile directory (stop dsh first if files are locked)`,
+      message: `这个 profile 的 node_modules 链接到的 pnpm store，和 pnpm 现在解析出的 store 不是同一个，pnpm 因此拒绝这个 profile 的所有安装与卸载。典型触发是把 $DSH_HOME 迁到另一个挂载点：迁盘前建的 node_modules 记着旧盘上的 store，而 pnpm 会按新的挂载点自动改选一个（#244 的另一种触发，见 #715）。${detail}\n持久的修法：把**记录里的那个** store 写进 profile 的 pnpm-workspace.yaml（顶层、驼峰）：\n\n  storeDir: <上面第一个路径>\n\n加完不用重装任何东西——包本来就在那个 store 里，直接重试即可（dsh 运行时可能占用文件，必要时先退出 dsh）。\n注意 \`pnpm install --store-dir <路径>\` **不是修复**：它只对那一次命令生效，也不会改写 node_modules/.modules.yaml 里的记录，所以下一条命令会报同样的错（pnpm 11.7 与 11.22 实测）。\n想改用 pnpm 现在解析出的那个 store 也行，但那要求清空并重装整个 node_modules（包全部重新下载），代价由你决定。 / this profile's node_modules is linked to a different pnpm store than the one pnpm now resolves, so pnpm refuses every install and uninstall for it. The usual trigger is moving $DSH_HOME to another mount point: a node_modules built before the move records the old disk's store while pnpm re-selects one for the new mount.${detail}\nDurable fix: write the store from the RECORD into the profile's pnpm-workspace.yaml (top level, camelCase):\n\n  storeDir: <the first path above>\n\nNothing has to be reinstalled — the packages are already in that store — so just retry (stop dsh first if files are locked).\nNote that \`pnpm install --store-dir <path>\` is NOT a fix: it applies to that one command and does not rewrite the record in node_modules/.modules.yaml, so the next command fails exactly the same way (measured on pnpm 11.7 and 11.22).\nSwitching to the store pnpm now resolves is also possible, but it requires purging and reinstalling the whole node_modules (every package re-downloaded) — your call, not the market's.`,
     }
   }
   // #367: pnpm verifies every tarball resolution in the lockfile before it
@@ -289,6 +385,34 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
       message: `profile 里的一个 pnpm 补丁打不上了${which}。pnpm 会继续把这个包装上，但装的是没打补丁的原版——通常下次启动才会以「插件加载失败」暴露出来。多半是包升级后挪动了补丁指向的文件（例如补丁改的是 client/client.js，而新版本发的是 lib/client.js）。请更新或删掉这个补丁文件，以及 profile package.json 里 pnpm.patchedDependencies 中对应的那一条 / a pnpm patch in this profile no longer applies${whichEn}. pnpm still installs the package, but unpatched — which usually surfaces at the next boot as "failed to load plugins" rather than here. The usual cause is the package moving the file the patch targets (for example a patch against client/client.js when the release now ships lib/client.js). Update or remove that patch file and its entry under pnpm.patchedDependencies in the profile's package.json`,
     }
   }
+  // #740 by @lws2004: the other half of the story above. `patchedDependencies`
+  // keys on `pkg@exactVersion`, and once the installed version moves past that
+  // key pnpm 12 treats the stale patch as a HARD error: it writes NOTHING at
+  // all. So an update of that plugin is refused in full — the version stays
+  // where it was, the market's own log holds only exit=1, and the user reads
+  // "the update did not apply" for what is really a patch that no longer
+  // matches. Unlike ERR_PNPM_PATCH_FAILED there is no unpatched install to
+  // discover later, which makes this the more confusing of the two. The patch
+  // is the user's, so the market names the entries and says where to fix them
+  // rather than guessing a retarget.
+  if (output.includes('ERR_PNPM_UNUSED_PATCH')) {
+    // `[^\n"]+`: the same sentence also arrives inside the ndjson stream,
+    // where it ends at a quote rather than at the line — matching to the line
+    // end there captured `"}}` as part of the package name.
+    const unused = /The following patches were not used:\s*([^\n"]+)/
+      .exec(withDecodedPnpmDiagnostics(output))?.[1]
+    const named = unused === undefined
+      ? []
+      : unused.split(',').map(entry => entry.trim()).filter(entry => entry !== '')
+    const which = named.length === 0 ? '' : `（${named.join('、')}）`
+    const whichEn = named.length === 0 ? '' : ` (${named.join(', ')})`
+    return {
+      code: 'unused-patch',
+      recoverable: false,
+      pkg: named.length === 1 ? named[0] : undefined,
+      message: `profile 里的 pnpm 补丁有一条已经用不上了${which}：patchedDependencies 是按「包名@精确版本」钉的，而这次要装的版本已经越过它，pnpm 12 因此判定整条命令失败——它什么都没写，所以看起来像「点了更新没反应」。要么把补丁更新到新版本、并把 profile package.json 里 pnpm.patchedDependencies 的键改成「包名@新版本」，要么在新版本已经自带这个修复时直接删掉这一条和对应的补丁文件 / a pnpm patch in this profile is no longer used${whichEn}: patchedDependencies keys on "package@exactVersion", and the version being installed has moved past that key, so pnpm 12 fails the WHOLE command and writes nothing at all — which is why the update looks like it simply did not apply. Either retarget the patch to the new version and change its pnpm.patchedDependencies key in the profile's package.json to "package@newVersion", or — when the new release already carries that fix — drop the entry and its patch file`,
+    }
+  }
   if (output.includes('ERR_PNPM_ADDING_TO_ROOT')) {
     return {
       code: 'adding-to-root',
@@ -308,13 +432,46 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // before ANY later mutation — uninstalling even an unrelated plugin fails
   // (MINIMUM_RELEASE_AGE_VIOLATION), and a later add can fail re-resolving
   // the young dep (NO_MATURE_MATCHING_VERSION). Recovery is a one-shot
-  // --config.minimumReleaseAge=0 retry, automated in withHoistRecovery.
+  // --config.minimum-release-age=0 retry, automated in withHoistRecovery.
+  //
+  // That gate has a THIRD face, and it is the one that fails AFTER the
+  // lockfile check has said yes. pnpm skips that check when the verification
+  // cache holds a run whose recorded window is at least as wide as the
+  // current one (`canTrustPastCheck`: past >= current, pnpm's own
+  // lockfile-verified cache), and the resolver then applies the same policy
+  // from scratch. A re-resolved dependency still inside the window comes back
+  // as a `policyViolation`, which the CLI only knows how to consume through a
+  // handler it never wires on this call path — so it throws
+  // RESOLUTION_POLICY_VIOLATIONS_UNHANDLED instead of reporting anything the
+  // user can act on. Measured on the bundled pnpm 11.7.0 (DSH Desktop), with
+  // a cached pass in place: verification prints "passes supply-chain
+  // policies", and the next phase dies with "2 resolution-policy violations
+  // were produced but no handleResolutionPolicyViolations callback was wired".
+  // Same cause, same cure as the two shapes above — pnpm's hint names
+  // `setupPolicyHandlers`, which an integration calling the CLI cannot wire,
+  // so the only answer is the one-shot override. Classifying it here is what
+  // connects it to that retry; without it the raw internal hint was surfaced.
   if (output.includes('ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION')
-    || output.includes('ERR_PNPM_NO_MATURE_MATCHING_VERSION')) {
+    || output.includes('ERR_PNPM_NO_MATURE_MATCHING_VERSION')
+    || output.includes('ERR_PNPM_RESOLUTION_POLICY_VIOLATIONS_UNHANDLED')) {
     return {
       code: 'release-age-violation',
       recoverable: false,
       message: '这个 profile 里有一个刚发布不久的插件版本，pnpm 的安全等待期检查因此拒绝了本次改动（即使改的是别的插件）。市场已自动放行重试一次；若仍看到本条，请导出日志反馈 / a recently-published plugin version in this profile trips pnpm\'s fresh-release safety check, blocking any change (even to other plugins); the market retries once with a one-shot bypass — if you still see this, export the log and report it',
+    }
+  }
+  // DSH 0.2.1 enforces the compatibility gate ITSELF, at install time, in the
+  // CLI — so the market's own "you insisted, go ahead" path no longer
+  // overrides it: the command exits 1 with `dsh: installation rejected:` and
+  // names an exact-version exemption the user can grant. Before this branch
+  // that wall of text was what the update dialog showed, and it read like a
+  // market failure (#404's question, answered by the host).
+  if (output.includes('dsh: installation rejected:') && /is incompatible with dsh \d/.test(output)) {
+    const requirement = /requirements (\{[^}]*\})/.exec(output)?.[1] ?? ''
+    return {
+      code: 'host-incompatible-install',
+      recoverable: false,
+      message: `这个版本要求的 DSH 比当前运行的新，宿主在安装时自己拒绝了${requirement === '' ? '' : `（它声明的需求：${requirement}）`}。换一个兼容的版本即可；确实要装这一个，需要先在宿主的插件管理器（或 dsh 的 allow-version）里为这个具体版本授权，再重试 / this release needs a newer DSH than the one running, and the HOST refused the install itself${requirement === '' ? '' : ` (it declares ${requirement})`} — not the market's check. Pick a compatible version; to install this exact one anyway, grant the host's exact-version exemption for it first (plugin manager, or dsh's allow-version) and retry`,
     }
   }
   // #69: pnpm >= 10 blocks dependency build scripts by default. The install
@@ -332,6 +489,52 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // pnpm's FETCHER, before anything lands in node_modules — so the package
   // the user must approve is not installed yet, and pnpm's own hint names a
   // commit-pinned codeload URL that changes on every push.
+  // #701: pnpm 12's native engine (pnpm-native) aborting on an allocation it
+  // cannot get — "memory allocation of 5368709120 bytes failed", Windows exit
+  // 3221226505 (0xC0000409, how a Rust abort ends there). Reported with an
+  // A/B: on pnpm 12.5.1 every run with `autoInstallPeers: false` in the
+  // workspace file (DSH writes it into every profile) aborted at ~5 GB peak
+  // RSS, every run without it passed at ~80 MB, with free memory to spare.
+  // Nothing about the plugin being installed; not something a retry of the
+  // same command changes on the reporter's data, so none is attempted.
+  if (/memory allocation of \d+ bytes failed/.test(output) || exitCode === 3221226505) {
+    return {
+      code: 'native-oom',
+      recoverable: false,
+      message: 'pnpm 12 的原生引擎在处理这个 profile 时耗尽了内存并中止——和要安装的插件无关。在 pnpm 修复之前，请改用 pnpm 11（npm install -g pnpm@11）后再试。 / pnpm 12\'s native engine ran out of memory on this profile and aborted — the plugin being installed is not the cause. Until pnpm fixes it, switch to pnpm 11 (npm install -g pnpm@11) and try again.',
+    }
+  }
+  // #698: pnpm 10.26+ and 11.0–11.5 read an allowBuilds key as
+  // `name@<version union>`, so a git or archive source there fails the WHOLE
+  // workspace file — every pnpm command in the profile, not the one plugin.
+  // Named separately from any install failure because the cure is in the
+  // profile's own pnpm-workspace.yaml, which withHoistRecovery repairs.
+  {
+    const found = /ERR_PNPM_INVALID_VERSION_UNION[\s\S]*?Found: \\?"([^"\\]+)\\?"/.exec(output)
+    if (found !== null && /@(?:git\+|https?:)/.test(found[1]!.slice(1))) {
+      return {
+        code: 'unparseable-build-key',
+        recoverable: false,
+        pkg: found[1],
+        message: `这个版本的 pnpm 读不懂 allowBuilds 里的 git 来源键（${found[1]}），整个 profile 的包操作都会因此失败 / this pnpm version cannot read a git-source key in allowBuilds (${found[1]}), which fails every package operation in the profile`,
+      }
+    }
+  }
+  // #596: the ssh half of #587. git asks for a passphrase (or a host-key
+  // confirmation) on a terminal a spawned child does not have; the market
+  // closes that prompt with `BatchMode=yes` so the question becomes a fast
+  // failure instead of a fifteen-minute hang. This is that failure, and it
+  // needs its own message because git's own words send the reader to the
+  // wrong place: `Permission denied (publickey)` reads as "your key is
+  // wrong", and the key is usually fine — it wants a passphrase, and the
+  // channel that would have asked for it is exactly what was shut.
+  if (/Permission denied \(publickey\)|Could not read from remote repository/.test(output)) {
+    return {
+      code: 'ssh-auth-failed',
+      recoverable: false,
+      message: 'git 无法在无人值守的情况下完成 SSH 认证。如果你的 SSH key 设了密码，请用 ssh-agent（ssh-add），或自己设置 GIT_SSH_COMMAND 指向你的命令，市场不会覆盖它。 / git could not complete SSH authentication unattended. If your SSH key has a passphrase, use ssh-agent (ssh-add), or set GIT_SSH_COMMAND to your own command — the market leaves yours alone.',
+    }
+  }
   if (output.includes('ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED')) {
     return {
       code: 'git-prepare-not-allowed',
@@ -369,8 +572,15 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // blocks all later installs, of anything.
   if (output.includes('ERR_PNPM_FETCH_404')) {
     const pkg = /GET\s+\S*\/([^/\s]+):/.exec(output)?.[1].replace(/%2[Ff]/g, '/')
-    const zh = pkg === undefined ? '' : `（${pkg}）`
-    const en = pkg === undefined ? '' : ` (${pkg})`
+    // The URL is either the package itself (`…/@types/retry`) or its tarball
+    // (`…/@types/retry/-/retry-0.12.0.tgz`). `pkg` stays the last path segment
+    // either way — the install route compares it against the tarball name to
+    // tell "this mirror has not synced that release" from a ghost entry — but
+    // a `.tgz` file name is not something the user can look up in their
+    // package.json, so the sentence names the package in the path above it.
+    const shown = pkg === undefined || !/\.tgz$/u.test(pkg) ? pkg : tarballOwner(output) ?? pkg
+    const zh = shown === undefined ? '' : `（${shown}）`
+    const en = shown === undefined ? '' : ` (${shown})`
     return {
       code: 'fetch-404',
       recoverable: false,
@@ -386,19 +596,145 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // error code, so the classifier names it separately and the #289 retry
   // shares it via install.ts's gate. Real output (pnpm 12.4.1): see
   // tests/pnpm-compat.spec.ts, which pins this wording.
+  //
+  // #927: when the request is an EXACT version (name@1.2.3) that this
+  // registry cannot see yet — often a mirror whose `/latest` moved ahead of
+  // its packument — the generic "withdrawn or never published" sentence is
+  // wrong. That shape gets its own code so withHoistRecovery can retry the
+  // same argv once (re-fetch packument) and the UI can say "not synced yet".
   if (output.includes('ERR_PNPM_NO_MATCHING_VERSION')) {
-    const pkg = /No matching version found for\s+((?:@[^/\s]+\/)?[^@\s]+)@/.exec(output)?.[1]
+    const asked = /No matching version found for\s+((?:@[^/\s]+\/)?[^@\s]+)@([^\s]+)/.exec(output)
+    const pkg = asked?.[1]
       ?? /GET\s+\S*\/([^/\s]+):/.exec(output)?.[1].replace(/%2[Ff]/g, '/')
+    const requested = asked?.[2]
     const zh = pkg === undefined ? '' : `（${pkg}）`
     const en = pkg === undefined ? '' : ` (${pkg})`
     const hostPeer = pkg !== undefined && HOST_NAMESPACE_RE.test(pkg)
+    if (hostPeer) {
+      return {
+        code: 'no-matching-version',
+        recoverable: false,
+        pkg,
+        message: `插件声明依赖的宿主包${zh}在 registry 上没有满足其版本范围的发布版（宿主运行时会自带它，npm 上不会出现这个版本）。市场会自动重试一次，放行这条 peer 依赖 / a plugin's declared host peer${en} has no published version satisfying its range — the runtime provides it, so npm carries no such version. The market retries once with that peer exempted from auto-install`,
+      }
+    }
+    const exact = requested !== undefined
+      && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(requested)
+    if (exact) {
+      const pin = pkg === undefined ? requested : `${pkg}@${requested}`
+      const latest = pkg === undefined
+        ? undefined
+        : new RegExp(
+          `The latest release of\\s+${pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+is\\s+"([^"]+)"`,
+          'i',
+        ).exec(output)?.[1]
+      const latestZh = latest === undefined ? '' : `（它目前看到的最新是 ${latest}）`
+      const latestEn = latest === undefined ? '' : ` (it currently reports latest as ${latest})`
+      return {
+        code: 'exact-version-missing',
+        recoverable: false,
+        ...(pkg === undefined ? {} : { pkg }),
+        message: `当前下载线路暂时找不到精确版本 ${pin}${latestZh}。常见原因是线路还没同步到刚发布的版本，不等于这个版本不存在。已自动重试一次仍失败——请稍后再试；若下载区域是中国大陆，也可改成「全球」后再试 / this download route cannot see the exact version ${pin} yet${latestEn}. Often the route has not synced a just-published release — that does not mean the version is missing from npm. One automatic retry failed too — try again shortly; if Download region is China mainland, you can also switch it to Global and retry`,
+      }
+    }
     return {
       code: 'no-matching-version',
       recoverable: false,
-      pkg,
-      message: hostPeer
-        ? `插件声明依赖的宿主包${zh}在 registry 上没有满足其版本范围的发布版（宿主运行时会自带它，npm 上不会出现这个版本）。市场会自动重试一次，放行这条 peer 依赖 / a plugin's declared host peer${en} has no published version satisfying its range — the runtime provides it, so npm carries no such version. The market retries once with that peer exempted from auto-install`
-        : `插件声明的一个依赖版本范围在 registry 上没有可满足的版本${zh}，通常是该版本被弃用或从未发布 / a dependency of this plugin declared a version range with no matching release on the registry${en} — the range resolves to nothing (withdrawn or never published)`,
+      ...(pkg === undefined ? {} : { pkg }),
+      message: `插件声明的一个依赖版本范围在 registry 上没有可满足的版本${zh}，通常是该版本被弃用或从未发布 / a dependency of this plugin declared a version range with no matching release on the registry${en} — the range resolves to nothing (withdrawn or never published)`,
+    }
+  }
+  // #808 by @Tofu707: the profile's own pnpm-lock.yaml is what is wrong, in
+  // two shapes that pnpm reports with two codes and two different repairs, so
+  // they are classified apart rather than merged into one answer.
+  //
+  // `lockfile-outdated` is tested first, because its anchor is a code and
+  // nothing else. The sentence pnpm prints here also arrives WRAPPED across
+  // lines in the human reporter ("… is not up" / "to date with
+  // package.json."), so keying on that sentence instead of the code would miss
+  // the form users actually see.
+  //
+  // The two failures do not happen in a fixed order, so nothing here — and
+  // nothing in either message — claims which one a user meets first.
+  //
+  // `recoverable: false` on both: repeating the same command cannot help, the
+  // lockfile has to change first.
+  if (output.includes('ERR_PNPM_OUTDATED_LOCKFILE')) {
+    return {
+      code: 'lockfile-outdated',
+      recoverable: false,
+      message: 'profile 的 pnpm-lock.yaml 与 package.json 对不上：锁文件里记的 specifier 和 manifest 里声明的不是同一个，pnpm 因此在 frozen-lockfile 这一步直接拒绝，什么都没装。先备份一份 pnpm-lock.yaml，再在 profile 目录里重新生成锁文件（pnpm 最后一行会给出它自己那一版的命令；pnpm install --lockfile-only 也让锁文件与 package.json 对齐）后重试。这与「锁文件里缺条目」是两个不同的报错、对应两种不同的修法，两条命令不要互相套用（#808） / this profile\'s pnpm-lock.yaml does not match package.json: the specifier recorded in the lockfile is not the one the manifest declares, so pnpm refuses at the frozen-lockfile check and installs nothing. Back up pnpm-lock.yaml first, then regenerate the lockfile in the profile directory (pnpm\'s last line names the command for its own version; pnpm install --lockfile-only also realigns the lockfile with package.json) and retry. This is a different error with a different repair from a lockfile that is missing an entry — do not apply one repair to the other',
+    }
+  }
+  // `lockfile-broken` is the lockfile contradicting ITSELF: an importer names
+  // a dependency that has no entry under `packages:`. pnpm 11 and 12 word it
+  // identically and both carry the code, so the rule keys on the code and on
+  // pnpm's own phrase — and deliberately NOT on pnpm's closing `help:` line,
+  // which drifts: 11.24.0 offers `pnpm install --no-frozen-lockfile` for this
+  // failure while 12.8.1 offers `pnpm install --fix-lockfile` (and for the
+  // outdated failure above it offers a third command again, `--lockfile-only`).
+  // Measured 2026-10-08 against 11.24.0 and 12.8.1.
+  //
+  // Both shapes reach here whichever stream pnpm used. Market commands run with
+  // `--reporter=ndjson`, and in that same measurement 11.24.0 wrote the error
+  // record to stdout as one JSON line while 12.8.1 wrote nothing to stdout at
+  // all (0 bytes) and put the error block on stderr as plain text.
+  // withDecodedPnpmDiagnostics lifts the message out of the first form, and
+  // both forms then carry these two strings verbatim.
+  //
+  // The missing entry is named in the message but deliberately NOT put in
+  // `pkg`: callers read `pkg` as "the package this failure is about" and act on
+  // it (the #289 peer retry, the #65 ghost-entry advice), and neither applies —
+  // the repair is in the lockfile, not in the manifest entry.
+  if (output.includes('ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY') || /Broken lockfile/.test(output)) {
+    const broken = /no entry for '?([^'\s]+@[^'\s]+)'? in pnpm-lock\.yaml/i
+      .exec(withDecodedPnpmDiagnostics(output))?.[1]
+    const zh = broken === undefined ? '' : `（${broken}）`
+    const en = broken === undefined ? '' : ` (${broken})`
+    return {
+      code: 'lockfile-broken',
+      recoverable: false,
+      message: `profile 的 pnpm-lock.yaml 自相矛盾：有个依赖在 importers 里记着，packages 里却没有它的条目${zh}，pnpm 因此在真正写 node_modules 的那一步拒绝整个命令。先备份一份 pnpm-lock.yaml；在 importers 下删掉这个依赖的那条记录（它的名字、specifier、version 三行），再在 profile 目录里执行 pnpm install --no-frozen-lockfile --lockfile-only，然后重试。不要用 pnpm 提示的 --fix-lockfile：在 12.x 上它修不好这种状态（11.x 上能修，所以那条提示只在 12.x 的 help 里出现，照它走会把 12.x 用户送到一条一定失败的命令上）。不要删掉整个 pnpm-lock.yaml，那会把其余插件的版本一起重新解析（#808） / this profile\'s pnpm-lock.yaml contradicts itself: a dependency is recorded in importers but has no entry under packages${en}, so pnpm refuses the whole command at the step that actually writes node_modules. Back up pnpm-lock.yaml first; remove that dependency\'s record from importers (its name, specifier and version lines); then run pnpm install --no-frozen-lockfile --lockfile-only in the profile directory and retry. Do not use the --fix-lockfile that pnpm itself suggests: on 12.x it does not repair this state (it does on 11.x, which is why that suggestion only appears in 12.x\'s help, and following it sends a 12.x user to a command that always fails). Do not delete the whole pnpm-lock.yaml either: that re-resolves every other plugin\'s version too (#808)`,
+    }
+  }
+  // #786 follow-up: pnpm could not replace one of the profile's own files —
+  // `package.json`, `pnpm-lock.yaml` — or the lockfile it keeps INSIDE
+  // `node_modules/.pnpm/lock.yaml`. None of these is a package directory.
+  //
+  // pnpm writes all of them through its bundled `write-file-atomic`, which does
+  // ONE rename and no retry (measured on the bundled 11.7.0: the temp name is
+  // `<file>.<hash>`, e.g. `pnpm-lock.yaml.3015012533`). Any momentary holder —
+  // Defender scanning the just-written file, the Windows indexer, an editor —
+  // fails the entire run. Measured on the reporter's own profile: 4 identical
+  // `add` runs, the 4th failed this way and an immediate 5th succeeded.
+  //
+  // The `.pnpm/lock.yaml` shape is the SAME failure, not a lesser one: pnpm's
+  // `writeLockfiles` writes the wanted lockfile and the current one through the
+  // same write-file-atomic inside one `Promise.all` (pnpm 11.7.0, both the
+  // equal-lockfile and the differing one branch). So a lock on the temp name
+  // `…\.pnpm\lock.yaml.<hash>` fails the run exactly like a lock on
+  // `pnpm-lock.yaml` — and answering it as the package-directory case below
+  // would roll the profile's lockfile back over a `node_modules` that already
+  // holds the new build, which is the desync this whole branch exists to stop.
+  //
+  // This must be answered BEFORE the package-directory branch below, whose
+  // pattern is broad enough to swallow it: that branch blames the running host
+  // for holding the plugin's files open and tells the user to quit DSH, which
+  // is wrong here (nothing about the plugin is locked) and is the most
+  // expensive advice available for a failure that a plain retry clears.
+  //
+  // `recoverable: false`, like the other same-argv retries (`transient-network`,
+  // `fetch-timeout`): that flag means "re-running `pnpm install` is the
+  // documented recovery", and no code reads it to decide a retry — the retry is
+  // keyed on this code in `withHoistRecovery`. Marking it true would invite a
+  // future reader to rebuild `node_modules` over a one-file rename.
+  if (/(?:ERR_PNPM_)?EPERM[^\n]*rename[^\n]*(?:[\\/](?:package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml)\.\d+|[\\/]\.pnpm[\\/]lock\.yaml\.\d+)/i.test(
+    withDecodedPnpmDiagnostics(output),
+  )) {
+    return {
+      code: 'profile-file-locked',
+      recoverable: false,
+      message: 'pnpm 写入 package.json 或 pnpm-lock.yaml 时被 Windows 拒绝了一下——通常是杀毒软件或索引服务正好在读这个刚写完的文件。插件本身没有被占用；市场已经自动重试过一次，还是失败，请再试一次 / Windows briefly refused pnpm\'s write of package.json or pnpm-lock.yaml — usually antivirus or the search indexer reading the file pnpm had just written. Nothing about the plugin is locked; the market already retried once and it still failed, so try again',
     }
   }
   // #389 by @qq1054435284: on Windows, pnpm stages the new version in a
@@ -426,7 +762,19 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // win, because that process is the thing holding the handles; retrying
   // would only turn one clear failure into several slow ones. So this names
   // the cause and the ways out instead of guessing.
-  if (/ERR_PNPM_EPERM|EPERM: operation not permitted, rename/i.test(output)) {
+  // pnpm 12 (the native CLI) says it differently and carries no ERR_PNPM_
+  // code: `failed to remove existing directory "…" prior to swap: …` — same
+  // refused swap over the open directory, so the same answer.
+  //
+  // A Windows EPERM on a PROFILE file is NOT this case, and is answered
+  // separately just above. pnpm's own write-file-atomic performs one rename
+  // with no retry (measured on the bundled 11.7.0), so an antivirus scan, a
+  // file indexer, or any process touching pnpm-lock.yaml for an instant fails
+  // the whole run — after pnpm has already built and linked the new commit.
+  // Reporting that as "the running host holds the plugin's files open" gave the
+  // worst available advice (quit DSH), because the interference is momentary
+  // and the next attempt succeeds.
+  if (/ERR_PNPM_EPERM|EPERM: operation not permitted, rename|failed to remove existing directory .* prior to swap/i.test(output)) {
     // Read through the NDJSON reporter like the integrity classifier does:
     // in production this arrives JSON-escaped, so every separator is doubled
     // and a single-character class silently matches nothing.
@@ -439,7 +787,7 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
       code: 'windows-file-locked',
       recoverable: false,
       ...(pkg === undefined ? {} : { pkg }),
-      message: `Windows 不允许替换正在被打开的文件。pnpm 要用新目录替换${zh === '' ? '一个已装好的包' : ` ${pkg!}`}，而它的文件正被运行中的 DeepSeek Harness 打开着，改名因此失败，这一步没有生效——已经装好的内容没有被破坏。\n如果这个包带原生模块（.node 文件，例如 node-hid 这类），那么停用插件、甚至卸载插件都不够：原生模块一旦被加载，在进程退出前都不会释放。刚卸载完立刻重装同一个插件在 Windows 上失败，通常就是这个原因。\n可行的做法：完全退出 DeepSeek Harness（不是刷新页面），重新启动后再操作一次；或退出后在命令行执行。杀毒软件或文件索引临时占用目录也会报同样的错，若都不适用可稍后重试。 / Windows will not replace a file that is open. pnpm tried to swap a new directory over${en === '' ? ' an installed package' : en}, whose files the running DeepSeek Harness holds open, so the rename failed and this step did not apply — what was already installed is intact. If that package ships a native module (a .node file, node-hid and friends), disabling the plugin — even uninstalling it — is not enough: once a native module is loaded it is not released until the process exits, which is the usual reason reinstalling a plugin right after uninstalling it fails on Windows. What works: quit DeepSeek Harness completely (not a page refresh), start it again, and repeat the operation; or run it from the command line with the app closed. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies.`,
+      message: `Windows 不允许替换正在被打开的文件。pnpm 要用新目录替换${zh === '' ? '一个已装好的包' : ` ${pkg!}`}，而它的文件正被运行中的 DeepSeek Harness 打开着，改名因此失败，这一步没有生效。\n要注意的是：pnpm 在重试改名之前会尽量把目标目录清掉，所以**被占用文件旁边的内容可能已经被删**——不一定只是「没换成」而已。市场遇到这种失败时不再尝试回滚（同一个改名会撞同一批句柄），而是把 package.json 与 pnpm-lock.yaml 恢复成操作前的样子，并检查原构建的入口是否还在——结论以那次检查为准。\n如果这个包带原生模块（.node 文件，例如 node-hid 这类），那么只停用、甚至卸载插件而不退出程序都不够：原生模块一旦被加载，在进程退出前都不会释放。刚卸载完立刻重装同一个插件在 Windows 上失败，通常就是这个原因。\n注意：这个包被锁住的时候，这个配置下**其他**插件的安装也会一起失败，不只是用到它的那一个。\n可行的做法：完全退出 DeepSeek Harness（不是刷新页面），重新启动后再操作一次；或退出后在命令行执行。如果重启后同一个包又被启动时加载、仍然失败，就先停用加载它的插件，再重启，操作完成后再启用它。杀毒软件或文件索引临时占用目录也会报同样的错，若都不适用可稍后重试。 / Windows will not replace a file that is open. pnpm tried to swap a new directory over${en === '' ? ' an installed package' : en}, whose files the running DeepSeek Harness holds open, so the rename failed and this step did not apply. Note that pnpm clears as much of the target directory as it can before retrying the rename, so content BESIDE the file it could not remove may already be gone — this is not always only "the swap did not happen". On this failure the market no longer attempts a rollback (the same rename would meet the same open handles); it restores package.json and pnpm-lock.yaml to how they were and then checks whether the previous build still has a loadable entry — that check is the answer. If that package ships a native module (a .node file, node-hid and friends), disabling the plugin — even uninstalling it — without quitting is not enough: once a native module is loaded it is not released until the process exits, which is the usual reason reinstalling a plugin right after uninstalling it fails on Windows. While that package is locked, every OTHER plugin operation that has to rewrite packages in this profile fails with it, not only the ones that use it. What works: quit DeepSeek Harness completely (not a page refresh), start it again, and repeat the operation; or run it from the command line with the app closed. If the same package is loaded at startup again and the retry still fails, disable the plugin that loads it, restart, update, and enable it again afterwards. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies.`,
     }
   }
   // #83: pnpm replays the WHOLE dependency tree on every add/remove, so a
@@ -449,6 +797,16 @@ export function classifyPnpmFailure(output: string, exitCode?: number | null): P
   // a plain retry to succeed seconds later. withHoistRecovery retries once;
   // this message covers the case where the retry lost too.
   if (isTransientPnpmFailure(output)) {
+    // Keep code `transient-network` so withHoistRecovery still does the #83
+    // same-argv retry; only the final message changes when that retry lost
+    // against the China mirror's tarball host (#926).
+    if (isChinaMirrorTarballReset(output)) {
+      return {
+        code: 'transient-network',
+        recoverable: false,
+        message: '中国大陆下载线路在拉这个安装包时被断开了。再走同一条线路通常没用。打开设置，把「下载区域」改成「全球」，然后再装一次 / the China mainland download route was interrupted while fetching this package. Trying the same route again usually will not help. Open Settings, switch Download region to Global, and install again',
+      }
+    }
     return {
       code: 'transient-network',
       recoverable: false,

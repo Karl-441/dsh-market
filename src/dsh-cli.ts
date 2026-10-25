@@ -7,9 +7,9 @@
  * the agent's sandboxed executor and denies writes to the profile directory.
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess, SpawnOptions } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { logEvent } from './log.ts'
@@ -136,12 +136,23 @@ export function proxyEnvForPnpm(env: NodeJS.ProcessEnv = process.env, region: Re
   // statement about where packages come from, and a region setting must not
   // overrule it. Same rule the proxy translation above follows, for the same
   // reason — this function's job is to fill silence, not to overwrite speech.
+  //
+  // Written in BOTH vocabularies (#865). pnpm reads `pnpm_config_*` /
+  // `PNPM_CONFIG_*` and does not read `npm_config_registry` at all — measured
+  // on 11.7.0, where the npm spelling is ignored and whatever `.npmrc` names
+  // stands. So the region setting used to move the market's own requests
+  // (checks, catalog, changelog) while every install still fetched from the
+  // user's configured registry, which is how a mirror lagging behind the
+  // catalog reads as "this version was never published" (#862). npm's own
+  // spelling stays because other things in the install path read it, and it
+  // is the name the value has always had.
   const mirror = routesFor(region).npmRegistry
-  if (mirror !== DEFAULT_NPM_REGISTRY && !has('npm_config_registry')) {
+  if (mirror !== DEFAULT_NPM_REGISTRY && !has('npm_config_registry') && !has('PNPM_CONFIG_REGISTRY')) {
     // npm's own config convention terminates the registry with a slash;
     // pnpm accepts either, but writing it the conventional way keeps the
     // value recognizable to anyone reading the spawned process's env.
     out.npm_config_registry = `${mirror}/`
+    out.PNPM_CONFIG_REGISTRY = `${mirror}/`
   }
   return out
 }
@@ -194,15 +205,199 @@ export function toolSearchDirs(
   return [...new Set(dirs.filter(dir => dir.trim() !== ''))]
 }
 
-function spawnEnv(): NodeJS.ProcessEnv {
+/**
+ * Stop git asking for credentials down a channel nobody is listening on
+ * (#587).
+ *
+ * `CI=true` below is the same defence one layer up, and pnpm reads it. git
+ * does not — it has its own switch, and it was not set. The gap only opens
+ * when a spec reaches pnpm's git fetcher instead of the codeload tarball
+ * path `accelerate.ts` describes: `github:owner/repo#path:/sub` is one, and
+ * pnpm really does shell out to `git` for it, trying HTTPS first.
+ *
+ * git's credential prompt opens the controlling terminal, not stdin. There
+ * is no terminal here, so the question is never seen and never answered:
+ * the reporter caught `git.exe` alive for eight minutes having burned 0.05s
+ * of CPU, and only the fifteen-minute install timeout ended it. Refusing
+ * the prompt turns that into a fast, readable failure.
+ *
+ * It is a default, not an override: a value the caller set wins, and blank
+ * counts as unset because an empty `GIT_TERMINAL_PROMPT` is not a setting
+ * git can parse either. Credential helpers and `GIT_ASKPASS` are untouched
+ * and still answer first — this closes only the terminal fallback, which is
+ * precisely the branch that cannot work from a spawned child.
+ *
+ * Scope, stated plainly because it is narrower than the issue title
+ * suggests: this is the HTTPS half, and the FIRST attempt HTTPS is. Measured
+ * with a `GIT_SSH_COMMAND` sentinel that always fails: pnpm's clone of a
+ * `github:owner/repo#path:/sub` spec succeeds without ever calling it, so
+ * ssh is the fallback that runs after HTTPS fails — which is the private
+ * repository case, not the common one.
+ *
+ * The ssh half (#596, @JINITAIMI121) is a policy decision, and it is made
+ * here: `BatchMode=yes`, so a passphrase or host-key question fails fast
+ * instead of waiting on a terminal nobody is watching. The cost is real and
+ * is why it is conditional — `BatchMode` also disables `SSH_ASKPASS`, so a
+ * key that NEEDS a passphrase stops prompting even where something could
+ * have answered, and the install fails where it used to work.
+ *
+ * So it is set only when the user has expressed NO ssh preference at all:
+ * `GIT_SSH_COMMAND` and `GIT_SSH` in the environment, and `core.sshCommand`
+ * in git config — the three ordinary ways to choose an identity, and
+ * `GIT_SSH_COMMAND` would silently override all three (measured: with
+ * `core.sshCommand` set, ours wins and theirs is never run). A user who
+ * has an agent or a specific key configured keeps exactly what they have;
+ * the prompt is closed for everyone else, and `classifyPnpmFailure` says
+ * what to do if that turns out to be the passphrase case.
+ */
+let coreSshCommandProbe: string | null | undefined
+
+/**
+ * `core.sshCommand` from the user's git configuration, or null.
+ *
+ * The third place an ssh identity hides, and the one the environment cannot
+ * show: `git config --get` answers it. Memoized for the process — a user
+ * does not reconfigure git mid-install, and this runs on every spawn.
+ *
+ * @returns the configured command, or null when git has none (including
+ *   when git is absent — an unreadable answer is not a choice).
+ */
+export function probeCoreSshCommand(env?: NodeJS.ProcessEnv): string | null {
+  // Memoized only for the caller that has no opinion: a test that supplies
+  // its own environment is asking a different question and must get the
+  // fresh answer.
+  if (env === undefined && coreSshCommandProbe !== undefined) return coreSshCommandProbe ?? null
+  try {
+    const out = spawnSync('git', ['config', '--get', 'core.sshCommand'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      ...(env === undefined ? {} : { env }),
+      // A user's git may be a shim that prints to a console; nothing here
+      // wants a window.
+      windowsHide: true,
+    })
+    const answer = out.status === 0 && typeof out.stdout === 'string' && out.stdout.trim() !== ''
+      ? out.stdout.trim()
+      : null
+    if (env === undefined) coreSshCommandProbe = answer
+    return answer
+  } catch {
+    if (env === undefined) coreSshCommandProbe = null
+    return null
+  }
+}
+
+export function gitEnvForPnpm(
+  env: NodeJS.ProcessEnv = process.env,
+  coreSshCommand: string | null = probeCoreSshCommand(),
+): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {}
+  // Blank counts as unset: an empty value is not a setting git can parse.
+  const speaks = (value: string | undefined): boolean => (value ?? '').trim() !== ''
+  if (!speaks(env.GIT_TERMINAL_PROMPT)) out.GIT_TERMINAL_PROMPT = '0'
+  const choseElsewhere = speaks(env.GIT_SSH_COMMAND) || speaks(env.GIT_SSH) || speaks(coreSshCommand ?? '')
+  if (!choseElsewhere) out.GIT_SSH_COMMAND = 'ssh -oBatchMode=yes'
+  return out
+}
+
+/**
+ * Every `--config.<key>=<value>` override in the argv, repeated as the
+ * `PNPM_CONFIG_<KEY>` environment variable that pnpm 12 still reads.
+ *
+ * pnpm 12 ignores some `--config.<key>` overrides on the command line, in
+ * either spelling, without a word: `fetchTimeout` (#615; measured on
+ * 12.2.1, 12.3.0 and 12.4.1) and `auto-install-peers` (12.4.1 auto-installs
+ * the peer with the flag present and not with the variable), so the retries
+ * that carry them ran exactly like the first attempt. `PNPM_CONFIG_*` is
+ * honoured by 11.8, 11.21 and 12.4 alike, so the argument stays for the
+ * versions that read it and the variable carries the same value for the
+ * ones that do not. Scoped to the run that carries the flag; nothing is set
+ * otherwise, so a user's own values are untouched on every other run. Keys
+ * are accepted in either spelling, so respelling a constant (as #600 did
+ * for the release-age one) cannot silently drop the variable.
+ */
+export function pnpmConfigEnvForArgs(pluginArgs: readonly string[]): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const arg of pluginArgs) {
+    const match = /^--config\.([A-Za-z][A-Za-z0-9-]*)=(\S+)$/.exec(arg)
+    if (match === null) continue
+    const key = match[1]!.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toUpperCase()
+    env[`PNPM_CONFIG_${key}`] = match[2]!
+  }
+  return env
+}
+
+/**
+ * The operator-configured build environment (issue #336): environment
+ * variables pinned in the market's config (cordis.yml `buildEnv`) or its
+ * settings section, for hosts — GUI, systemd/launchd, Windows Start menu —
+ * where the dsh process cannot inherit a shell environment.
+ *
+ * The value is read through a live SOURCE rather than copied at mount: the
+ * settings wiring mutates `config.buildEnv` at runtime, and a frozen copy
+ * would quietly keep every later spawn on the boot-time value. The default
+ * source answers nothing, so a host that never configures this (or that
+ * unmounts its routes) gets the exact same env it always did.
+ */
+let buildEnvSource: () => Readonly<Record<string, string>> = () => ({})
+
+/**
+ * Point every future child spawn at the configured build environment.
+ * @param source - Live source of the config's `buildEnv` object, re-read on
+ * every spawn so a settings change reaches the next child immediately.
+ * @returns the previous source, so a caller can restore it on teardown.
+ */
+export function setBuildEnvSource(source: () => Readonly<Record<string, string>>): () => Readonly<Record<string, string>> {
+  const previous = buildEnvSource
+  buildEnvSource = source
+  return previous
+}
+
+function spawnEnv(invocation: HostPackageManager | null = hostPackageManager): NodeJS.ProcessEnv {
   // pnpm v10+ blocks forever on a silent interactive prompt without a TTY;
   // CI mode forces it to act or fail instead of asking.
   const separator = process.platform === 'win32' ? ';' : ':'
-  const parts = (process.env.PATH ?? '').split(separator).filter(part => part !== '')
+  // A packaged host ships its runtime rather than relying on PATH, and says
+  // where it is through the invocation's own `env` (#653). That environment
+  // goes FIRST so its bundled Node wins on a machine where nothing else is
+  // on the process PATH — and it reaches every child, including the
+  // `dsh plugin` forwarder, which is the only way an install can run there.
+  const hostEnv = invocation?.env ?? {}
+  const parts = `${hostEnv.PATH ?? ''}${separator}${process.env.PATH ?? ''}`
+    .split(separator).filter(part => part !== '')
   for (const bin of toolSearchDirs()) {
     if (!parts.includes(bin)) parts.push(bin)
   }
-  return { ...process.env, ...proxyEnvForPnpm(process.env, activeRegion()), CI: 'true', PATH: parts.join(separator) }
+  // Merge order is the feature (#336). The configured build env sits above
+  // BOTH the inherited process.env and the host's own `env` (#653): the
+  // inherited one is what the operator is trying to replace (a `g++` too old
+  // to compile a plugin), and the host's is a default it ships, which an
+  // explicit line is allowed to overrule. That precedence is a decision, not
+  // a property of the order these objects happen to be written in.
+  //
+  // It stays strictly below the two values the market computes for itself.
+  // PATH is its answer to "where is pnpm", CI is its answer to pnpm's
+  // interactive prompt, and either being overridden by a config value would
+  // produce a failure that looks nothing like its cause.
+  //
+  // proxyEnvForPnpm and gitEnvForPnpm are asked about the MERGED env, not
+  // process.env: both are "fill silence, never overwrite speech" guards, and
+  // a `GIT_SSH_COMMAND` pinned here is speech. Reading process.env would make
+  // the market inject its own BatchMode command over the operator's, which is
+  // the silent-overwrite shape #713 exists to end.
+  const withBuildEnv = { ...process.env, ...hostEnv, ...buildEnvSource() }
+  // hostEnv follows process.env. PATH is `parts` below: host entries, then
+  // the inherited PATH. That PATH is never empty, so dropping the host
+  // entries whenever it is already set would leave the bundled Node off
+  // the path (#653).
+  return {
+    ...withBuildEnv,
+    ...proxyEnvForPnpm(withBuildEnv, activeRegion()),
+    ...gitEnvForPnpm(withBuildEnv),
+    CI: 'true',
+    PATH: parts.join(separator),
+  }
 }
 
 const INSTALL_TIMEOUT_MS = Number(process.env.DSH_MARKET_INSTALL_TIMEOUT_MS) || 15 * 60 * 1000
@@ -283,13 +478,21 @@ function spawnShim(file: string, args: readonly string[], options: SpawnShimOpti
  */
 export function dshArgv(): { file: string; args: string[]; cwd: string | undefined; viaShell: boolean } {
   const entry = process.argv[1]
-  if (entry !== undefined && /[\\/](?:bin\.(?:js|ts)|dsh)$/.test(entry)) {
+  // Desktop's installed `dsh web` uses this CLI carrier too. Keep
+  // that installation's dispatcher instead of silently selecting a different
+  // dsh from PATH. Do not accept arbitrary applications named cli.js.
+  const desktopCli = entry !== undefined
+    && /[\\/]node_modules[\\/]@deepseek-ai[\\/]dsh-desktop-host[\\/]lib[\\/]cli\.js$/.test(entry)
+  if (entry !== undefined && (desktopCli || /[\\/](?:bin\.(?:js|ts)|dsh)$/.test(entry))) {
     // Absolute paths are required: source launches (`pnpm dsh`) pass a
     // relative entry, which the child resolves against its OWN cwd and dies
     // with MODULE_NOT_FOUND (#13). cwd near the entry keeps execArgv imports
     // (tsx/esm) resolvable on source launches.
     const abs = resolve(entry)
-    return { file: nodeExecutable(), args: [...process.execArgv, abs], cwd: dirname(abs), viaShell: false }
+    // The official bundled CLI inherits the launcher's cwd. Its entry can
+    // live inside app.asar: Electron can read it, but the OS cannot chdir there.
+    // Do not probe that directory through Electron's virtual filesystem.
+    return { file: nodeExecutable(), args: [...process.execArgv, abs], cwd: desktopCli ? undefined : dirname(abs), viaShell: false }
   }
   // Bare `dsh` is a .cmd shim on Windows that only a shell can start (#13).
   return { file: 'dsh', args: [], cwd: undefined, viaShell: winCmdShim }
@@ -305,6 +508,39 @@ export interface InstallResult {
   cancelled: boolean
   /** Desktop's generation-wide package-operation gate rejected the start. */
   busy?: boolean
+  /**
+   * The host refused before it ran the package manager, so the profile is
+   * exactly as it was.
+   *
+   * The update route answers a failed run by reinstalling the previous build
+   * and, when that cannot be verified, tells the user to inspect a profile
+   * nothing touched. Desktop's manager has refusals of this kind of its own —
+   * it declines a spec it considers already installed before pnpm starts
+   * (#897) — and their only true account is "nothing happened".
+   */
+  wroteNothing?: boolean
+  /**
+   * The desktop manager stopped answering, and the profile may be
+   * half-updated: a removal it was asked to perform can already be on disk.
+   *
+   * The update route normally answers a failed run by restoring the previous
+   * build through the same manager. That is exactly wrong here — the manager
+   * is what stopped answering, and its profile write lock is still held — so
+   * the route leaves the profile alone and the market's journal
+   * (`src/pending-updates.ts`) finishes or undoes the removal on the next
+   * start (#928).
+   */
+  repairOnRestart?: boolean
+  /**
+   * The host's own refusal code, when it stopped before running pnpm.
+   *
+   * The desktop manager answers with structured codes — `already-installed`,
+   * `bundle-in-use`, `market-self-update` — but they used to survive only as
+   * text inside `stderr`. The update route forwards this to `failureCode`,
+   * so a client can tell "the market cannot update itself here" (#909) from
+   * an ordinary failure without parsing a sentence.
+   */
+  refusalCode?: string
   /** Package names pnpm reported as having ignored build scripts (ndjson). */
   ignoredBuilds?: string[]
   /**
@@ -347,6 +583,19 @@ export interface PluginCommandRuntime {
   cancelActive(): boolean
   /** Whether this host can execute an immutable rollback add target. */
   supportsExactRollbackTarget?(target: string): boolean
+  /**
+   * Whether this runtime runs pnpm itself and therefore accepts the market's
+   * own arguments — `--config.*` overrides, `--force`, `--no-frozen-lockfile`.
+   *
+   * The official Electron profile does not (#732): its in-process manager
+   * takes exactly `add <target>` or `remove <target>` and answers any other
+   * argv with exit 127. Every recovery step that decorates a command with an
+   * option is impossible there, and sending it anyway turned a pnpm failure
+   * into "this desktop operation is not supported" — a message about an
+   * operation that is in fact supported, which sent the reporter looking for
+   * a broken profile instead of the option. Absent means "accepts".
+   */
+  acceptsMarketPnpmFlags?: boolean
 }
 
 /** One running package operation, however it was started. */
@@ -494,6 +743,35 @@ export function killChild(child: ChildProcess): void {
 let activeChild: ChildProcess | null = null
 let cancelRequested = false
 
+/**
+ * Remove the profile's `package.json.lock` when it is provably ours (#914).
+ *
+ * The dsh CLI writes that lock through the host's atomic-write, whose
+ * `finally` releases it. A timeout kills the whole tree with `taskkill /F`,
+ * so that release never runs and the file outlives the child — and on
+ * Windows the host cannot reliably tell a dead PID from a live one, so every
+ * later change waits the full lock timeout and fails.
+ *
+ * Only a lock naming OUR killed child is removed: that PID is provably dead
+ * because we just killed its whole tree, and it cannot belong to another
+ * operation. A lock naming anything else is left for the classifier to name
+ * (#914), because deleting a live operation's lock would race it.
+ */
+export function clearOwnedProfileLock(profile: string, pid: number | undefined): boolean {
+  if (pid === undefined) return false
+  try {
+    const lock = join(profileDir(profile), 'package.json.lock')
+    const recorded = Number(readFileSync(lock, 'utf8').trim())
+    if (!Number.isInteger(recorded) || recorded !== pid) return false
+    rmSync(lock, { force: true })
+    logEvent('warn', 'install', `the timed-out operation left ${lock} behind (pid ${pid}, already killed with its tree) — removed it so the next change is not blocked (#914)`)
+    return true
+  } catch {
+    // Absent, unreadable, or removed by the child on its way out: nothing to do.
+    return false
+  }
+}
+
 interface ActiveDesktopOperation {
   readonly owner: symbol
   readonly cancel: () => void
@@ -549,6 +827,64 @@ export function cancelActive(): boolean {
   return true
 }
 
+/**
+ * The package manager the host itself supplies, as the launcher hands it
+ * over (`profileContext.packageManager`).
+ *
+ * This is not a PATH executable. A packaged host ships its own runtime and
+ * describes it as a whole invocation — command, args AND env — because each
+ * part carries meaning: the desktop host passes the location of its embedded
+ * Node through `env`, so an implementation that keeps only `command` reaches
+ * a tool it still cannot execute, which is the reported failure (#653).
+ */
+export interface HostPackageManager {
+  readonly command: string
+  readonly args: readonly string[]
+  readonly env: NodeJS.ProcessEnv
+}
+
+let hostPackageManager: HostPackageManager | null = null
+
+/** Whether the host-supplied package manager answered `--version`. */
+let hostPnpmReady = false
+
+/**
+ * Why the host-supplied package manager failed — kept apart from the PATH
+ * probe's own failure so a hint can name the component that actually failed.
+ */
+let hostProbeFailure: { command: string; output: string } | null = null
+
+/**
+ * Register the host's package manager for this process, or clear it with
+ * `null`. Cached probe answers are dropped only when the invocation really
+ * changes, so a repeated mount does not re-probe a toolchain that works.
+ */
+export function setHostPackageManager(invocation: HostPackageManager | null): void {
+  const previous = hostPackageManager
+  const unchanged = previous === invocation || (
+    previous !== null && invocation !== null &&
+    previous.command === invocation.command &&
+    previous.args.length === invocation.args.length &&
+    previous.args.every((arg, index) => arg === invocation.args[index])
+  )
+  if (unchanged) return
+  hostPackageManager = invocation
+  hostPnpmReady = false
+  pnpmReady = false
+  pnpmProbeFailure = null
+  hostProbeFailure = null
+}
+
+/** The host-supplied package manager, for callers that must name it. */
+export function hostPackageManagerInvocation(): HostPackageManager | null {
+  return hostPackageManager
+}
+
+/** Why the host-supplied package manager last failed, or null. */
+export function lastHostPackageManagerFailure(): { command: string; output: string } | null {
+  return hostProbeFailure
+}
+
 /** Whether `pnpm` resolves on PATH; success is cached, absence is re-probed. */
 let pnpmReady = false
 
@@ -569,8 +905,55 @@ export function lastPnpmProbeFailure(): { kind: 'missing' | 'failed'; output: st
   return pnpmProbeFailure
 }
 
-/** Probe `pnpm --version` on PATH. */
+/**
+ * Probe the host-supplied package manager: `<command> <args…> --version`,
+ * with the invocation's own environment (see spawnEnv). Its answers are
+ * cached exactly like the PATH probe's.
+ */
+function probeHostPackageManager(): Promise<boolean> {
+  if (hostPnpmReady) return Promise.resolve(true)
+  const invocation = hostPackageManager
+  if (invocation === null) return Promise.resolve(false)
+  return new Promise((resolvePromise) => {
+    const child = spawnShim(invocation.command, [...invocation.args, '--version'], {
+      stdio: ['ignore', 'pipe', 'pipe'], viaShell: winCmdShim, env: spawnEnv(),
+    })
+    let output = ''
+    const collect = (chunk: Buffer): void => { output = (output + chunk.toString()).slice(-2000) }
+    child.stdout?.on('data', collect)
+    child.stderr?.on('data', collect)
+    child.on('error', (error) => {
+      hostProbeFailure = { command: invocation.command, output: error.message }
+      resolvePromise(false)
+    })
+    child.on('close', (code) => {
+      hostPnpmReady = code === 0
+      hostProbeFailure = hostPnpmReady ? null : { command: invocation.command, output: output.trim() }
+      resolvePromise(hostPnpmReady)
+    })
+  })
+}
+
+/**
+ * Whether a package manager is usable — the host-supplied one first.
+ *
+ * The tiers are ordered by what the machine can actually run: a packaged
+ * host's bundled runtime exists whether or not PATH was inherited from a
+ * shell, and on the reported machine only that tier can work at all (#653).
+ * A host tier that fails falls through to the PATH probe, so a host that
+ * publishes a broken invocation cannot make things worse than they were.
+ */
 export function probePnpm(): Promise<boolean> {
+  if (pnpmReady || hostPnpmReady) return Promise.resolve(true)
+  // Deliberately not `async`: with no host tier this returns the PATH probe's
+  // own promise, so the observable timing of every existing caller is exactly
+  // what it was before this tier existed.
+  if (hostPackageManager === null) return probePnpmOnPath()
+  return probeHostPackageManager().then(ready => ready ? true : probePnpmOnPath())
+}
+
+/** Probe `pnpm --version` on PATH. */
+function probePnpmOnPath(): Promise<boolean> {
   if (pnpmReady) return Promise.resolve(true)
   return new Promise((resolvePromise) => {
     // Piped, not ignored: the output of a pnpm that exists but will not run
@@ -616,6 +999,15 @@ function runQuiet(file: string, args: string[], timeoutMs: number): Promise<{ co
  * @returns true when `pnpm --version` succeeds afterwards.
  */
 export async function provisionPnpm(): Promise<{ ok: boolean; hint?: string }> {
+  // A host that ships a package manager has nothing to provision, and asking
+  // corepack or npm to fetch another one cannot help: on the reported machine
+  // both are unreachable, which is precisely why the host bundles a runtime
+  // (#653). Probe what we were handed and report that honestly rather than
+  // running two commands that cannot succeed.
+  if (hostPackageManager !== null) {
+    if (await probePnpm()) return { ok: true }
+    return { ok: false, hint: hostPackageManagerHint() }
+  }
   const corepack = await runQuiet('corepack', ['enable', 'pnpm'], 60 * 1000)
   logEvent(corepack.code === 0 ? 'info' : 'warn', 'setup-pnpm', `corepack enable: exit=${String(corepack.code)} ${corepack.output.slice(-200)}`)
   if (await probePnpm()) return { ok: true }
@@ -674,6 +1066,25 @@ export function toolOnPath(name: string): boolean {
 }
 
 /**
+ * Why a host-supplied package manager will not run.
+ *
+ * Separate from `provisionHint` on purpose: nothing was provisioned and
+ * nothing is misinstalled, so every PATH-shaped explanation (install it,
+ * set PNPM_HOME, restart dsh) is advice for a problem this user does not
+ * have (#653). Name the invocation the host published, because that is what
+ * has to change.
+ * @returns a bilingual, actionable hint.
+ */
+function hostPackageManagerHint(): string {
+  const invocation = hostPackageManager
+  const command = invocation === null ? '' : invocation.command
+  const args = invocation === null ? '' : invocation.args.join(' ')
+  const failure = hostProbeFailure
+  const detail = failure === null || failure.output === '' ? '' : `\n\n${failure.output}`
+  return `这台机器的宿主自己带了一个包管理器，dsh 进程优先用它，但它连 \`--version\` 都跑不起来——所以这次不是你装错了东西，设 PNPM_HOME 也没有用。宿主给的调用是：${command} ${args}。常见原因是宿主的内嵌运行时目录被移动、被清理，或正处在升级中途。请重启宿主（桌面端）让它重新注入运行时；这条链只负责使用宿主给的运行时，没有它时会照旧回落到 PATH 上的 pnpm。原始输出：${detail} / The host supplies its own package manager and this dsh process prefers it, but it cannot even run \`--version\` — so nothing is misinstalled and PNPM_HOME will not help. The host published: ${command} ${args}. The usual cause is the host's bundled runtime having been moved, cleaned up, or caught mid-upgrade. Restart the host so it injects its runtime again; this tier only consumes what the host publishes and still falls back to a PATH pnpm without it. Its output:${detail}`
+}
+
+/**
  * Why the one-click pnpm setup failed, in terms the user can act on.
  *
  * Every one of these was a real report where the market said only "自动准备
@@ -728,6 +1139,15 @@ export function provisionHint(
   // which is exactly what #228 reported. Its own output is the explanation.
   if (probeFailure?.kind === 'failed') {
     const detail = probeFailure.output === '' ? '' : `\n\n${probeFailure.output}`
+    // pnpm's own output names the culprit, and the reported case is not the
+    // shim (#653): `env: node:` is the interpreter lookup of a
+    // `#!/usr/bin/env node` shebang, so pnpm is here and could not start
+    // because THIS PROCESS has no node on PATH — a launch that never
+    // inherited a shell profile. Sending that user to check corepack's
+    // network is advice for a different machine.
+    if (/^\s*env:\s*node:/m.test(probeFailure.output)) {
+      return `找到 pnpm 了，但运行 \`pnpm --version\` 失败，而它自己的输出已经说明了原因：env: node: No such file or directory。这不是 corepack 要联网下载的问题，是 node 不在这个进程的 PATH 上——pnpm 的真身是 \`#!/usr/bin/env node\` 脚本，env 找不到任何 node 就启动不了它。典型场景是 node 装在 brew 的 keg-only 目录或用户目录里、只由 shell 配置注入 PATH，而这个宿主是图形界面启动的，继承不到那份配置。两条路：从终端启动 dsh（继承 shell 的 PATH），或让宿主提供它自带的运行时。pnpm 的原始输出：${detail} / pnpm was found but \`pnpm --version\` fails, and its own output says why: env: node: No such file or directory. That is not the corepack shim failing to reach the network — node is missing from THIS process's PATH. pnpm itself is a \`#!/usr/bin/env node\` script, so env cannot start it without one. The usual shape is node installed keg-only (brew) or under a user directory and injected only by a shell profile, with the host launched from a GUI. Two ways out: start dsh from a terminal, or have the host supply its own runtime. pnpm's own output:${detail}`
+    }
     return `找到 pnpm 了，但运行 \`pnpm --version\` 失败——所以问题不在路径上，设 PNPM_HOME 没有用。最常见的原因是 corepack 的 shim 需要联网下载 pnpm 本体，而这台机器下不到。请在终端执行一次 \`pnpm --version\`：如果同样失败，按它的提示修（受限网络可用 \`brew install pnpm\` 或 \`npm i -g pnpm --registry <你的镜像>\` 装一个完整的 pnpm，绕开 shim）；如果在终端里正常，说明 dsh 进程的环境和你的终端不同，请从该终端启动 dsh。pnpm 的原始输出：${detail} / pnpm was found, but \`pnpm --version\` fails — so this is not a path problem and PNPM_HOME will not help. The usual cause is a corepack shim that has to download pnpm itself and cannot reach the network. Run \`pnpm --version\` in a terminal: if it fails the same way, follow what it says (on a restricted network install a real pnpm with \`brew install pnpm\` or \`npm i -g pnpm --registry <your mirror>\` to bypass the shim); if it works there, the dsh process has a different environment than your shell — start dsh from that terminal. pnpm's own output:${detail}`
   }
   const searched = toolSearchDirs().join(process.platform === 'win32' ? ' ; ' : ' : ')
@@ -791,7 +1211,7 @@ export const BOOT_ID = `${String(process.pid)}-${String(Date.now())}`
 export const TARGET_RE = /^[A-Za-z0-9@:./_#+~^=-]+$/
 
 /** Mutating pnpm commands get the structured reporter appended. */
-const NDJSON_COMMANDS = new Set(['add', 'remove', 'install'])
+const NDJSON_COMMANDS = new Set(['add', 'remove', 'install', 'update'])
 
 /** Apply profile-specific pnpm compatibility and the structured reporter. */
 function preparePluginArgs(profileDirectory: string, pluginArgs: readonly string[]): {
@@ -847,6 +1267,81 @@ function makeProgressFeeder(tracker: ReturnType<typeof createProgressTracker>): 
   }
 }
 
+/**
+ * Run the host-supplied package manager in a profile directory.
+ *
+ * Official Desktop publishes this invocation on `profileContext` and uses it
+ * for every managed install. The market's official branch must not send
+ * `dsh plugin --profile desktop`, and must not go through the manager for the
+ * market's own package (#900). This is that remaining door: `pnpm add` (or
+ * whatever argv the caller names) against the bundled Node, with the
+ * invocation's own env. Callers must not add `--config.minimum-release-age=0`
+ * here — that is the #944 lockfile write.
+ */
+export function runHostPnpm(
+  invocation: HostPackageManager,
+  cwd: string,
+  args: readonly string[],
+): Promise<InstallResult> {
+  if (invocation.command.trim() === '') {
+    return Promise.resolve({
+      exitCode: 127, timedOut: false, stdout: '', stderr: 'host package manager has no command', cancelled: false,
+    })
+  }
+  const tracker = beginProgress(args[args.length - 1] ?? '')
+  const feed = makeProgressFeeder(tracker)
+  return new Promise((resolvePromise) => {
+    const child = spawnShim(invocation.command, [...invocation.args, ...args], {
+      cwd,
+      env: { ...spawnEnv(invocation), ...pnpmConfigEnvForArgs(args) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      viaShell: winCmdShim && /\.cmd$/i.test(invocation.command),
+      detached: process.platform !== 'win32',
+    })
+    activeChild = child
+    cancelRequested = false
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      killTree(child)
+    }, INSTALL_TIMEOUT_MS)
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString()
+      stdout = (stdout + text).slice(-256 * 1024)
+      feed(text)
+      syncProgress(tracker)
+    })
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString()
+      stderr = (stderr + text).slice(-64 * 1024)
+      feed(text)
+      syncProgress(tracker)
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      progress.active = false
+      progress.cancelling = false
+      if (activeChild === child) activeChild = null
+      resolvePromise({ exitCode: 127, timedOut: false, stdout, stderr: `${stderr}\n${error.message}`.trim(), cancelled: false })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      progress.active = false
+      progress.cancelling = false
+      if (activeChild === child) activeChild = null
+      resolvePromise({
+        exitCode: code,
+        timedOut,
+        stdout,
+        stderr,
+        cancelled: cancelRequested,
+      })
+    })
+  })
+}
+
 /** Run one `dsh plugin --profile <p> …` command with timeout and progress tracking. */
 export function runDshPlugin(profile: string, pluginArgs: string[]): Promise<InstallResult> {
   const { file, args, cwd, viaShell } = dshArgv()
@@ -869,7 +1364,7 @@ export function runDshPlugin(profile: string, pluginArgs: string[]): Promise<Ins
       // pnpm v10 blocks forever on a silent interactive prompt without a TTY
       // (observed on re-add over a pinned git spec); CI mode forces it to act
       // or fail instead of asking.
-      env: spawnEnv(),
+      env: { ...spawnEnv(), ...pnpmConfigEnvForArgs(pluginArgs) },
       stdio: ['ignore', 'pipe', 'pipe'],
       viaShell,
       // Own process group on POSIX so cancel/timeout can kill the whole
@@ -906,6 +1401,9 @@ export function runDshPlugin(profile: string, pluginArgs: string[]): Promise<Ins
     })
     child.on('close', (code) => {
       clearTimeout(timer)
+      // A timed-out run was killed hard, so the host's lock release in the
+      // child's `finally` never ran. Clear only OUR child's lock (#914).
+      if (timedOut) clearOwnedProfileLock(profile, child.pid)
       progress.active = false
       progress.cancelling = false
       if (activeChild === child) activeChild = null

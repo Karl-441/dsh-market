@@ -294,6 +294,33 @@ describe('Diagnostics (jsdom)', () => {
     expect(screen.getByText(new RegExp(`^${t('catWarn')}:\\s*0$`))).toBeTruthy()
   })
 
+  it('lists leftover directories without wearing the problem style (#663)', async () => {
+    stubCheckReport({
+      ...REPORT,
+      residuals: [
+        { name: 'dsh-pet', path: 'node_modules/dsh-pet', kind: 'incomplete-package', declared: false },
+        {
+          name: 'dsh-loop',
+          path: 'node_modules/.pnpm/dsh-loop@1.0.0/node_modules/dsh-loop_tmp_99_2',
+          kind: 'tmp-directory', declared: true,
+        },
+      ],
+    })
+    render(<Diagnostics t={t} />)
+    await waitFor(() => expect(screen.queryByText(t('checkLoading'))).toBeNull())
+
+    const section = assertSection(t('checkResiduals'), 2)
+    // Open it: every block is collapsed by default.
+    fireEvent.click(within(section).getByText(t('checkResiduals')))
+    expect(within(section).getByText('node_modules/dsh-pet')).toBeTruthy()
+    expect(within(section).getByText(t('checkResidualIncomplete'))).toBeTruthy()
+    expect(within(section).getByText(t('checkResidualTmp'))).toBeTruthy()
+    expect(within(section).getByText(t('checkResidualsHint'))).toBeTruthy()
+    // Informational, not a fourth alarm: a leftover does not stop a boot, and
+    // it must not read like the errors above it.
+    expect(section.querySelector('.' + css.diagAlert)).toBeNull()
+  })
+
   it('counts multiVersion in the summary strip and never calls a warning-only report all-good', async () => {
     // Regression for the #201 tier split: multiVersion stopped being part of
     // anyIssue, so a warning-only report could claim "all good".

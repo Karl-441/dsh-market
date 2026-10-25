@@ -112,11 +112,74 @@ describe('market state.json (#60)', () => {
     }
   })
 
+  /** #657. Same optional-field contract as notes/favorites: a caller that
+   * never heard of blocked must not erase a list the user already has. */
+  it('a partial write keeps blocked names that the caller never mentioned', () => {
+    const dir = stateDir()
+    try {
+      writeMarketState(dir, {
+        disabled: new Set(), groups: {}, groupOrder: [],
+        blocked: ['dsh-loop', 'dsh-notify'],
+      })
+      expect(readMarketState(dir).blocked).toEqual(['dsh-loop', 'dsh-notify'])
+
+      writeMarketState(dir, { disabled: new Set(['a']), groups: {}, groupOrder: [] })
+      expect(readMarketState(dir).blocked).toEqual(['dsh-loop', 'dsh-notify'])
+
+      writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], blocked: [] })
+      expect(readMarketState(dir).blocked).toEqual([])
+      expect('blocked' in readRaw(dir)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  /** #728. Same optional-field contract as blocked: a caller that never
+   * heard of the persistent "don't remind me" list must not erase it. */
+  it('a partial write keeps update-exempt names that the caller never mentioned', () => {
+    const dir = stateDir()
+    try {
+      writeMarketState(dir, {
+        disabled: new Set(), groups: {}, groupOrder: [],
+        updateExempt: ['dsh-loop', 'dsh-notify'],
+      })
+      expect(readMarketState(dir).updateExempt).toEqual(['dsh-loop', 'dsh-notify'])
+
+      writeMarketState(dir, { disabled: new Set(['a']), groups: {}, groupOrder: [] })
+      expect(readMarketState(dir).updateExempt).toEqual(['dsh-loop', 'dsh-notify'])
+
+      writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], updateExempt: [] })
+      expect(readMarketState(dir).updateExempt).toEqual([])
+      expect('updateExempt' in readRaw(dir)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists blocked package names and drops junk on read', () => {
+    const dir = stateDir()
+    try {
+      writeMarketState(dir, {
+        disabled: new Set(), groups: {}, groupOrder: [],
+        blocked: ['dsh-loop', 'dsh-loop', '', 'dsh-notify'],
+      })
+      expect(readMarketState(dir).blocked).toEqual(['dsh-loop', 'dsh-notify'])
+      expect('blocked' in readRaw(dir)).toBe(true)
+
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
+        blocked: ['ok', 7, null, 'ok', ''],
+      }))
+      expect(readMarketState(dir).blocked).toEqual(['ok'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('readMarketState normalizes malformed payloads to empty state', () => {
     const dir = stateDir()
     try {
       writeFileSync(join(dir, '.dsh-market', 'state.json'), 'not json')
-      expect(readMarketState(dir)).toEqual({ disabled: new Set(), groups: {}, groupOrder: [], notes: {}, favorites: [] })
+      expect(readMarketState(dir)).toEqual({ disabled: new Set(), groups: {}, groupOrder: [], notes: {}, favorites: [], blocked: [], updateExempt: [] })
       writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
         disabled: ['a', 'a', '', 7],
         groups: { work: ['x', 'x', 3] },
@@ -182,6 +245,40 @@ describe('market state.json (#60)', () => {
       writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], channel: 'beta' })
       writeDisabled(dir, new Set(['theme-a']))
       expect(readMarketState(dir).channel).toBe('beta')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists a saved build environment and forgives junk on the way in (#336)', () => {
+    const dir = stateDir()
+    try {
+      const base = { disabled: new Set(), groups: {}, groupOrder: [] }
+      writeMarketState(dir, { ...base, buildEnv: { CC: '/usr/bin/gcc-11', CXX: '/usr/bin/g++-11' } })
+      expect(readRaw(dir).buildEnv).toEqual({ CC: '/usr/bin/gcc-11', CXX: '/usr/bin/g++-11' })
+      expect(readMarketState(dir).buildEnv).toEqual({ CC: '/usr/bin/gcc-11', CXX: '/usr/bin/g++-11' })
+
+      // Names pnpm would never apply, blank values and non-strings are
+      // dropped rather than replayed into every future install.
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
+        buildEnv: { CC: '/usr/bin/gcc-11', '1BAD': 'x', 'A-B': 'y', BLANK: '   ', NUM: 7, PATH: '/evil' },
+      }))
+      expect(readMarketState(dir).buildEnv).toEqual({ CC: '/usr/bin/gcc-11' })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('an absent or emptied build environment is absent, not a blank override', () => {
+    const dir = stateDir()
+    try {
+      writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [] })
+      expect('buildEnv' in readRaw(dir)).toBe(false)
+      expect(readMarketState(dir).buildEnv).toBeUndefined()
+      // An all-junk map on disk reads as "never saved" — the composition
+      // keeps inheriting rather than a frozen empty override.
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ buildEnv: { '': '' } }))
+      expect(readMarketState(dir).buildEnv).toBeUndefined()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -296,6 +393,41 @@ describe('a partial write must not erase the rest of the state (#435)', () => {
     }
   })
 
+  it('keeps the sidebar entry on across unrelated writes, and lets it be turned off (#846)', () => {
+    const dir = stateDir()
+    try {
+      expect(readMarketState(dir).sidebarEntry).toBeUndefined()
+      writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], sidebarEntry: true })
+      expect(readMarketState(dir).sidebarEntry).toBe(true)
+
+      // A plugin toggle knows nothing about the sidebar and must not erase it.
+      writeMarketState(dir, { disabled: new Set(['dsh-loop']), groups: {}, groupOrder: [] })
+      expect(readMarketState(dir).sidebarEntry).toBe(true)
+
+      // Turning it off is a CHOICE, not an empty field: on a host with no
+      // settings page this row is the only way into the market, so a later
+      // read must not take "off" for "never asked" and put the row back
+      // (#846 on DSH 0.2.1+).
+      writeMarketState(dir, { ...readMarketState(dir), sidebarEntry: false })
+      expect(readMarketState(dir).sidebarEntry).toBe(false)
+      expect(readRaw(dir).sidebarEntry).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('reads anything but a literal true as the sidebar entry being off', () => {
+    const dir = stateDir()
+    try {
+      for (const sidebarEntry of ['true', 1, null, {}]) {
+        writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ sidebarEntry }))
+        expect(readMarketState(dir).sidebarEntry).toBeUndefined()
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('ignores unsafe or malformed persisted GitHub prefixes', () => {
     const dir = stateDir()
     try {
@@ -308,6 +440,39 @@ describe('a partial write must not erase the rest of the state (#435)', () => {
         writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({ githubProxy }))
         expect(readMarketState(dir).githubProxy).toBeUndefined()
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('group state normalization (#964)', () => {
+  it('drops order entries with no group and appends groups with no order entry', () => {
+    const dir = stateDir()
+    try {
+      // The reported file: four names in the order, one key in the map. The
+      // UI lists all four, and every operation on the three ghosts answers
+      // group-not-found — including delete.
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
+        groups: { '本地化插件': ['dsh-loop'] },
+        groupOrder: ['插件', '工作', '学习', '本地化插件'],
+      }))
+      const state = readMarketState(dir)
+      expect(state.groupOrder).toEqual(['本地化插件'])
+      expect(Object.keys(state.groups)).toEqual(['本地化插件'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps a group whose order entry is missing', () => {
+    const dir = stateDir()
+    try {
+      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
+        groups: { work: [], play: [] },
+        groupOrder: ['play'],
+      }))
+      expect(readMarketState(dir).groupOrder).toEqual(['play', 'work'])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -330,6 +495,15 @@ describe('group CRUD (groups.ts)', () => {
     expect(renameGroup(state, 'work', 'work').ok).toBe(true)
 
     expect(deleteGroup(state, 'work').ok).toBe(true)
+    expect(state).toEqual({ groups: {}, groupOrder: [] })
+    expect(deleteGroup(state, 'ghost').ok).toBe(false)
+  })
+
+  it('deletes a name the order still lists but the map lost (#964)', () => {
+    // The impossible row the reporter was stuck with: listed, but every
+    // operation — including delete — answered group-not-found.
+    const state = { groups: {}, groupOrder: ['ghost'] }
+    expect(deleteGroup(state, 'ghost').ok).toBe(true)
     expect(state).toEqual({ groups: {}, groupOrder: [] })
     expect(deleteGroup(state, 'ghost').ok).toBe(false)
   })

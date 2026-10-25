@@ -35,7 +35,7 @@ describe.skipIf(!HAS_DSH)('web e2e: release channel', () => {
 
   /** POST as the market's own page does — the route requires a same origin. */
   const post = async (path: string, payload: unknown): Promise<{ status: number; body: any }> => {
-    const res = await fetch(`${scaffold.baseUrl}${path}`, {
+    const res = await scaffold.api(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: scaffold.baseUrl },
       body: JSON.stringify(payload),
@@ -47,12 +47,12 @@ describe.skipIf(!HAS_DSH)('web e2e: release channel', () => {
     (await post('/dsh-market/channel', { channel })).status
 
   const statusNow = async (): Promise<any> => {
-    const res = await fetch(`${scaffold.baseUrl}/dsh-market/status`, { cache: 'no-store' })
+    const res = await scaffold.api(`/dsh-market/status`, { cache: 'no-store' })
     return await res.json()
   }
 
   const channelNow = async (): Promise<unknown> => {
-    const res = await fetch(`${scaffold.baseUrl}/dsh-market/status`, { cache: 'no-store' })
+    const res = await scaffold.api(`/dsh-market/status`, { cache: 'no-store' })
     return ((await res.json()) as { channel?: unknown }).channel
   }
 
@@ -112,7 +112,7 @@ describe.skipIf(!HAS_DSH)('web e2e: the dev channel', () => {
     existsSync(statePath()) ? JSON.parse(readFileSync(statePath(), 'utf8')) as Record<string, unknown> : {}
 
   const post = async (path: string, payload: unknown): Promise<{ status: number; body: any }> => {
-    const res = await fetch(`${scaffold.baseUrl}${path}`, {
+    const res = await scaffold.api(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: scaffold.baseUrl },
       body: JSON.stringify(payload),
@@ -120,7 +120,7 @@ describe.skipIf(!HAS_DSH)('web e2e: the dev channel', () => {
     return { status: res.status, body: await res.json().catch(() => ({})) }
   }
   const statusNow = async (): Promise<any> =>
-    await (await fetch(`${scaffold.baseUrl}/dsh-market/status`, { cache: 'no-store' })).json()
+    await (await scaffold.api(`/dsh-market/status`, { cache: 'no-store' })).json()
 
   it('is offered by a real host with no opt-in of any kind', async () => {
     // It was behind a stored developer mode for one version. Nothing has to

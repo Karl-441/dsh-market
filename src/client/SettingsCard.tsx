@@ -35,11 +35,13 @@
 
 import { createElement as h, Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
-import { Button, IconChevronDownOutline14, IconLoadingOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconChevronDownOutline14, IconLoadingOutline16 } from './icons.ts'
 import css from './Market.module.css'
 import { api, applyGithubRouting } from './market-data.ts'
 import type { MarketStatus } from './market-data.ts'
 import type { Translate } from './market-data.ts'
+import type { SidebarEntry } from './sidebar-entry.ts'
 
 /** Keys the market leaves in the browser; cleared when the user purges. */
 const BROWSER_KEYS = ['dshm-webdav', 'dshm-gist-id'] as const
@@ -55,6 +57,8 @@ export interface SettingsCardProps {
    * server that has disposed its routes.
    */
   onRemoved?: () => void
+  /** The opt-in sidebar row (#846); absent, the card offers no switch. */
+  sidebar?: SidebarEntry
 }
 
 type Channel = 'stable' | 'beta' | 'dev'
@@ -79,12 +83,21 @@ interface SelfStatus {
   githubProxyManaged: boolean
   /** Whether the profile package manager owns this market installation. */
   selfManaged: boolean
+  /**
+   * Whether a remove request from this page could pass the market's own
+   * fence (#903). False behind a reverse proxy or a remote host, where the
+   * card must not offer a button that can only answer 403.
+   */
+  selfUninstallReachable: boolean
+  /** The effective build environment (composition + card-saved override). */
+  buildEnv: Record<string, string>
 }
 
 /** The subset of api('/dsh-market/status') this card reads. */
 interface StatusBody {
   version?: string
   restart?: boolean
+  selfUninstallReachable?: boolean
   channel?: string
   channels?: string[]
   region?: string
@@ -95,6 +108,7 @@ interface StatusBody {
   githubProxyCustom?: string | null
   githubProxyManaged?: boolean
   selfManaged?: boolean
+  buildEnv?: Record<string, string>
 }
 
 /** What api('/dsh-market/updates') says about the market's own row. */
@@ -161,7 +175,33 @@ function readStatus(body: StatusBody): SelfStatus {
     githubProxyCustom: typeof body.githubProxyCustom === 'string' ? body.githubProxyCustom : null,
     githubProxyManaged: body.githubProxyManaged === true,
     selfManaged: body.selfManaged !== false,
+    selfUninstallReachable: body.selfUninstallReachable !== false,
+    buildEnv: body.buildEnv ?? {},
   }
+}
+
+/** Render the effective build environment as one `KEY=value` line each. */
+export function buildEnvToText(env: Record<string, string>): string {
+  return Object.entries(env)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n')
+}
+
+/** Parse a `KEY=value` block back into a map; blank lines are dropped. */
+export function buildEnvFromText(text: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of text.split('\n')) {
+    const entry = line.trim()
+    if (entry === '') continue
+    const at = entry.indexOf('=')
+    if (at <= 0) continue
+    const key = entry.slice(0, at).trim()
+    const value = entry.slice(at + 1).trim()
+    if (key === '') continue
+    out[key] = value
+  }
+  return out
 }
 
 function readUpdate(own: RawUpdate): SelfUpdate {
@@ -189,8 +229,20 @@ export function clearBrowserState(storage: Pick<Storage, 'removeItem'>): void {
   }
 }
 
-export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement | null {
+export function SettingsCard({ t, onRemoved, sidebar }: SettingsCardProps): ReactElement | null {
   const [open, setOpen] = useState(false)
+  const [sidebarState, setSidebarState] = useState(() => ({
+    supported: sidebar?.supported() === true,
+    enabled: sidebar?.enabled() === true,
+    onlyDoor: sidebar?.onlyDoor() === true,
+  }))
+  const [sidebarSaving, setSidebarSaving] = useState(false)
+  useEffect(() => {
+    if (sidebar === undefined) return undefined
+    const sync = (): void => { setSidebarState({ supported: sidebar.supported(), enabled: sidebar.enabled(), onlyDoor: sidebar.onlyDoor() }) }
+    sync()
+    return sidebar.subscribe(sync)
+  }, [sidebar])
   const [status, setStatus] = useState<SelfStatus | null>(null)
   const [update, setUpdate] = useState<SelfUpdate | null>(null)
   const [phase, setPhase] = useState<Phase>('idle')
@@ -200,6 +252,9 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
   const [proxyEditing, setProxyEditing] = useState(false)
   const [proxyDraft, setProxyDraft] = useState('')
   const [proxySaving, setProxySaving] = useState(false)
+  /** Draft of the build-environment editor (#336), seeded once from status. */
+  const [envText, setEnvText] = useState('')
+  const envSeeded = useRef(false)
   /**
    * The last self-update was refused by pnpm's fresh-release safety wait
    * (#39). Only the market's own card can update the market, so without a
@@ -232,7 +287,7 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
           setStatus({
             version: null, restart: false, channel: 'stable', channels: ['stable', 'beta'],
             region: 'global', regions: REGIONS, regionAuto: false,
-            githubProxyCustom: null, githubProxyManaged: false, selfManaged: true,
+            githubProxyCustom: null, githubProxyManaged: false, selfManaged: true, selfUninstallReachable: true, buildEnv: {},
           })
         }
       }
@@ -386,6 +441,47 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
       }
     })()
   }, [post, t])
+  /**
+   * Seed the build-environment editor from the server's effective value —
+   * ONCE. The draft is the user's to edit from then on; the status refetch
+   * after a save updates it explicitly instead.
+   */
+  useEffect(() => {
+    if (status === null || envSeeded.current) return
+    envSeeded.current = true
+    setEnvText(buildEnvToText(status.buildEnv))
+  }, [status])
+
+  /** Save the draft build environment; an empty list clears it (#336). */
+  const onSaveEnv = useCallback(async () => {
+    setError(null)
+    try {
+      const body = await post(api('/dsh-market/build-env'), {
+        buildEnv: buildEnvFromText(envText),
+      }) as { ok?: boolean; error?: string; buildEnv?: Record<string, string> }
+      if (body.ok !== true) { setError(body.error ?? t('setSelfFailed')); return }
+      // Reflect exactly what the server applied, not what we sent — the
+      // server is the one that dropped blank lines and rejected names.
+      setEnvText(buildEnvToText(body.buildEnv ?? {}))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }, [envText, post, t])
+
+  const onSidebar = useCallback((next: boolean) => {
+    if (sidebar === undefined) return
+    setError(null)
+    setSidebarSaving(true)
+    void (async () => {
+      try {
+        await sidebar.set(next)
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause))
+      } finally {
+        setSidebarSaving(false)
+      }
+    })()
+  }, [sidebar])
 
   /** One label + hint block with an optional action, the host's row shape. */
   const row = (label: string, hint: string, action: ReactElement | null): ReactElement =>
@@ -403,6 +499,25 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
   const body = phase === 'removed'
     ? row(t('setSelfRemoved'), t('setSelfRemovedHint'), null)
     : h(Fragment, null,
+        // First, not under region and proxy: this is how the shortcut stays
+        // findable after the market-page tip is dismissed. Only on a host
+        // with sidebar panels — elsewhere the switch would promise a row
+        // that has nowhere to appear.
+        sidebarState.supported ? row(t('setSidebar'), t(sidebarState.onlyDoor ? 'setSidebarOnlyDoorHint' : 'setSidebarHint'),
+          h('div', { className: css.setSeg },
+            ([false, true] as const).map(on => h('button', {
+              key: String(on),
+              type: 'button',
+              className: sidebarState.enabled === on ? `${css.setSegBtn} ${css.setSegOn}` : css.setSegBtn,
+              disabled: busy || sidebarSaving,
+              'aria-pressed': sidebarState.enabled === on,
+              onClick: () => { if (sidebarState.enabled !== on) onSidebar(on) },
+            }, t(on ? 'setSidebarOn' : 'setSidebarOff'))),
+          )) : null,
+        // Where the same catalog is reachable on a host that reads market
+        // indexes (dsh 0.2.1+): a statement, not an action — the address is
+        // the whole thing the user needs, and it stays selectable here.
+        row(t('setIndexSource'), t('setIndexSourceHint'), null),
         status?.selfManaged === true ? row(
           // An older offer is not an update, and calling it one would have
           // the user click "更新" to go backwards. It IS what picking an
@@ -469,9 +584,8 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
               onClick: () => { onChannel(id) },
             }, t(CHANNEL_LABEL[id]))),
           )) : null,
-        // Above the channel row and below the update row: this is about
-        // getting plugins at all, which is the market's whole job, while the
-        // channel is about which build of the market itself arrives.
+        // Getting plugins at all is the market's job; the channel above is
+        // which build of the market itself arrives.
         row(
           t('setRegion'),
           // The hint carries the explanation of an automatic choice when
@@ -542,17 +656,43 @@ export function SettingsCard({ t, onRemoved }: SettingsCardProps): ReactElement 
               ),
             )
           : null,
-        status?.selfManaged === true ? row(t('setSelfRemove'), t('setSelfRemoveHint'),
-          phase === 'confirming' || busy
-            ? null
-            : h(Button, {
+        // Build environment (#336): the one place an unshelled host pins
+        // CC/CXX for plugin builds. Full-width block, because the editor is
+        // a list — a cramped column would teach a one-line-per-row format
+        // nobody can read.
+        h('div', { className: css.setConfirm },
+          h('div', { className: css.setLabel }, t('setBuildEnv')),
+          h('div', { className: css.setHint }, t('setBuildEnvHint')),
+          h('textarea', {
+            className: css.envEditor,
+            rows: 3,
+            spellCheck: false,
+            'aria-label': t('setBuildEnv'),
+            value: envText,
+            disabled: busy || status === null,
+            placeholder: 'CC=/usr/bin/gcc-11\nCXX=/usr/bin/g++-11',
+            onChange: (event: { target: { value: string } }) => { setEnvText(event.target.value) },
+          }),
+          h('div', { className: css.setActions },
+            h(Button, {
+              variant: 'primary',
+              size: 'sm',
+              disabled: busy || status === null,
+              onClick: () => { void onSaveEnv() },
+            }, t('setBuildEnvSave'))),
+        ),
+        status?.selfManaged === true ? row(t('setSelfRemove'),
+          status.selfUninstallReachable ? t('setSelfRemoveHint') : t('setSelfRemoveRemote'),
+          status.selfUninstallReachable && phase !== 'confirming' && !busy
+            ? h(Button, {
                 variant: 'outline',
                 size: 'sm',
                 className: css.setDanger,
                 disabled: busy,
                 onClick: () => { setPhase('confirming') },
-              }, t('setSelfRemove'))) : null,
-        status?.selfManaged === true && (phase === 'confirming' || busy)
+              }, t('setSelfRemove'))
+            : null) : null,
+        status?.selfManaged === true && status.selfUninstallReachable && (phase === 'confirming' || busy)
           ? h('div', { className: css.setConfirm },
               h('div', { className: css.setHint }, t('setSelfConfirm')),
               h('label', { className: css.setCheck },

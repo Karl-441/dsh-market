@@ -6,8 +6,8 @@
  * mounts every entry, then `assertEntriesActivated` throws for the first one
  * that failed, so ONE broken plugin means `dsh web` exits and the browser is
  * left holding a dead origin. The market's own UI dies with the host it was
- * serving from, and the user's only way back was editing cordis.patch.yml by
- * hand (the #575 report measured 24 restarts before someone did).
+ * serving from, and the only way back used to be editing cordis.patch.yml by
+ * hand.
  *
  * So the detached restart helper (src/restart.ts) hands off to THIS module
  * when the replacement it spawned never bound the port. This process is not
@@ -33,10 +33,10 @@ import { spawn } from 'node:child_process'
 import { appendFileSync, openSync, readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { connect } from 'node:net'
-import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readJsonBody, sameOrigin, sendJson } from './http.ts'
+import { redactHomePaths } from './log-redaction.ts'
 import { disableRow, enableRow } from './patch.ts'
 import { addProfileBundle, removeProfileBundle } from './profile.ts'
 
@@ -303,6 +303,14 @@ export function matchFailureToPlugins(
 
 /** The plugin view the UI renders: inventory plus what the failure implicated. */
 export interface RecoveryPluginView extends RecoveryPlugin {
+  /**
+   * The switch position the surface OPENS on, not the plugin's current state.
+   * For a plugin this boot blamed — and that can be switched at all — the fix
+   * is "off", so the box starts off: that is the contract the failure prompt
+   * makes ("the plugins DSH blamed are marked red and left unticked"), and
+   * leaving the user to untick a red row by hand is a weaker one.
+   */
+  enabled: boolean
   implicated: boolean
   /** The reason the boot named, when it named this plugin. */
   reason?: string
@@ -320,11 +328,23 @@ export interface RecoveryPayload {
   plugins: RecoveryPluginView[]
   /** Names DSH blamed that this surface cannot switch. */
   unmatched: BootFailureEntry[]
+  /** Write errors from the last apply, when the choice could not be written in full. */
+  lastErrors: string[]
   logPath: string
 }
 
-/** Build the payload from the config and the parsed failure. */
-export function recoveryPayload(config: RecoveryConfig, failure: BootFailure): RecoveryPayload {
+/**
+ * Build the payload from the config and the parsed failure.
+ * @param config - the recovery config written before the restart.
+ * @param failure - the failure parsed from the replacement's log.
+ * @param lastErrors - write errors from the previous apply, if it did not land.
+ * @returns the payload both surfaces render.
+ */
+export function recoveryPayload(
+  config: RecoveryConfig,
+  failure: BootFailure,
+  lastErrors: readonly string[] = [],
+): RecoveryPayload {
   const { implicated, reasons, unmatched } = matchFailureToPlugins(config.plugins, failure)
   return {
     ok: true,
@@ -336,13 +356,19 @@ export function recoveryPayload(config: RecoveryConfig, failure: BootFailure): R
     failure,
     plugins: config.plugins.map((plugin) => {
       const reason = reasons.get(plugin.name)?.reason
+      const blamed = implicated.has(plugin.name)
       return {
         ...plugin,
-        implicated: implicated.has(plugin.name),
+        // Blame is a recommendation and the recommendation is OFF — see
+        // RecoveryPluginView.enabled. A plugin that cannot be switched keeps
+        // its state: there is nothing the user could do with another position.
+        enabled: blamed && plugin.toggleable ? false : plugin.enabled,
+        implicated: blamed,
         ...(reason === undefined ? {} : { reason }),
       }
     }),
     unmatched,
+    lastErrors: [...lastErrors],
     logPath: config.logs.err,
   }
 }
@@ -451,6 +477,11 @@ export async function respawnAndWatch(config: RecoveryConfig): Promise<boolean> 
       stdio: ['ignore', openSync(config.logs.out, 'a'), openSync(config.logs.err, 'a')],
       env: process.env,
       shell: config.spawn.viaShell,
+      // The recovery server runs without a console (it is spawned detached by
+      // the helper), so a console child would be handed a new, visible one
+      // (#624). Same flag the restart helper uses for this reason; on POSIX it
+      // is inert.
+      windowsHide: true,
     })
   } catch (cause) {
     note(config, `could not start the replacement: ${cause instanceof Error ? cause.message : String(cause)}`)
@@ -482,6 +513,39 @@ export async function respawnAndWatch(config: RecoveryConfig): Promise<boolean> 
   return false
 }
 
+/**
+ * Whether a process is still running, by the only portable test: signal 0.
+ * `EPERM` counts as alive — the process exists and belongs to someone else,
+ * which for this purpose is the same answer.
+ */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (cause) {
+    return (cause as { code?: string }).code !== 'ESRCH'
+  }
+}
+
+/**
+ * Wait for the replacement process to be gone.
+ *
+ * Taking the port while the replacement is still booting is what turned a
+ * slow start into a deadlock (#719): the helper gave up at 28s, the recovery
+ * surface bound the port, and the replacement — which binds at ~42-45s on a
+ * source-run host — died on EADDRINUSE. Nothing could then come back, because
+ * the process that had just been killed was the real host.
+ * @returns true when the process is gone, false when it outlasted the wait.
+ */
+async function waitForProcessGone(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (processAlive(pid)) {
+    if (Date.now() > deadline) return false
+    await sleep(250)
+  }
+  return true
+}
+
 /** Wait for a port to stop answering, so a new listener can take it. */
 async function waitForPortFree(port: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
@@ -502,8 +566,7 @@ async function waitForPortFree(port: number, timeoutMs: number): Promise<boolean
  * one unreadable line, which is the opposite of what the export is for.
  */
 function redactLog(text: string): string {
-  return text
-    .replaceAll(homedir(), '~')
+  return redactHomePaths(text)
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***')
     .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, 'gh*_***')
     .replace(/npm_[A-Za-z0-9]{16,}/g, 'npm_***')
@@ -540,6 +603,7 @@ const PAGE_TEXT = {
     idle: '长时间无人操作后本页会自动释放端口。',
     changes: '将要改动：',
     nothing: '没有需要改动的插件，直接重启。',
+    writeFailed: '上次的选择没能完整写入，因此没有重启：',
   },
   en: {
     title: 'DeepSeek Harness failed to start',
@@ -559,6 +623,7 @@ const PAGE_TEXT = {
     idle: 'This page releases the port on its own after a long idle period.',
     changes: 'Changes:',
     nothing: 'Nothing to change — restarting.',
+    writeFailed: 'The last choice could not be written in full, so nothing was restarted:',
   },
 } as const
 
@@ -620,6 +685,7 @@ export function recoveryPageHtml(lang: PageLang): string {
   <h1>${text.title}</h1>
   <p class="lead">${text.lead}</p>
   <div class="err" id="err"><b id="errTitle">…</b><pre id="tail"></pre></div>
+  <div class="err hidden" id="writeErr"><b id="writeErrTitle"></b><pre id="writeErrDetail"></pre></div>
   <h2 id="blamedHeading">${text.failed}</h2>
   <ul id="list"></ul>
   <p class="note" id="unmatched"></p>
@@ -643,6 +709,11 @@ export function recoveryPageHtml(lang: PageLang): string {
     if (state === null) return
     document.getElementById('errTitle').textContent = state.failure.summary || T.none
     document.getElementById('tail').textContent = state.failure.tail || ''
+    if (state.lastErrors && state.lastErrors.length > 0) {
+      document.getElementById('writeErr').classList.remove('hidden')
+      document.getElementById('writeErrTitle').textContent = T.writeFailed
+      document.getElementById('writeErrDetail').textContent = state.lastErrors.join('\n')
+    }
     document.getElementById('logPath').textContent = state.logPath ? T.log + ': ' + state.logPath : ''
     document.getElementById('blamedHeading').textContent = state.failure.entries.length > 0 ? T.failed : T.plugins
     if (state.unmatched.length > 0) {
@@ -804,7 +875,7 @@ function pageLang(request: IncomingMessage): PageLang {
 export async function startRecoveryServer(
   config: RecoveryConfig,
   failure: BootFailure,
-  options: { port?: number; idleTimeoutMs?: number } = {},
+  options: { port?: number; idleTimeoutMs?: number; lastErrors?: readonly string[] } = {},
 ): Promise<RecoveryServer> {
   let currentFailure = failure
   let applyRequested: ((enabled: string[]) => void) | null = null
@@ -844,7 +915,7 @@ export async function startRecoveryServer(
       return
     }
     if (path === '/dsh-market/recovery') {
-      sendJson(response, 200, recoveryPayload(config, currentFailure))
+      sendJson(response, 200, recoveryPayload(config, currentFailure, options.lastErrors ?? []))
       return
     }
     // The market page in the tab that started the restart keeps polling this
@@ -1000,7 +1071,7 @@ export async function startRecoveryServer(
  */
 export async function runRecovery(
   config: RecoveryConfig,
-  facts: { exitCode: number | null; bound: boolean } = { exitCode: null, bound: false },
+  facts: { exitCode: number | null; bound: boolean; replacementPid?: number | null } = { exitCode: null, bound: false },
   options: { port?: number; idleTimeoutMs?: number } = {},
 ): Promise<'booted' | 'released' | 'idle'> {
   let failure = parseBootFailure(readLog(config.logs.err))
@@ -1014,6 +1085,30 @@ export async function runRecovery(
   }
   note(config, `recovery surface starting on port ${String(options.port ?? config.port)} — ${failure.summary}`)
   const servePort = options.port ?? config.port
+  /** Write errors from the previous apply; they travel into the next payload. */
+  let writeErrors: string[] = []
+  // A port that ANSWERS is proof the host came up, and it needs no pid to say
+  // so (#854). The helper's pid is the process IT spawned, which on Windows is
+  // the `powershell.exe` wrapper rather than the node host that binds — so the
+  // guard below cannot be trusted on its own, and a helper that gave up late
+  // handed this surface a pid that was already gone while the host was still
+  // starting. Asking the socket settles it either way.
+  if (servePort !== null && servePort !== 0 && await portListening(servePort)) {
+    note(config, `port ${String(servePort)} is already answering — the host came up after all; leaving it alone`)
+    return 'booted'
+  }
+  // The replacement is not necessarily dead just because it has not bound the
+  // port: on a slow host it is still starting. It gets the same grace as a
+  // released port before the surface takes the port out from under it (#719).
+  if (facts.replacementPid !== null && facts.replacementPid !== undefined && facts.replacementPid > 0
+    && processAlive(facts.replacementPid)) {
+    note(config, `the replacement (pid ${String(facts.replacementPid)}) is still starting — waiting for it before taking port ${String(servePort ?? config.port)}`)
+    if (!(await waitForProcessGone(facts.replacementPid, PORT_FREE_TIMEOUT_MS))) {
+      note(config, `the replacement (pid ${String(facts.replacementPid)}) is still running after ${String(PORT_FREE_TIMEOUT_MS / 1000)}s and has not bound the port — serving anyway`)
+    } else {
+      note(config, `the replacement (pid ${String(facts.replacementPid)}) exited — serving the recovery surface`)
+    }
+  }
   for (;;) {
     // A failed attempt may still be holding the port while it disposes: binding
     // over it would fail, and the surface the user is looking at would vanish
@@ -1022,7 +1117,7 @@ export async function runRecovery(
       note(config, `port ${String(servePort)} never came free — nothing left to serve on`)
       return 'released'
     }
-    const surface = await startRecoveryServer(config, failure, options)
+    const surface = await startRecoveryServer(config, failure, { ...options, lastErrors: writeErrors })
     const outcome = await surface.finished
     if (outcome.kind !== 'apply') return outcome.kind
     // THE WRITE. The surface only collected the ticks; this is where they
@@ -1030,7 +1125,16 @@ export async function runRecovery(
     // change). Without it the user's decision is thrown away and the same
     // broken composition is booted again — the bug the demo plugin found.
     const applied = await applyRecovery(config, outcome.enabled)
-    for (const error of applied.errors) note(config, `could not write the choice: ${error}`)
+    if (!applied.ok) {
+      // A partial write leaves the profile neither as the user asked nor as it
+      // was, so booting it would be booting a guess. Come back to the surface
+      // with the errors instead, and let the user retry or fix the patch file.
+      writeErrors = [...applied.errors]
+      for (const error of applied.errors) note(config, `could not write the choice: ${error}`)
+      note(config, 'the choice could not be written in full — back to the recovery surface')
+      continue
+    }
+    writeErrors = []
     note(config, `wrote ${String(applied.changes.length)} change(s): ${applied.changes.map(change => (change.to ? '+' : '-') + change.name).join(', ') || 'none'}`)
     const booted = await respawnAndWatch(config)
     if (booted) {
@@ -1067,12 +1171,17 @@ export async function runRecoveryCli(argv: readonly string[]): Promise<void> {
   }
   const exitArg = argv.find(argument => argument.startsWith('--exit='))
   const boundArg = argv.find(argument => argument.startsWith('--bound='))
+  // The replacement's pid, handed over by the helper so this surface can tell
+  // "the host is dead" from "the host is still starting" (#719).
+  const pidArg = argv.find(argument => argument.startsWith('--pid='))
   const exitCode = exitArg === undefined ? null : Number(exitArg.slice('--exit='.length))
   const bound = boundArg?.slice('--bound='.length) === '1'
+  const replacementPid = pidArg === undefined ? null : Number(pidArg.slice('--pid='.length))
   try {
     const outcome = await runRecovery(config, {
       exitCode: exitCode === null || Number.isNaN(exitCode) ? null : exitCode,
       bound,
+      replacementPid: replacementPid === null || Number.isNaN(replacementPid) ? null : replacementPid,
     })
     note(config, `recovery surface finished: ${outcome}`)
   } catch (cause) {

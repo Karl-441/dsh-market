@@ -18,7 +18,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from 'react'
-import { Button, IconWarningOutline16, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconWarningOutline16 } from './icons.ts'
 import css from './Market.module.css'
 import { api, type Translate } from './market-data.ts'
 
@@ -54,7 +55,25 @@ export interface RecoveryView {
   plugins: RecoveryPluginView[]
   /** Names DSH blamed that this surface cannot switch. */
   unmatched: RecoveryFailureEntry[]
+  /** Write errors from the last apply, when the choice could not be written in full. */
+  lastErrors: string[]
   logPath: string
+}
+
+/**
+ * The switch positions a surface OPENS on, taken straight from the payload.
+ *
+ * Extracted because this is the production initialisation both surfaces
+ * depend on: the payload already carries the recommended position (off for a
+ * plugin this boot blamed — see RecoveryPluginView.enabled in
+ * src/recovery.ts), so the client's job is to copy it, not to re-derive it. A
+ * test that hand-builds `keep` proves nothing about what a user actually
+ * sees, which is how "unticked by default" shipped unimplemented once.
+ * @param view - the recovery payload.
+ * @returns the initial checkbox state, keyed by plugin name.
+ */
+export function initialKeep(view: RecoveryView): Record<string, boolean> {
+  return Object.fromEntries(view.plugins.map(plugin => [plugin.name, plugin.enabled]))
 }
 
 /** Whether a payload really is the recovery surface's answer. */
@@ -210,6 +229,12 @@ export function RecoveryPanel(props: RecoveryPanelProps): ReactElement | null {
         <IconWarningOutline16 size={14} className={css.bannerIcon} />
         <span>{view.failure.summary || t('recoveryNoSummary')}</span>
       </div>
+      {view.lastErrors.length > 0 && (
+        <div className={css.recoverySummary}>
+          <IconWarningOutline16 size={14} className={css.bannerIcon} />
+          <span>{t('recoveryWriteFailed')}{view.lastErrors.join('; ')}</span>
+        </div>
+      )}
       {view.failure.tail !== '' && (
         <details className={css.recoveryLog}>
           <summary>{t('recoveryRawLog')}</summary>

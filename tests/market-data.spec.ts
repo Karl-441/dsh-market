@@ -6,10 +6,10 @@
  * behind a working fallback.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  entryForDep, extractReadmeImageCandidates, extractReadmeImages, formatCount, groupSwitchState, installedForCatalog, isInstalled, isMarketItself, looksTerminal, matchInstalledName, orderedCategories, pageItems, pluginCategories, pluginsForFavorites, previewDimensionScore, rankThemeScreenshots, safeScreenshots, staleFavoriteUrls, themePlugins, visiblePlugins, humanOutput, catalogEntryForInstalled} from '../src/client/market-data.ts'
-import type { RegistryPlugin, ScreenshotCandidate } from '../src/client/market-data.ts'
+  entryForDep, installCommandFor, extractReadmeImageCandidates, extractReadmeImages, formatCount, groupSwitchState, installedForCatalog, isInstalled, isMarketItself, localizeBilingual, localizeBilingualList, looksTerminal, matchInstalledName, orderedCategories, pageItems, pluginCategories, pluginScreenshotCandidates, pluginsForFavorites, previewDimensionScore, rankThemeScreenshots, releaseNotesHttpsImage, resetGithubRouting, resetScreenshotsCache, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins, visiblePlugins, humanOutput, failureText, catalogEntryForInstalled} from '../src/client/market-data.ts'
+import type { RegistryPlugin, ScreenshotCandidate, ScreenshotRejection } from '../src/client/market-data.ts'
 
 function plugin(partial: Partial<RegistryPlugin>): RegistryPlugin {
   return { name: 'x', owner: 'o', url: 'https://github.com/o/x', category: 'tool', ...partial }
@@ -31,6 +31,24 @@ describe('looksTerminal', () => {
   it('still warns for plugins that positively target a terminal surface', () => {
     expect(looksTerminal(plugin({ name: 'dsh-tui' }), 'en')).toBe(true)
     expect(looksTerminal(plugin({ description: { zh: '为 DSH 提供命令行界面。' } }), 'zh')).toBe(true)
+    expect(looksTerminal(plugin({ description: { en: 'A terminal UI for DSH sessions.' } }), 'en')).toBe(true)
+  })
+
+  it('does not call a web plugin terminal-only because a companion CLI is mentioned (#931)', () => {
+    // Reported shape: a web plugin (client platform + bundle) whose catalog
+    // description also says the repository ships a CLI. The bare mention used
+    // to trigger "may not work in the web app" on the install confirmation.
+    expect(looksTerminal(plugin({
+      name: 'dsh-plugin-compat-check',
+      description: {
+        en: 'Web compatibility settings panel and plugin-detail findings. The repository also ships a CLI.',
+        zh: '网页兼容性设置面板与插件详情检查。仓库里另外提供了一个 CLI。',
+      },
+    }), 'en')).toBe(false)
+    expect(looksTerminal(plugin({
+      name: 'dsh-plugin-compat-check',
+      description: { zh: '网页兼容性设置面板与插件详情检查。仓库里另外提供了一个 CLI。' },
+    }), 'zh')).toBe(false)
   })
 })
 
@@ -281,6 +299,51 @@ describe('matchInstalledName / isInstalled', () => {
     expect(matchInstalledName(exact, pinned)).toBe('plugin-a')
     expect(matchInstalledName(sibling, pinned)).toBeNull()
   })
+
+  it('reads an npm-installed monorepo subpackage through the bare root its manifest publishes (#605)', () => {
+    // The shape the ecosystem usually publishes: `repository` names the
+    // collection while `repository.directory` is absent, so the server's
+    // evidence is the bare root alone — the case the test above does not
+    // cover, because it feeds root AND #path together, which is what
+    // githubRepoIdentities returns only when a directory IS declared.
+    //
+    // entryIdentities still carries the entry's npm name here, but
+    // sameSourceConflict() read root-vs-#path:/sub as two different sources
+    // and returned before any identity was compared, so the strongest
+    // evidence available never got a chance to match and Discover kept
+    // offering Install on a running plugin.
+    const entry = plugin({
+      name: 'dsh-web#packages/dsh-task-board',
+      npm: '@linxin666/dsh-client-ui-task-board',
+      url: 'https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-task-board',
+    })
+    const installed = { '@linxin666/dsh-client-ui-task-board': '^0.3.22' }
+    const repoIdentities = { '@linxin666/dsh-client-ui-task-board': ['zhu1090093659/dsh-web'] }
+
+    expect(matchInstalledName(entry, installed, repoIdentities, [entry]))
+      .toBe('@linxin666/dsh-client-ui-task-board')
+  })
+
+  it('keeps bare-root evidence from claiming a sibling subpackage of the same monorepo (#605)', () => {
+    // Root evidence says which repository, never which package inside it. The
+    // fix must not be "let the bare root satisfy entryIdentities" — that would
+    // hand the whole collection to whichever sibling the catalog lists first.
+    const sibling = plugin({
+      name: 'dsh-web#packages/dsh-git-graph',
+      url: 'https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-git-graph',
+    })
+    const installed = { '@linxin666/dsh-client-ui-task-board': '^0.3.22' }
+    const repoIdentities = { '@linxin666/dsh-client-ui-task-board': ['zhu1090093659/dsh-web'] }
+
+    expect(matchInstalledName(sibling, installed, repoIdentities, [sibling])).toBeNull()
+
+    // The collection's own root entry, by contrast, has always identified the
+    // subpackage it contains (#170) — relaxing the conflict check must leave
+    // that working.
+    const root = plugin({ name: 'dsh-web', url: 'https://github.com/zhu1090093659/dsh-web' })
+    expect(matchInstalledName(root, installed, repoIdentities, [root]))
+      .toBe('@linxin666/dsh-client-ui-task-board')
+  })
 })
 
 describe('entryForDep', () => {
@@ -350,6 +413,21 @@ describe('discover list (visiblePlugins)', () => {
       'dsh-mcp-panel',
       'popular-agent',
     ])
+  })
+
+  it('lets the selected sort order names that start with the query and names that contain it (#815)', () => {
+    // The reporter's search: both names hold `computer-use` as a phrase; only
+    // the less popular one happens to start with it.
+    const rows: RegistryPlugin[] = [
+      plugin({ name: 'computer-use-vision', downloads: 355, stars: 1 }),
+      plugin({ name: 'dsh-computer-use', downloads: 3_600, stars: 53 }),
+    ]
+    const names = (sort: string) => visiblePlugins(rows, {
+      category: 'all', query: 'computer-use', lang: 'zh', sort,
+    }).map(p => p.name)
+    expect(names('downloads-desc')).toEqual(['dsh-computer-use', 'computer-use-vision'])
+    expect(names('stars-desc')).toEqual(['dsh-computer-use', 'computer-use-vision'])
+    expect(names('downloads-asc')).toEqual(['computer-use-vision', 'dsh-computer-use'])
   })
 
   it('normalizes punctuation and keeps exact package names ahead of longer prefixes', () => {
@@ -612,6 +690,13 @@ describe('group switch derivation (#60)', () => {
 })
 
 describe('screenshots (#61)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    resetScreenshotsCache()
+    resetGithubRouting()
+  })
+
   it('safeScreenshots keeps only https GitHub-hosted raster images, deduped and capped', () => {
     expect(safeScreenshots([
       'https://raw.githubusercontent.com/o/r/main/a.png',
@@ -629,6 +714,77 @@ describe('screenshots (#61)', () => {
     // capped at 6
     const many = Array.from({ length: 9 }, (_, i) => `https://raw.githubusercontent.com/o/r/main/s${i}.png`)
     expect(safeScreenshots(many)).toHaveLength(6)
+  })
+
+  it('reports each refused candidate with its reason, and refuses exactly the same values', () => {
+    const png = 'https://raw.githubusercontent.com/o/r/main/a.png'
+    const svg = 'https://raw.githubusercontent.com/o/r/main/logo.svg'
+    const badHost = 'https://evil.example/track.png'
+    const notHttps = 'http://raw.githubusercontent.com/o/r/main/b.png'
+    const unparseable = 'not a url'
+    const rejected: ScreenshotRejection[] = []
+
+    // The accepted list is byte-for-byte the old one — 42 included.
+    expect(safeScreenshots(
+      [png, svg, badHost, notHttps, unparseable, 42, png],
+      { onReject: rejection => { rejected.push(rejection) } },
+    )).toEqual([png])
+    expect(rejected).toEqual([
+      { value: svg, reason: 'svg is not rendered' },
+      { value: badHost, reason: 'host not allowlisted (evil.example)' },
+      { value: notHttps, reason: 'not https' },
+      { value: unparseable, reason: 'not a parseable URL' },
+      { value: 42, reason: 'not a string' },
+    ])
+  })
+
+  it('warns once per catalog entry whose declared screenshots are all refused, and still falls back to README', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const svg = 'https://raw.githubusercontent.com/o/r/HEAD/docs/preview.svg'
+    const fromReadme = 'https://raw.githubusercontent.com/o/r/HEAD/docs/readme-preview.png'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      `## Screenshots / 截图\n![full preview](${fromReadme})\n`,
+      { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } },
+    )))
+    const entry = plugin({ name: 'svg-only-entry', url: 'https://github.com/o/r', screenshots: [svg, svg] })
+
+    // Every declared shot is refused, so the README fallback is what renders —
+    // and that is worth one line, because nothing else says why.
+    expect((await pluginScreenshotCandidates(entry)).map(candidate => candidate.src)).toEqual([fromReadme])
+    await pluginScreenshotCandidates(entry)
+    expect(warn).toHaveBeenCalledTimes(1)
+    const line = String(warn.mock.calls[0]![0])
+    expect(line).toContain('svg-only-entry')
+    expect(line).toContain(svg)
+    expect(line).toContain('svg is not rendered')
+  })
+
+  it('sanitizeReleaseNotesBody drops pasted HTML images and other tags without eating prose', () => {
+    const body = [
+      'Open the Context tab from the chat stats line.',
+      '<img width="999" height="148" alt="image" src="https://github.com/user-attachments/assets/d732b30f-2649-4758-bc7a-c57a1cac6e14" />',
+      '',
+      'More <strong>detail</strong> with an <a href="https://example.com">label</a>.',
+      '![ok](https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)',
+    ].join('\n')
+    const cleaned = sanitizeReleaseNotesBody(body)
+    expect(cleaned).not.toContain('<img')
+    expect(cleaned).not.toContain('<strong>')
+    expect(cleaned).toContain('Open the Context tab from the chat stats line.')
+    expect(cleaned).toContain('More detail with an label.')
+    expect(cleaned).toContain('![ok](https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)')
+  })
+
+  it('releaseNotesHttpsImage accepts allowlisted https markdown images only', () => {
+    expect(releaseNotesHttpsImage(
+      '![shot](https://github.com/user-attachments/assets/d732b30f-2649-4758-bc7a-c57a1cac6e14)',
+    )).toEqual({
+      alt: 'shot',
+      src: 'https://github.com/user-attachments/assets/d732b30f-2649-4758-bc7a-c57a1cac6e14',
+    })
+    expect(releaseNotesHttpsImage('![x](https://evil.example/a.png)')).toBeNull()
+    expect(releaseNotesHttpsImage('![x](assets/local.png)')).toBeNull()
+    expect(releaseNotesHttpsImage('not an image')).toBeNull()
   })
 
   it('extractReadmeImages ranks screenshot evidence ahead of title logos and keeps scanning past six images', () => {
@@ -712,6 +868,87 @@ describe('humanOutput', () => {
   it('leaves ordinary output and malformed lines alone', () => {
     expect(humanOutput('plain error\n{not json\n')).toBe('plain error\n{not json')
     expect(humanOutput('')).toBe('')
+  })
+})
+
+describe('failureText', () => {
+  it('keeps the market\'s own sentence whole, and clips only pnpm\'s output (#848)', () => {
+    // The sentences the routes write are bilingual — Chinese first, then
+    // English — so keeping the last 600 characters kept the English and threw
+    // the Chinese away. Every one of them is bounded by construction; pnpm's
+    // output is the unbounded one.
+    const sentence = `${'中'.repeat(400)} / ${'en'.repeat(400)}`
+    expect(sentence.length).toBeGreaterThan(600)
+    const shown = failureText({ error: sentence, stderr: 'IGNORED', stdout: '', exitCode: 1 })
+    expect(shown).toBe(sentence)
+    expect(shown.startsWith('中')).toBe(true)
+  })
+
+  it('falls back to the tail of pnpm\'s output, dropping progress chatter', () => {
+    const shown = failureText({
+      stderr: [
+        '{"name":"pnpm:fetching-progress","downloaded":1}',
+        `ERR_PNPM_SOMETHING  ${'x'.repeat(700)}`,
+      ].join('\n'),
+      stdout: '',
+      exitCode: 1,
+    })
+    expect(shown.length).toBe(600)
+    expect(shown).not.toContain('fetching-progress')
+    expect(shown.endsWith('x'.repeat(10))).toBe(true)
+  })
+
+  it('honours the caller\'s window and its own fallback', () => {
+    // The uninstall path wants a shorter line and asks for it; the two
+    // callers that show 'error' rather than "exit undefined" say so.
+    expect(failureText({ stderr: 'y'.repeat(500) }, { tail: 400 }).length).toBe(400)
+    expect(failureText({ stderr: '', stdout: '', exitCode: '' }, { fallback: 'error' })).toBe('error')
+    expect(failureText({ stderr: '', stdout: '', exitCode: 3 })).toBe('exit 3')
+  })
+
+  it('reads a route field that arrived as an object with text', () => {
+    expect(failureText({ error: { text: 'the cause', other: 1 } })).toBe('the cause')
+    expect(failureText({ error: { code: 7 } })).toBe('{"code":7}')
+  })
+})
+
+describe('localizeBilingual', () => {
+  it('picks the Chinese half of a zh-first activation reason', () => {
+    const text = '未声明 dsh.bundle,已作为普通依赖安装,不会成为 profile 层 / no dsh.bundle — installed as a plain dependency, never a profile-layer plugin'
+    expect(localizeBilingual(text, 'zh')).toBe('未声明 dsh.bundle,已作为普通依赖安装,不会成为 profile 层')
+    expect(localizeBilingual(text, 'en')).toBe('no dsh.bundle — installed as a plain dependency, never a profile-layer plugin')
+  })
+
+  it('picks the Chinese half when English comes first', () => {
+    const text = 'JSON body is required / 需要 JSON body'
+    expect(localizeBilingual(text, 'zh')).toBe('需要 JSON body')
+    expect(localizeBilingual(text, 'en')).toBe('JSON body is required')
+  })
+
+  it('splits on the language join when the English half contains an em-dash', () => {
+    const text = 'theme activation failed — restart required / 主题启用失败，需要重启'
+    expect(localizeBilingual(text, 'zh')).toBe('主题启用失败，需要重启')
+    expect(localizeBilingual(text, 'en')).toBe('theme activation failed — restart required')
+  })
+
+  it('leaves monolingual and ambiguous strings alone', () => {
+    expect(localizeBilingual('already localized', 'zh')).toBe('already localized')
+    expect(localizeBilingual('left / right', 'en')).toBe('left / right')
+  })
+
+  it('localizes multiline warnings line by line', () => {
+    const text = '第一行中文 / first line\n第二行中文 / second line'
+    expect(localizeBilingual(text, 'zh')).toBe('第一行中文\n第二行中文')
+    expect(localizeBilingual(text, 'en')).toBe('first line\nsecond line')
+  })
+
+  it('joins multiple reasons without reusing the bilingual separator', () => {
+    const reasons = [
+      '未声明 dsh.bundle / no dsh.bundle',
+      '需要重启 / restart required',
+    ]
+    expect(localizeBilingualList(reasons, 'zh')).toBe('未声明 dsh.bundle；需要重启')
+    expect(localizeBilingualList(reasons, 'en')).toBe('no dsh.bundle; restart required')
   })
 })
 
@@ -819,5 +1056,153 @@ describe('installed-state matching stays cheap as the catalog grows (#262)', () 
     ]
     // Now ambiguous in the NEW catalog — the old count of 1 must not survive.
     expect(isInstalled(after[0]!, installed, {}, after, {})).toBe(false)
+  })
+})
+
+describe('local link:/file: matching stays cheap as the catalog grows (#589)', () => {
+  // The branch #262 left behind. A version-pinned dependency goes through
+  // looseMatchCount and its memo; a `link:` or `file:` one goes through
+  // findCatalogEntryForLocal, which had none — so the reporter measured
+  // ~300ms per repaint with a single local dependency against a 3,627-entry
+  // catalog, where the version-pinned path cost 1.1ms.
+  const catalog = (n: number): RegistryPlugin[] =>
+    Array.from({ length: n }, (_, i) => plugin({
+      name: `pkg-${i}`, npm: `pkg-${i}`, url: `https://github.com/o${i}/pkg-${i}`,
+    }))
+
+  it('makes a RE-render cheap, which is what typing in the search box costs', () => {
+    // Same property and the same sampling as the #262 test above: not a
+    // wall-clock budget, but "the catalog is scanned once, not once per
+    // render". Every keystroke re-renders the discover list.
+    const plugins = catalog(8000)
+    const installed: Record<string, string> = {}
+    for (let i = 0; i < 24; i++) installed[`pkg-${i}`] = `link:../pkg-${i}`
+    const render = (): number => {
+      const t0 = performance.now()
+      for (const p of plugins.slice(0, 48)) isInstalled(p, installed, {}, plugins, {})
+      return performance.now() - t0
+    }
+    const first = render()
+    let warm = Infinity
+    for (let i = 0; i < 5; i++) warm = Math.min(warm, render())
+    expect(first / Math.max(warm, 0.001)).toBeGreaterThan(10)
+  })
+
+  it('answers the post-install question, not the pre-install one (#485)', () => {
+    // The reason the key carries the evidence. Installing a plugin gives the
+    // next render a fresh identities array while the catalog array stays the
+    // same; a name-only key would hand back the verdict reached when the
+    // checkout still had no declared repo, which is how a different author's
+    // same-named plugin gets marked as installed.
+    const plugins = [
+      plugin({ name: 'dsh-humanizer', owner: 'lynote-ai', url: 'https://github.com/lynote-ai/dsh-humanizer', npm: 'dsh-humanizer' }),
+    ]
+    const spec = 'link:../dsh-humanizer'
+    expect(catalogEntryForInstalled(plugins, 'dsh-humanizer', spec)?.owner).toBe('lynote-ai')
+    // Same name, same catalog, evidence now says it is a fork.
+    expect(catalogEntryForInstalled(plugins, 'dsh-humanizer', spec, ['handsomeliu/dsh-humanizer'])).toBeUndefined()
+    // And back again, to prove neither answer poisoned the other.
+    expect(catalogEntryForInstalled(plugins, 'dsh-humanizer', spec, ['lynote-ai/dsh-humanizer'])?.owner).toBe('lynote-ai')
+    expect(catalogEntryForInstalled(plugins, 'dsh-humanizer', spec)?.owner).toBe('lynote-ai')
+  })
+
+  it('never lets a hint stand in for an identity', () => {
+    // The two are not interchangeable, so the key cannot treat them as one
+    // field. An identity is searched against the whole catalog; a hint only
+    // disambiguates rows that already matched by name. A local checkout the
+    // developer renamed, whose git origin still points at the catalog repo,
+    // matches on the identity and matches nothing on the hint.
+    const plugins = [plugin({ name: 'dsh-foo', npm: 'dsh-foo', url: 'https://github.com/x/dsh-foo' })]
+    const spec = 'link:../renamed'
+    expect(catalogEntryForInstalled(plugins, 'my-renamed-plugin', spec, [], ['x/dsh-foo'])).toBeUndefined()
+    expect(catalogEntryForInstalled(plugins, 'my-renamed-plugin', spec, ['x/dsh-foo'])?.url).toBe('https://github.com/x/dsh-foo')
+  })
+
+  it('does not leak a match between two different catalogs', () => {
+    // Keyed on the array identity, like looseMatchCountCache: a refetched
+    // catalog is a new array, so a verdict from the previous one cannot
+    // survive into it.
+    const before = [plugin({ name: 'solo', npm: 'solo', url: 'https://github.com/a/solo' })]
+    expect(catalogEntryForInstalled(before, 'solo', 'link:../solo')?.url).toBe('https://github.com/a/solo')
+    const after = [
+      plugin({ name: 'solo', npm: 'solo', url: 'https://github.com/a/solo' }),
+      plugin({ name: 'solo-two', npm: 'solo', url: 'https://github.com/b/solo-two' }),
+    ]
+    // Ambiguous in the NEW catalog, and with no evidence the matcher refuses.
+    expect(catalogEntryForInstalled(after, 'solo', 'link:../solo')).toBeUndefined()
+  })
+
+  it('caches a miss, instead of re-scanning to prove the absence again', () => {
+    // "No catalog row" costs the same full scan to establish as a hit does,
+    // so a miss is cached as null. Asserting only that it stays undefined
+    // would pass with no cache at all, and would not notice `if (hit)` in
+    // place of `if (hit !== undefined)` — which serves every cached null
+    // back as a fresh scan. So this is a ratio test like the one above, on
+    // a name the catalog does not have.
+    const plugins = catalog(8000)
+    const render = (): number => {
+      const t0 = performance.now()
+      for (let i = 0; i < 48; i++) catalogEntryForInstalled(plugins, 'absent', 'link:../absent')
+      return performance.now() - t0
+    }
+    const first = render()
+    let warm = Infinity
+    for (let i = 0; i < 5; i++) warm = Math.min(warm, render())
+    expect(first / Math.max(warm, 0.001)).toBeGreaterThan(10)
+    // ...and it is still a miss, however often it is asked.
+    expect(catalogEntryForInstalled(plugins, 'absent', 'link:../absent')).toBeUndefined()
+  })
+
+  it('tells an absent identity list from a present-but-empty one', () => {
+    // `[].join(sep)` and `[''].join(sep)` are the same string, and these are
+    // opposite questions: an empty-but-present list has size 1, enters the
+    // evidence branch, and refuses to guess; an absent one falls through to
+    // the unique-name match. A key built by joining answered both with
+    // whichever was asked first.
+    const plugins = [plugin({ name: 'solo', npm: 'solo', url: 'https://github.com/a/solo' })]
+    const spec = 'link:../solo'
+    expect(catalogEntryForInstalled(plugins, 'solo', spec, [], [])?.url).toBe('https://github.com/a/solo')
+    expect(catalogEntryForInstalled(plugins, 'solo', spec, [''], [])).toBeUndefined()
+    expect(catalogEntryForInstalled(plugins, 'solo', spec, [], [''])).toBeUndefined()
+    // Re-ask in the other order: the cached answers must not have merged.
+    expect(catalogEntryForInstalled(plugins, 'solo', spec, [], [])?.url).toBe('https://github.com/a/solo')
+  })
+})
+
+describe('installCommandFor (#872)', () => {
+  const catalog = 'dsh plugin --profile web add dsh-answer-reviewer'
+
+  it('names the profile this page actually runs in', () => {
+    // awesome-dsh-plugin writes the command once, for `web`. On any other
+    // profile — and the report's was `desktop` — copying it verbatim
+    // installed into the wrong place or nowhere at all.
+    expect(installCommandFor(catalog, 'work').command).toBe('dsh plugin --profile work add dsh-answer-reviewer')
+    expect(installCommandFor(catalog, 'web').command).toBe(catalog)
+  })
+
+  it('offers no command at all on a desktop profile, because none can work', () => {
+    // The DSH CLI refuses a profile by that name, so the command as printed
+    // cannot install anything there — handing it over would be worse than
+    // handing over nothing.
+    expect(installCommandFor(catalog, 'desktop')).toEqual({ command: null, unusable: true })
+    expect(installCommandFor(catalog, 'Desktop')).toEqual({ command: null, unusable: true })
+  })
+
+  it('leaves a command with no --profile token alone', () => {
+    const bare = 'dsh plugin add dsh-answer-reviewer'
+    expect(installCommandFor(bare, 'work')).toEqual({ command: bare, unusable: false })
+    expect(installCommandFor(bare, 'desktop')).toEqual({ command: bare, unusable: false })
+  })
+
+  it('keeps the catalog text when the profile is unknown', () => {
+    expect(installCommandFor(catalog, null).command).toBe(catalog)
+    expect(installCommandFor(catalog, '').command).toBe(catalog)
+    expect(installCommandFor(undefined, 'work')).toEqual({ command: null, unusable: false })
+    expect(installCommandFor('', 'work')).toEqual({ command: null, unusable: false })
+  })
+
+  it('handles the --profile=name spelling', () => {
+    expect(installCommandFor('dsh plugin --profile=web add x', 'work').command)
+      .toBe('dsh plugin --profile work add x')
   })
 })

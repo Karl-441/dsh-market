@@ -15,13 +15,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { dump } from 'js-yaml'
 import { mountMarketRoutes, type MarketHost } from '../src/routes.ts'
 import { sameOrigin } from '../src/http.ts'
+import { readMarketState, writeMarketState } from '../src/hot.ts'
+import { configurePersistentLog, readPersistentLog } from '../src/log.ts'
 import * as orderApi from '../src/order.ts'
 import type { PluginCommandRuntime } from '../src/dsh-cli.ts'
 
@@ -96,6 +98,8 @@ interface RequestOpts {
   body?: unknown
   /** Verbatim body bytes (malformed JSON / empty stream cases). */
   rawBody?: string
+  /** Peer address the download/restart fences read; loopback unless a test says otherwise. */
+  remoteAddress?: string
 }
 
 /** A fake IncomingMessage: headers + an async-iterable body (readJsonBody's only needs). */
@@ -110,6 +114,10 @@ function makeRequest(opts: RequestOpts): IncomingMessage {
     method: opts.method,
     url: opts.url,
     headers,
+    // Loopback by default, like the browser this route serves: the download
+    // fence reads `socket.remoteAddress`, and a request without a socket made
+    // that path throw instead of answering.
+    socket: { remoteAddress: opts.remoteAddress ?? '127.0.0.1' },
     [Symbol.asyncIterator]() {
       let i = 0
       return {
@@ -226,6 +234,8 @@ describe('method & Allow contract', () => {
     ['/dsh-market/bundle-order', 'GET', 'POST'],
     ['/dsh-market/snapshots', 'DELETE', 'GET, POST'],
     ['/dsh-market/restore-snapshot', 'GET', 'POST'],
+    ['/dsh-market/host-recovery', 'POST', 'GET'],
+    ['/dsh-market/host-recovery/restore', 'GET', 'POST'],
     ['/dsh-market/delete-snapshot', 'GET', 'POST'],
     ['/dsh-market/presets', 'DELETE', 'GET, POST'],
   ])('answers 405 with an Allow header on %s', async (path, method, allow) => {
@@ -241,6 +251,7 @@ describe('origin enforcement (POST routes)', () => {
     ['/dsh-market/bundle-order', { order: ['beta', 'alpha'] }],
     ['/dsh-market/snapshots', undefined],
     ['/dsh-market/restore-snapshot', { snapshot: 'snapshot-x' }],
+    ['/dsh-market/host-recovery/restore', { name: 'cordis.patch.yml.bak-1' }],
     ['/dsh-market/delete-snapshot', { snapshot: 'snapshot-x' }],
     ['/dsh-market/presets', { action: 'save', name: 'p' }],
   ]
@@ -257,9 +268,19 @@ describe('origin enforcement (POST routes)', () => {
     expect(jsonBody(res)).toEqual({ error: 'untrusted origin' })
   })
 
-  it.each(mutating)('rejects a POST %s with no Origin header at all', async (path, body) => {
+  it.each(mutating)('accepts a POST %s with no Origin header at all (#648)', async (path, body) => {
+    // The Desktop app's proxy strips Origin before forwarding, so its
+    // requests arrive exactly like this. They must reach the route: refusing
+    // the header's absence answered 403 to every Desktop mutation while
+    // protecting nothing a browser-driven cross-site POST (the case just
+    // above, still refused) does not already cover.
+    //
+    // `not.toBe(403)` rather than 200 on purpose: this fixture may fail the
+    // request for its own reasons, and the assertion is about the origin
+    // gate, not about the route's outcome.
     const res = await hit(routes, path as string, { method: 'POST', url: path as string, host: HOST, body })
-    expect(res.status).toBe(403)
+    expect(res.status).not.toBe(403)
+    expect(jsonBody(res)).not.toEqual({ error: 'untrusted origin' })
   })
 
   it('passes a matching Origin through (same-origin success path)', async () => {
@@ -504,6 +525,235 @@ describe('GET /dsh-market/installed — local repository evidence', () => {
   })
 })
 
+describe('GET /dsh-market/backup — a failure says why (#55)', () => {
+  // kettly1260 hit "Error: HTTP 500" and asked how to find out more: the route
+  // did answer with the reason, the client threw it away. Both ends are
+  // asserted here — the body carries the reason, and the log carries it too so
+  // a report can include it.
+  it('names the cap when the profile has more configuration files than a backup holds', async () => {
+    writeStandardProfile()
+    for (let i = 0; i < 300; i++) writeFileSync(join(dir, `conf-${String(i)}.yml`), `key: ${String(i)}\n`)
+    configurePersistentLog(join(tmp, 'log.ndjson'))
+    let res: Captured
+    try {
+      res = await hit(routes, '/dsh-market/backup', { method: 'GET', url: '/dsh-market/backup', host: HOST })
+    } finally { configurePersistentLog(null) }
+    expect(res.status).toBe(500)
+    const body = JSON.parse(res.body) as { error: string }
+    expect(body.error).toContain('配置文件超过 256 个')
+    expect(body.error).toContain('Export selected plugins instead')
+    expect(readPersistentLog(join(tmp, 'log.ndjson')).join('\n')).toContain('"event":"backup"')
+  })
+
+  it('still exports a profile inside the cap', async () => {
+    writeStandardProfile()
+    const res = await hit(routes, '/dsh-market/backup', { method: 'GET', url: '/dsh-market/backup', host: HOST })
+    expect(res.status).toBe(200)
+    expect(JSON.parse(res.body).files.length).toBeGreaterThan(0)
+  })
+})
+
+describe('POST /dsh-market/dismiss-broken (#763)', () => {
+  // #763: the removed-declaration notice is durable on purpose — it is the only
+  // thing left that can say why a plugin vanished. But when the plugin is gone
+  // from the catalog too, the one action it offered ("Find this plugin")
+  // searches for nothing, and the notice is a banner no user can remove. The
+  // entry has to stay explainable AND escapable: the user is allowed to stop
+  // being told, without the market pretending the plugin was repaired.
+
+  const BROKEN = { reason: 'incomplete-build-locked', at: '2026-09-29T00:00:00.000Z' } as const
+
+  /** Seed two notices on disk, then re-mount so the routes read them at boot. */
+  function seedBroken(a: string, b: string): void {
+    writeStandardProfile()
+    writeMarketState(dir, {
+      disabled: new Set(), groups: {}, groupOrder: [],
+      brokenPlugins: {
+        [a]: { spec: 'github:o/alpha', ...BROKEN },
+        [b]: { spec: 'github:o/beta', ...BROKEN },
+      },
+    })
+    routes = mount().routes
+  }
+
+  const listed = async (): Promise<Record<string, unknown>> =>
+    jsonBody(await hit(routes, '/dsh-market/installed', { method: 'GET', url: '/dsh-market/installed' }))
+      .brokenPlugins as Record<string, unknown>
+
+  it('keeps a cancel-caused removal across a restart, and keeps its reason (#663)', async () => {
+    // The notice is what explains the plugin's absence after the next start,
+    // and the next start is exactly when state.json is read back from disk. A
+    // reason the reader does not know is dropped there, which would make the
+    // cancel case vanish on restart — the one moment it was written for.
+    writeStandardProfile()
+    writeMarketState(dir, {
+      disabled: new Set(), groups: {}, groupOrder: [],
+      brokenPlugins: { 'dsh-pet': { spec: '^0.3.5', reason: 'incomplete-build-cancelled', at: '2026-10-08T00:27:20.000Z' } },
+    })
+    routes = mount().routes
+
+    expect(await listed()).toMatchObject({ 'dsh-pet': { spec: '^0.3.5', reason: 'incomplete-build-cancelled' } })
+  })
+
+  it('removes only the named notice and leaves the others standing', async () => {
+    seedBroken('dsh-alpha', 'dsh-beta')
+    expect(Object.keys(await listed()).sort()).toEqual(['dsh-alpha', 'dsh-beta'])
+
+    const res = await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    expect(res.status).toBe(200)
+    expect(jsonBody(res)).toMatchObject({ ok: true })
+    // The other notice is a different plugin's absence and still needs saying.
+    expect(Object.keys(await listed())).toEqual(['dsh-beta'])
+    // ...and the same on disk, not only in the reply.
+    expect(Object.keys(readMarketState(dir).brokenPlugins ?? {})).toEqual(['dsh-beta'])
+  })
+
+  it('survives a reload, so dismissing is not undone by the next start (#763)', async () => {
+    // The reporter refreshed the page, restarted DSH, updated the market itself
+    // and installed other plugins: the notice was still there. This is the half
+    // a reply-only fix would miss — the dismissal has to be persisted, not held
+    // in the in-memory state the request happened to touch.
+    seedBroken('dsh-alpha', 'dsh-beta')
+    await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    // A fresh mount is a fresh boot reading state.json: nothing in memory.
+    routes = mount().routes
+    expect(Object.keys(await listed())).toEqual(['dsh-beta'])
+    expect('dsh-alpha' in readMarketState(dir).brokenPlugins!).toBe(false)
+  })
+
+  it('keeps the reinstall auto-clear contract working alongside it (#663)', async () => {
+    // Two ways an entry leaves this map, and they must not fight: the market
+    // drops it when the plugin comes back, the user drops it when they stop
+    // wanting to hear about it. A dismiss must not resurrect a notice that
+    // install already cleared, and must not be blocked by one.
+    seedBroken('dsh-alpha', 'dsh-beta')
+    await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    const res = await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-beta' }))
+
+    // The last notice cleared must not leave an empty object behind claiming
+    // there is something broken: the notice is driven by keys existing.
+    expect(res.status).toBe(200)
+    expect(jsonBody(res)).toMatchObject({ ok: true, brokenPlugins: {} })
+    expect(await listed()).toEqual({})
+    expect(readMarketState(dir).brokenPlugins).toBeUndefined()
+    expect('brokenPlugins' in readRawState()).toBe(false)
+  })
+
+  it('is idempotent and never invents a notice for a name that has none', async () => {
+    seedBroken('dsh-alpha', 'dsh-beta')
+    await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    // Dismissing twice must be a no-op, not a second write that could race.
+    const again = await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    expect(again.status).toBe(200)
+    expect(jsonBody(again)).toMatchObject({ ok: true })
+    // A name that was never broken is not an error either: the client and the
+    // user can both be out of date, and refusing would strand the button.
+    const absent = await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-never-existed' }))
+    expect(absent.status).toBe(200)
+    expect(Object.keys(await listed())).toEqual(['dsh-beta'])
+  })
+
+  it('a dismiss that removes nothing does not touch the file or the log (#763 review)', async () => {
+    // The log is the durable record of what the market did (#663), and the
+    // reporter had to export one to get an answer. A line saying "the user hid
+    // the notice for X" for a name that had no notice is a false statement in
+    // the one file that is supposed to be true — and it is written on every
+    // double-click and every out-of-date client.
+    // Names unique to this spec: the in-memory log is shared across a test
+    // file, so a bare count of the event would also count the other specs here.
+    const mine = 'dsh-noop-probe'
+    seedBroken(mine, 'dsh-beta')
+    const dismiss = (name: string) =>
+      hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name }))
+    // The export renders every entry twice (a JSON line and a readable one), so
+    // count the machine form only — one event is one of those.
+    const linesFor = (body: string) =>
+      body.split('\n').filter(line => line.includes('"event":"broken-notice-dismissed"') && line.includes(mine))
+
+    // One real dismissal, to establish the line that must NOT grow after this.
+    await dismiss(mine)
+    const logsAfterReal = (await hit(routes, '/dsh-market/logs', { method: 'GET', url: '/dsh-market/logs' })).body
+    expect(linesFor(logsAfterReal)).toHaveLength(1)
+    expect(logsAfterReal).toContain('broken-notice-dismissed')
+    const stateAfterReal = readFileSync(join(dir, '.dsh-market', 'state.json'), 'utf8')
+
+    // The same name again, and a name that never had a notice.
+    await dismiss(mine)
+    await dismiss('dsh-never-existed')
+
+    const logsAfterNoop = (await hit(routes, '/dsh-market/logs', { method: 'GET', url: '/dsh-market/logs' })).body
+    expect(linesFor(logsAfterNoop)).toHaveLength(1)
+    // ...and the state file is byte-identical: a no-op that rewrote it would be
+    // indistinguishable from a real change to anyone reading the file later.
+    expect(readFileSync(join(dir, '.dsh-market', 'state.json'), 'utf8')).toBe(stateAfterReal)
+    // Still the authoritative list, and the other notice untouched.
+    expect(Object.keys(await listed())).toEqual(['dsh-beta'])
+  })
+
+  it('refuses a cross-origin dismiss and validates the name', async () => {
+    seedBroken('dsh-alpha', 'dsh-beta')
+
+    const cross = await hit(routes, '/dsh-market/dismiss-broken', {
+      method: 'POST', url: '/dsh-market/dismiss-broken', origin: 'http://evil.example', host: HOST, body: { name: 'dsh-alpha' },
+    })
+    expect(cross.status).toBe(403)
+    expect(jsonBody(cross)).toEqual({ error: 'untrusted origin' })
+
+    for (const body of [null, {}, { name: '' }, { name: '   ' }, { name: 42 }, { name: 'x'.repeat(215) }]) {
+      const res = await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', body))
+      expect(res.status).toBe(400)
+    }
+    // A rejected request must not have removed anything.
+    expect(Object.keys(await listed()).sort()).toEqual(['dsh-alpha', 'dsh-beta'])
+  })
+
+  it('answers GET with 405 rather than pretending the notice is dismissable that way', async () => {
+    seedBroken('dsh-alpha', 'dsh-beta')
+    const res = await hit(routes, '/dsh-market/dismiss-broken', { method: 'GET', url: '/dsh-market/dismiss-broken' })
+    expect(res.status).toBe(405)
+    expect(res.headers.allow).toBe('POST')
+  })
+
+  it('does not touch the leftover directory or the rest of the state (#763)', async () => {
+    // The notice explains an absence; dismissing it is a statement about the
+    // message, not a repair. Deleting the directory here would destroy the
+    // only thing the user can reinstall from, and would make "dismiss" mean
+    // two different things to the profile.
+    seedBroken('dsh-alpha', 'dsh-beta')
+    const leftover = join(dir, 'node_modules', 'dsh-alpha')
+    mkdirSync(leftover, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'web-profile', dependencies: { 'dsh-beta': '^1.0.0' } }))
+
+    await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    expect(existsSync(leftover)).toBe(true)
+    // The profile's own declarations are not this route's business either.
+    expect(JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).dependencies).toEqual({ 'dsh-beta': '^1.0.0' })
+  })
+
+  it('records the dismissal in the log without claiming the plugin was fixed', async () => {
+    // log.ndjson is the durable record of what the market did (#663). Wording
+    // matters here: "repaired" or "reinstalled" would be a false statement the
+    // user reads later, when they open the very directory this left in place.
+    seedBroken('dsh-alpha', 'dsh-beta')
+    await hit(routes, '/dsh-market/dismiss-broken', post('/dsh-market/dismiss-broken', { name: 'dsh-alpha' }))
+
+    const res = await hit(routes, '/dsh-market/logs', { method: 'GET', url: '/dsh-market/logs' })
+    expect(res.body).toContain('dsh-alpha')
+    expect(res.body).not.toMatch(/repaired|已修复|reinstalled|已重装/)
+  })
+})
+
+/** Raw state.json on disk, so a test can assert a key is absent, not just empty. */
+function readRawState(): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(dir, '.dsh-market', 'state.json'), 'utf8')) as Record<string, unknown>
+}
+
 describe('POST /dsh-market/bundle-order', () => {
   it('applies a valid community reorder: 200 with the merged stack, manifest rewritten', async () => {
     // #125/#126: the in-route pre-write safety net is the profile backup, and
@@ -704,11 +954,57 @@ describe('sameOrigin', () => {
     expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: 'http://127.0.0.1:9999' }))).toBe(false)
   })
 
-  it('refuses a request with no Origin or no Host', () => {
-    // Unlike the download navigation, a mutating POST must carry Origin.
-    expect(sameOrigin(req({ host: '127.0.0.1:3080' }))).toBe(false)
+  it('allows a request with no Origin at all (#648)', () => {
+    // INVERTED from what this asserted before, and the reason matters: the
+    // rule used to be "a mutating POST must carry Origin". Browsers do send
+    // it on every POST, so its absence means the caller is not a page — and
+    // a non-browser client can forge any Origin. Refusing the absence was
+    // therefore not a protection, while the Desktop app's proxy strips the
+    // header before forwarding and every Desktop mutation met 403.
+    expect(sameOrigin(req({ host: '127.0.0.1:3080' }))).toBe(true)
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: undefined as never }))).toBe(true)
+    expect(sameOrigin(req({}))).toBe(true)
+    // An Origin that is PRESENT but unparseable is still refused — including
+    // the empty string, which is a malformed header rather than an absent
+    // one. Only true absence is what a stripping proxy produces.
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: '' }))).toBe(false)
+    // And a present Origin still needs a Host to compare against.
     expect(sameOrigin(req({ origin: 'http://127.0.0.1:3080' }))).toBe(false)
-    expect(sameOrigin(req({}))).toBe(false)
+  })
+
+  it('refuses a DNS-rebinding request, where Origin and Host agree on the attacker (#678)', () => {
+    // The attack the equality check cannot see: the page is served from
+    // evil.com, that name resolves to 127.0.0.1, and the browser therefore
+    // connects to the loopback listener while sending Origin AND Host as
+    // evil.com. Equality holds for the attacker; Host is the only part of
+    // it they cannot forge, so it is what has to name a loopback authority.
+    expect(sameOrigin(req({ host: 'evil.com', origin: 'http://evil.com' }))).toBe(false)
+    expect(sameOrigin(req({ host: 'evil.com:3080', origin: 'http://evil.com:3080' }))).toBe(false)
+    // …including when the attacker omits Origin, which no browser does.
+    expect(sameOrigin(req({ host: 'evil.com' }))).toBe(false)
+  })
+
+  it('accepts every loopback spelling, because that is what the UI is served from', () => {
+    for (const host of ['127.0.0.1:3080', 'localhost:3080', '[::1]:3080']) {
+      expect(sameOrigin(req({ host, origin: `http://${host}` })), host).toBe(true)
+    }
+    // `localhost.evil.com` is a subdomain, not `localhost`.
+    expect(sameOrigin(req({ host: 'localhost.evil.com', origin: 'http://localhost.evil.com' }))).toBe(false)
+  })
+
+  it('still refuses a page whose Origin is present and different', () => {
+    // The half that has to survive: this is the CSRF case, and a browser
+    // always sends Origin here, so the check still sees it.
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: 'http://evil.example' }))).toBe(false)
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: 'http://127.0.0.1:9999' }))).toBe(false)
+  })
+
+  it('still refuses a sandboxed origin, which is present-but-unparseable', () => {
+    // `Origin: null` comes from a sandboxed iframe or a data: document. It is
+    // NOT an absent header, and reading it as one would reopen the CSRF hole
+    // this check exists for.
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: 'null' }))).toBe(false)
+    expect(sameOrigin(req({ host: '127.0.0.1:3080', origin: 'about:blank' }))).toBe(false)
   })
 
   it('refuses an Origin that does not parse, rather than trusting it', () => {
@@ -811,5 +1107,162 @@ describe('POST /dsh-market/restore-snapshot & /dsh-market/delete-snapshot', () =
     const res = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', { snapshot: 'snapshot-does-not-exist' }))
     expect(res.status).toBe(400)
     expect(String(jsonBody(res).error)).toMatch(/snapshot not found/)
+  })
+})
+
+describe('market state publication (#582 narrowest point)', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dshm-state-'))
+    mkdirSync(join(dir, '.dsh-market'), { recursive: true })
+  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  const statePath = () => join(dir, '.dsh-market', 'state.json')
+
+  it('leaves no half-written file and no temporary behind', () => {
+    writeMarketState(dir, { disabled: new Set(['a']), groups: {}, groupOrder: [] })
+    expect(readMarketState(dir).disabled.has('a')).toBe(true)
+    expect(readdirSync(join(dir, '.dsh-market')).some(name => name.endsWith('.new'))).toBe(false)
+  })
+
+  it('writes through a symlinked state file instead of replacing the link (#582)', () => {
+    const real = join(dir, 'state-elsewhere.json')
+    writeFileSync(real, JSON.stringify({ disabled: ['keep'] }))
+    symlinkSync(real, statePath())
+    writeMarketState(dir, { disabled: new Set(['a', 'keep']), groups: {}, groupOrder: [] })
+    expect(lstatSync(statePath()).isSymbolicLink()).toBe(true)
+    expect(JSON.parse(readFileSync(real, 'utf8')).disabled).toEqual(['a', 'keep'])
+  })
+
+  it('says so when the state file cannot be read, instead of silently coming back empty', () => {
+    // Every disable, group, favourite and exemption lives in this file. Coming
+    // back empty silently reads as "my plugins switched themselves back on".
+    writeFileSync(statePath(), '{"disabled": ["a"')
+    configurePersistentLog(join(dir, 'log.ndjson'))
+    try {
+      expect(readMarketState(dir).disabled.size).toBe(0)
+    } finally { configurePersistentLog(null) }
+    // The log is the only trace: the next write replaces the damaged file.
+    const logged = readPersistentLog(join(dir, 'log.ndjson')).join('\n')
+    expect(logged).toContain('market state could not be read')
+    // A warning, not an info line: it is the only trace this happened.
+    expect(logged).toContain('"level":"warn"')
+  })
+})
+
+describe('a client that reads its config from a name nothing serves (#810)', () => {
+  /** A bundle package that also ships a client bundle (what the scan reads). */
+  function writeClientBundle(name: string, source: string): void {
+    writeBundle(name)
+    const pkgDir = join(dir, 'node_modules', name)
+    const manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as {
+      dsh: Record<string, unknown>
+    }
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+      ...manifest,
+      exports: { './client': './lib/client.js' },
+      dsh: { ...manifest.dsh, client: { platform: 'web' } },
+    }))
+    mkdirSync(join(pkgDir, 'lib'), { recursive: true })
+    writeFileSync(join(pkgDir, 'lib', 'client.js'), source)
+  }
+
+  const getInstalled = async (): Promise<Record<string, unknown>> =>
+    jsonBody(await hit(routes, '/dsh-market/installed', { method: 'GET', url: '/dsh-market/installed' }))
+
+  it('names the package and the entry id it should have asked for', async () => {
+    // The reported shape: the client asks for its PACKAGE name while its own
+    // entry id is something else. The row needs both — the mistake to be
+    // believable and the value to write instead.
+    writeProfile(['alpha'])
+    writeClientBundle('alpha', 'var NAMESPACE = "alpha"\nctx.configForms.get(NAMESPACE)')
+
+    expect((await getInstalled()).configNamespaces).toEqual([
+      { name: 'alpha', namespaces: ['alpha'], ownEntryIds: ['alpha-entry'] },
+    ])
+  })
+
+  it('stays quiet when an entry id answers to that name, whoever declares it', async () => {
+    // Served by ANOTHER package's row counts: a carrier bundle mounts ids of
+    // its own, and judging by the asking package's ids alone would flag it.
+    writeProfile(['alpha', 'beta'])
+    writeBundle('beta', { entries: [{ id: 'shared-entry', name: 'beta' }] })
+    writeClientBundle('alpha', 'ctx.configForms.get("shared-entry")')
+
+    expect((await getInstalled()).configNamespaces).toBeUndefined()
+  })
+
+  it('reports the same finding on the diagnostics page', async () => {
+    // The page composes the host layers as well, so it is the wider of the
+    // two judgements; a finding on the row is a finding here.
+    writeProfile(['alpha'])
+    writeClientBundle('alpha', 'ctx.configForms.get("alpha-panel")')
+
+    const body = jsonBody(await hit(routes, '/dsh-market/check', { method: 'GET', url: '/dsh-market/check' }))
+    expect(body.configNamespaces).toEqual([
+      { name: 'alpha', namespaces: ['alpha-panel'], ownEntryIds: ['alpha-entry'] },
+    ])
+  })
+
+  it('is absent from a healthy profile, so the row renders nothing', async () => {
+    writeStandardProfile()
+    expect((await getInstalled()).configNamespaces).toBeUndefined()
+    const body = jsonBody(await hit(routes, '/dsh-market/check', { method: 'GET', url: '/dsh-market/check' }))
+    expect(body.configNamespaces).toEqual([])
+  })
+})
+
+// --- #875: the host's own recovery moved the profile patch aside ---
+
+/** The stub `sanitizeProfile` writes, and the user patch it displaced. */
+const USER_PATCH_ROWS = [
+  '- insert:',
+  '    - id: llm-deepseek',
+  '- id: permission',
+  '  disabled: false',
+  '',
+].join('\n')
+
+describe('host recovery (#875)', () => {
+  const BACKUP = 'cordis.patch.yml.bak-1792065596554'
+
+  it('answers with the wipe shape and restores the patch it names', async () => {
+    writeProfile(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+    writeFileSync(join(dir, 'cordis.patch.yml'), '# recovered\n')
+    writeFileSync(join(dir, BACKUP), USER_PATCH_ROWS)
+
+    const view = await hit(routes, '/dsh-market/host-recovery', { method: 'GET', url: '/dsh-market/host-recovery' })
+    expect(view.status).toBe(200)
+    expect(view.json()).toMatchObject({ offerRestore: true, lostRowIds: ['llm-deepseek', 'permission'] })
+
+    const res = await hit(routes, '/dsh-market/host-recovery/restore', post('/dsh-market/host-recovery/restore', { name: BACKUP }))
+    expect(res.status).toBe(200)
+    expect(res.json()).toMatchObject({ ok: true, restored: { rows: 2 } })
+    expect(readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')).toBe(USER_PATCH_ROWS)
+
+    const after = await hit(routes, '/dsh-market/host-recovery', { method: 'GET', url: '/dsh-market/host-recovery' })
+    expect(after.json()).toMatchObject({ offerRestore: false })
+  })
+
+  it('says nothing on a profile its own recovery never touched', async () => {
+    writeProfile(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+    const res = await hit(routes, '/dsh-market/host-recovery', { method: 'GET', url: '/dsh-market/host-recovery' })
+    expect(res.status).toBe(200)
+    expect(res.json()).toMatchObject({ offerRestore: false, backups: [] })
+  })
+
+  it('refuses a backup name that is not one of the files beside the patch', async () => {
+    writeProfile(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+    writeFileSync(join(dir, 'cordis.patch.yml'), '# recovered\n')
+    writeFileSync(join(dir, BACKUP), USER_PATCH_ROWS)
+    const res = await hit(routes, '/dsh-market/host-recovery/restore', post('/dsh-market/host-recovery/restore', { name: '../package.json' }))
+    expect(res.status).toBe(400)
+    expect(readFileSync(join(dir, 'cordis.patch.yml'), 'utf8')).toBe('# recovered\n')
+  })
+
+  it('rejects a body that names no backup at all', async () => {
+    const res = await hit(routes, '/dsh-market/host-recovery/restore', post('/dsh-market/host-recovery/restore', {}))
+    expect(res.status).toBe(400)
   })
 })

@@ -43,13 +43,13 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real update chain', () => {
   afterAll(async () => { await scaffold?.close() })
 
   const post = async (path: string, body: unknown): Promise<Response> =>
-    fetch(`${base}${path}`, {
+    scaffold.api(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: base },
       body: JSON.stringify(body),
     })
 
-  const get = async (path: string): Promise<any> => (await fetch(`${base}${path}`)).json()
+  const get = async (path: string): Promise<any> => (await scaffold.api(path)).json()
 
   /** The version the RUNNING process is serving, or null when not live. */
   const liveVersion = (): string | null => {
@@ -108,6 +108,37 @@ describe.skipIf(!HAS_DSH).sequential('web e2e: the real update chain', () => {
     expect(again.activation[A]?.state).toBe('restart')
     expect(liveVersion()).toBe('1.0.0')
   }, 120_000)
+
+  it('does not call an off-and-on "live" while the process still serves the old module (#685)', async () => {
+    // Reported by @HorusJiang with a module-scope probe: turning a replaced
+    // bundle-layer plugin off and on again destroys and re-creates its
+    // fiber, but the new fiber evaluates the SAME module URL, which Node
+    // serves from its ESM cache — so the old build keeps running. The toggle
+    // reply nevertheless said `live`, `restart: false`, because it asked the
+    // loader's inventory (the name is there) and not whether the code was new.
+    const off = await post('/dsh-market/toggle', { name: A, enabled: false })
+    expect(off.status).toBe(200)
+    expect(liveVersion(), 'the marker should go when the plugin is unloaded').toBeNull()
+
+    const on = await post('/dsh-market/toggle', { name: A, enabled: true })
+    expect(on.status).toBe(200)
+    const reply = await on.json() as { restart?: boolean; activation?: Record<string, { state?: string; hot?: boolean }> }
+
+    // Ground truth first: the fixture reads its version at MODULE scope and
+    // writes it from apply(), so a re-created fiber on a cached module writes
+    // the OLD version. If this host ever starts re-evaluating the module on
+    // re-enable, this flips to 2.0.0 and the assertions below have to be
+    // rethought — which is the point of measuring rather than assuming.
+    expect(liveVersion()).toBe('1.0.0')
+    expect(reply.activation?.[A]?.state).toBe('restart')
+    expect(reply.activation?.[A]?.hot).toBe(false)
+    expect(reply.restart).toBe(true)
+
+    // And the listing agrees with the reply, rather than the two telling
+    // different stories about the same moment.
+    const state = await get('/dsh-market/installed')
+    expect(state.activation[A]?.state).toBe('restart')
+  }, 300_000)
 
   it('is live on the new build after a restart, with the notice gone', async () => {
     await scaffold.restart()
