@@ -3939,7 +3939,7 @@ export function MarketSection(props: MarketSectionProps) {
         // success once the plugin lands (busy-aware since #91) and strikes
         // out genuinely dead installs (#32).
       })
-  }, [nextRecordId, refreshInstalled, t])
+  }, [nextRecordId, refreshInstalled, t, installed])
 
   /**
    * Resolve a loader-id clash the only way one profile allows: uninstall the

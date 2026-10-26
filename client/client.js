@@ -10577,7 +10577,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			}, [
 				nextRecordId,
 				refreshInstalled,
-				t
+				t,
+				installed
 			]);
 			/**
 			* Resolve a loader-id clash the only way one profile allows: uninstall the

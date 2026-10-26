@@ -8314,6 +8314,86 @@ describe('Git to npm source migration (#461)', () => {
   })
 })
 
+describe('npm rename migration (#1012)', () => {
+  // The successor carries the new npm name while the profile still holds the
+  // former one: the host refuses to install it beside that install, because
+  // both would register the same loader rows (#122).
+  const SUCCESSOR = {
+    name: 'dsh-renamed',
+    owner: 'alice',
+    url: 'https://github.com/alice/dsh-renamed',
+    category: ['tools'],
+    npm: '@scope/dsh-renamed',
+    stars: 50,
+    added: '2026-08-01',
+    description: { en: 'Renamed plugin', zh: '改名的插件' },
+    install: '',
+  }
+  const FORMER = 'dsh-renamed-old'
+
+  it('follows an install refusal into the rename dialog and runs the migration', async () => {
+    stubFetch({
+      '/dsh-market/registry': {
+        source: 'live',
+        hostVersion: '0.1.2-alpha.2',
+        registry: { ...REGISTRY, count: 1, plugins: [SUCCESSOR] },
+      },
+      '/dsh-market/installed': {
+        profile: 'web',
+        installed: { [FORMER]: '^0.9.6' },
+        live: [FORMER],
+        disabled: [],
+        groups: {},
+        groupOrder: [],
+        favorites: [],
+        blocked: [],
+      },
+      // What the host answers when the successor would collide with the
+      // install it is meant to replace: not a plain failure, a rename question.
+      '/dsh-market/install': {
+        __status: 409,
+        ok: false,
+        error: 'name conflict',
+        migration: { from: FORMER, target: '@scope/dsh-renamed' },
+      },
+      '/dsh-market/migrate-source': {
+        ok: true,
+        from: { name: FORMER, source: '^0.9.6' },
+        to: { name: '@scope/dsh-renamed', source: 'npm' },
+        activation: {},
+        warnings: [],
+      },
+    })
+
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-renamed')
+    fireEvent.click(screen.getAllByRole('button', { name: en.install })[0]!)
+    fireEvent.click(await screen.findByRole('button', { name: en.confirmInstall }))
+
+    // The refusal is a question with one answer: the dialog names both
+    // packages, and its note is reassurance rather than a warning — a rename
+    // cannot touch data the plugin saved itself (#4).
+    const dialog = await screen.findByRole('dialog', { name: re(en.renameTitle) })
+    expect(within(dialog).getByText(`${FORMER}: ^0.9.6`)).toBeTruthy()
+    expect(within(dialog).getByText('@scope/dsh-renamed')).toBeTruthy()
+    const note = within(dialog).getByText(en.renameWarning)
+    expect(note.classList.contains(css.migrationNote)).toBe(true)
+    expect(note.classList.contains(css.migrationWarning)).toBe(false)
+    // Opening the dialog decides nothing; only the confirm button runs the
+    // transaction, which is the whole reason the host refused in the first place.
+    expect(fetchCalls.some(call => call.path === '/dsh-market/migrate-source')).toBe(false)
+
+    fireEvent.click(within(dialog).getByRole('button', { name: en.renameContinue }))
+    await waitFor(() => {
+      expect(fetchCalls).toContainEqual({
+        path: '/dsh-market/migrate-source',
+        method: 'POST',
+        body: { name: FORMER, kind: 'npm-rename', to: '@scope/dsh-renamed' },
+      })
+    })
+  })
+})
+
 describe('restart banner counts only restart-requiring updates (#558)', () => {
   const INSTALLED = { profile: 'web', installed: { 'dsh-loop': '^1.0.0', 'whale-skin': '^1.0.0' }, live: ['dsh-loop', 'whale-skin'], disabled: [], groups: {}, groupOrder: [], favorites: [] }
   const STATUS = { active: false, busy: false, pnpm: true, boot: 'boot-1', restart: true, installed: { 'dsh-loop': '^1.0.0', 'whale-skin': '^1.0.0' } }
