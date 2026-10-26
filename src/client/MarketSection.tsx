@@ -3818,6 +3818,22 @@ export function MarketSection(props: MarketSectionProps) {
               : { state: 'done', needsRefresh: body.hot !== true }))
           refreshInstalled()
         } else {
+          // A rename the catalog declares and this profile still holds under
+          // the former name (#1012): the host refuses to install the successor
+          // beside it, because both would register the same loader rows and
+          // the next start would refuse the tree (#122). That refusal is a
+          // question with one answer, not a failure to report — the record is
+          // replaced by the migration dialog, and its answer runs the same
+          // transaction that carries switches, groups and notes across.
+          if (body.agentsBusy !== true && body.migration && typeof body.migration === 'object') {
+            const { from, target } = body.migration as { from?: unknown; target?: unknown }
+            if (typeof from === 'string' && typeof target === 'string') {
+              setRecords(list => drop(list, recordId))
+              setMigrationConfirm({ name: from, source: String(installed[from] ?? ''), target, kind: 'npm-rename' })
+              setOperationsOpen(true)
+              return
+            }
+          }
           if (status === 409) {
             if (body.agentsBusy === true) {
               // Agents-busy is a queue, not a failure: keep the record as
@@ -4275,23 +4291,6 @@ export function MarketSection(props: MarketSectionProps) {
           // last 600 characters kept the English and dropped the Chinese.
           const clipped = detail.trim().slice(0, 1200)
           setRecords(list => patchRecord(list, updateRecordId, { state: 'failed', reason: clipped }))
-          // A package renamed upstream (#1012) is not a dead end. The host has
-          // already rolled the update back, and this dialog moves the row to
-          // the new name in one step — so it replaces the failure banner and
-          // the "uninstall, then install the new name" advice it used to give.
-          const renamedTarget = typeof body.renamedTo === 'string' && body.renamedTo !== '' ? body.renamedTo : null
-          if (renamedTarget !== null) {
-            // Keep the failure line as well: the dialog is the way out, not the
-            // whole story, and cancelling it must still leave a reason on screen.
-            setInstallError((restore ? t('restoreFail') : t('updateFail')) + ': ' + name + ' — ' + localizeBilingual(clipped, lang))
-            setMigrationConfirm({
-              name,
-              source: String(installed[name] ?? ''),
-              target: renamedTarget,
-              kind: 'npm-rename',
-            })
-            return
-          }
           // Localize the server half before prepending t() chrome.
           setInstallError((restore ? t('restoreFail') : t('updateFail')) + ': ' + name + ' — ' + localizeBilingual(clipped, lang))
         }

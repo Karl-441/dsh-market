@@ -13,11 +13,12 @@ import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { load as loadYaml } from 'js-yaml'
+import { packageFileFromRegistry } from './catalog-npm.ts'
 import { forgetCatalog, loadRegistry, pluginCategories } from './registry.ts'
 import { settingsNamespaceState } from './settings.ts'
 import {
   buildEnvFromUnknown, cleanHotDir, hotMount, hotUnmount, listHotMounts, MAX_BLOCKED, MAX_BLOCKED_NAME, MAX_FAVORITES, MAX_NOTE, MAX_UPDATE_EXEMPT,
-  mountClientOnlyDeps, purgeMarketState, readMarketState, recordRenameOffer, writeMarketState,
+  mountClientOnlyDeps, purgeMarketState, readMarketState, writeMarketState,
   type BrokenReason,
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
@@ -32,7 +33,7 @@ import {
 } from './dsh-cli.ts'
 import { packageOfEntryName } from './entry-identity.ts'
 import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
-import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
+import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
 import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
@@ -71,7 +72,7 @@ import {
   createGist, fitsGistLimit, GistError, gistErrorCode, parseGistId, readGist, resolveGistTokenSource, updateGist, verifyGistToken,
 } from './gist.ts'
 import { MAX_UPDATE_OPERATIONS_V1, UpdateOperationStoreV1, UPDATE_API_V1_SCHEMA } from './update-api-v1.ts'
-import { findCatalogRename, findGitToNpmMigration, findInstalledPredecessor, findNpmTargetEntry, isRegistryRangeSpec, type GitToNpmMigration, type NpmRenameMigration } from './source-migration.ts'
+import { declaredPredecessors, findCatalogRename, findGitToNpmMigration, findNpmTargetEntry, isRegistryRangeSpec, sameLoaderRows, type GitToNpmMigration, type NpmRenameMigration } from './source-migration.ts'
 
 export type { LoaderEntry } from './themes.ts'
 export type { UpdateStatus } from './updates.ts'
@@ -696,10 +697,6 @@ export function mountMarketRoutes(
     // Same list as blocked: a name written here must survive the next
     // writer that saves `marketState` whole (#435, #728).
     marketState.updateExempt = fresh.updateExempt
-    // Written from the update route and cleared by the migration route, so a
-    // snapshot captured at mount would either resurrect a spent offer or drop
-    // a new one (#1012).
-    marketState.renameOffers = fresh.renameOffers
     marketState.githubProxy = fresh.githubProxy
     // Refreshed like the rest: a declaration this route dropped (#663) must
     // survive another writer's read-back, which is the whole point of this
@@ -1291,6 +1288,44 @@ export function mountMarketRoutes(
   /** Why a rematerialization could not even be attempted here (see above). */
   function cannotRematerializeDetail(name: string, pinned: string | undefined): string {
     return `这台宿主只接受按精确版本重新安装，「${name}」改动前在 profile 里写作 ${pinned ?? '（不在 profile 里）'}，市场无法在它上面重建上一版 / this host can only reinstall an exact version, and "${name}" was declared as ${pinned ?? '(not in the profile)'}, so the previous build cannot be rematerialized there`
+  }
+
+  /**
+   * The installed package this entry replaces under a former name (#1012).
+   *
+   * Identity, not naming. Two packages are one plugin when they insert the
+   * same loader rows, and both sides state theirs: the installed copy in the
+   * patch files it ships, the published copy in its tarball. Comparing those
+   * costs no install and cannot be fooled by a package that merely shares a
+   * name — which is exactly what a rename breaks.
+   *
+   * The catalog's `previousNpm` narrows the candidates and supplies the only
+   * statement of intent; the rows confirm it. A row read that fails proves
+   * nothing, so the catalog's claim stands; rows that ARE readable and
+   * disjoint say these are two plugins after all, and the install proceeds.
+   */
+  async function renamePredecessor(
+    entry: { name: string; npm?: unknown; previousNpm?: unknown },
+    installed: Record<string, string>,
+    registryBase: string,
+  ): Promise<string | null> {
+    const candidates = declaredPredecessors(entry, installed)
+    if (candidates.length === 0) return null
+    if (typeof entry.npm !== 'string' || !NPM_NAME_RE.test(entry.npm)) return null
+    if (candidates.length > 1) {
+      logEvent('warn', 'install', `${entry.name}: ${candidates.join(', ')} all answer to a former name — not replacing any of them`)
+      return null
+    }
+    const current = candidates[0]!
+    const installedIds = bundlePatchInsertedIds(join(activeProfileDir, 'node_modules', current))
+    if (installedIds.length === 0) return current
+    const bytes = await packageFileFromRegistry(registryBase, entry.npm, 'package/cordis.patch.yml')
+    if (bytes === null) return current
+    const incomingIds = parsePatchRows(bytes.toString('utf8')).insertedIds
+    if (incomingIds.length === 0) return current
+    if (sameLoaderRows(installedIds, incomingIds)) return current
+    logEvent('info', 'install', `${entry.name}: ${current} declares no row this release inserts — installing beside it`)
+    return null
   }
 
   /**
@@ -3137,34 +3172,8 @@ export function mountMarketRoutes(
               return
             }
             pendingRollbacks.clear()
-            // A snapshot is a picture of the configuration, not of what the
-            // registry answered afterwards: restoring must not erase a rename
-            // discovered since that snapshot, nor resurrect one the migration
-            // already spent (#1012). The offers are facts about the world, so
-            // they come from the present, not from the snapshot.
-            const offersBeforeRestore = { ...(readMarketState(activeProfileDir).renameOffers ?? {}) }
             const restored = restoreSnapshot(activeProfileDir, body.snapshot)
             if (restored.ok) {
-              // The snapshot is a picture of the configuration; an offer is a
-              // fact about the registry, so neither direction of the restore
-              // may touch it: carry the present map over, and when there is
-              // none, clear whatever the snapshot happened to contain — a
-              // spent offer must not come back as a button (#1012). Both
-              // writes are skipped when the state file would stay as the
-              // restore left it, because a snapshot without market state must
-              // still leave no file behind (existing snapshot test).
-              const carried = Object.keys(offersBeforeRestore).length > 0 ? offersBeforeRestore : {}
-              const presentAfterRestore = readMarketState(activeProfileDir).renameOffers
-              if (Object.keys(carried).length > 0 || presentAfterRestore !== undefined) {
-                try {
-                  writeMarketState(activeProfileDir, {
-                    ...readMarketState(activeProfileDir),
-                    renameOffers: carried,
-                  })
-                } catch (error) {
-                  logEvent('warn', 'snapshot', `rename offers not carried across the restore — ${error instanceof Error ? error.message : String(error)}`)
-                }
-              }
               invalidateUpdates()
               refreshMarketState()
             }
@@ -3994,21 +4003,6 @@ export function mountMarketRoutes(
               if (rename === null || installed[rename.target] !== undefined) continue
               sourceMigrationFor.set(name, { kind: 'npm-rename', from: name, target: rename.target })
             }
-            // A rename recorded by an earlier failed update (#1012) outlives
-            // the response that discovered it, so the row keeps offering the
-            // move after a reload. Only shipped while the catalog still
-            // publishes the target: a button the route would refuse must not
-            // exist in the first place.
-            for (const [name, to] of Object.entries(readMarketState(activeProfileDir).renameOffers ?? {})) {
-              const spec = installed[name]
-              if (spec === undefined || sourceMigrationFor.has(name)) continue
-              // The rename transaction only replaces a registry dependency; a
-              // git, path, alias or workspace spec is refused there, so offering
-              // it here would be a button that can only 400 (#1012).
-              if (!isRegistryRangeSpec(spec)) continue
-              if (findNpmTargetEntry(registry.plugins, to) === null) continue
-              sourceMigrationFor.set(name, { kind: 'npm-rename', from: name, target: to })
-            }
           } catch (error) {
             logEvent('warn', 'updates', `package source lookup failed — ${error instanceof Error ? error.message : String(error)}`)
           }
@@ -4122,16 +4116,26 @@ sendJson(response, 200, { updates })
                 })
                 return
               }
+              // Verified the same way discovery finds it: exactly one catalog
+              // entry declares this package as a former name of ITSELF, and
+              // the target is the one it publishes under (#1012). A name pair
+              // that nobody declares is not a rename, and two declarations are
+              // ambiguity — both refuse, because the transaction removes an
+              // installed package before this is answered.
               let verified = false
               try {
                 const registry = await loadRegistry()
-                verified = findNpmTargetEntry(registry.plugins, to) !== null
+                const declared = findCatalogRename(registry.plugins, name)
+                const named = findNpmTargetEntry(registry.plugins, to)
+                verified = declared !== null && named !== null
+                  && declared.target.toLowerCase() === to.toLowerCase()
+                  && declared.entry === named
               } catch (error) {
                 logEvent('warn', 'source-migration', `${name}: catalog lookup failed — ${error instanceof Error ? error.message : String(error)}`)
               }
               if (!verified) {
                 sendJson(response, 400, {
-                  error: `目标包名 ${to} 不在市场目录里，或无法唯一核验；未执行迁移。 / The target ${to} is not in the market catalog, or cannot be uniquely verified; migration was not performed.`,
+                  error: `目标包名 ${to} 不在市场目录里，或目录没有声明它是「${name}」的新名字；未执行迁移。 / The target ${to} is not in the market catalog, or the catalog does not declare it as the new name of "${name}"; migration was not performed.`,
                 })
                 return
               }
@@ -4288,16 +4292,6 @@ sendJson(response, 200, { updates })
             }
 
             let stateWarning: string | null = null
-            // The offer is spent the moment the migration lands (#1012): the
-            // row is the new package now, and an entry keyed by the old name
-            // would outlive its subject. Read fresh — the offer is recorded by
-            // an update failure, which can land after this mount captured
-            // `marketState` — and write the whole fresh map, not just our own
-            // removal: a migration of some other plugin must not put a stale
-            // snapshot back over it.
-            const offers = { ...(readMarketState(activeProfileDir).renameOffers ?? {}) }
-            delete offers[name]
-            marketState.renameOffers = offers
             try {
               writeMarketState(activeProfileDir, marketState)
             } catch (error) {
@@ -5250,20 +5244,6 @@ sendJson(response, 200, { updates })
                 rollbackDetail = rollback.detail
                 logEvent('error', 'update',
                   `${name}: the update installed a package named ${afterPackageName} (renamed upstream) — ${rollback.ok ? 'previous build restored' : `could not restore previous files: ${rollback.detail ?? 'unknown'}`}`)
-                // Keep the fact past this response (#1012): the row offers the
-                // migration from it, and a fact that dies with the failure is
-                // what made the only way forward "uninstall, then reinstall".
-                // Only a market-managed registry dependency can be moved by the
-                // rename transaction (the same test as `isNpmRollbackSource`),
-                // so a git or path install is detected and reported but not
-                // recorded — its row would only get a button that 400s.
-                if (!isGit && !/[:/\\]/.test(spec)) {
-                  try {
-                    recordRenameOffer(activeProfileDir, name, afterPackageName)
-                  } catch (error) {
-                    logEvent('warn', 'update', `${name}: could not record the rename offer — ${error instanceof Error ? error.message : String(error)}`)
-                  }
-                }
               }
             }
             let brokenEntry = false
@@ -5405,8 +5385,8 @@ sendJson(response, 200, { updates })
             // rewriting the profile's bundle list.
             const renamedError = renamedTo === null ? null
               : rollbackOk
-                ? `${name} 的上游已把包改名为 ${renamedTo}：新版本会装在旧名字下，DSH 下次启动会拒绝这个 profile，所以本次更新已自动回滚、原版本已恢复。迁移到新名字后就能继续更新。 / ${name} was renamed upstream to ${renamedTo}: the new version would sit under the old name and DSH would refuse to start this profile, so the update was rolled back and the previous build restored. Migrating to the new name lets updates continue.`
-                : `${name} 的上游已把包改名为 ${renamedTo}，且未能验证恢复原版本（${rollbackDetail ?? 'unknown'}）；迁移到新名字后就能继续更新。 / ${name} was renamed upstream to ${renamedTo}, and restoration of the previous build could not be verified (${rollbackDetail ?? 'unknown'}); migrating to the new name lets updates continue.`
+                ? `${name} 的上游已把包改名为 ${renamedTo}：新版本会装在旧名字下，DSH 下次启动会拒绝这个 profile，所以本次更新已自动回滚、原版本已恢复。目录如果声明了这次改名，「已安装」里会出现迁移入口。 / ${name} was renamed upstream to ${renamedTo}: the new version would sit under the old name and DSH would refuse to start this profile, so the update was rolled back and the previous build restored. If the catalog declares this rename, the installed list offers the migration.`
+                : `${name} 的上游已把包改名为 ${renamedTo}，且未能验证恢复原版本（${rollbackDetail ?? 'unknown'}）。 / ${name} was renamed upstream to ${renamedTo}, and restoration of the previous build could not be verified (${rollbackDetail ?? 'unknown'}).`
 
             const cancelDiff = cancelled ? changedSince(beforeInstalled) : null
             // Build-script blocks hit updates too (#69): a leftover invalid
@@ -6604,18 +6584,25 @@ sendJson(response, 200, { updates })
                 return
               }
             }
-            // Predecessor guard (#1012): the package this entry used to be may
-            // still be installed under its old name. A rename re-registers the
-            // same bundle ids, so two copies cannot coexist — the trial boot
-            // rejects duplicate loader ids and the next start fails. Installing
-            // a successor beside its predecessor is the one obvious move that
-            // bricks the profile, so it is refused here, before pnpm runs, with
-            // the migration that carries the market state across named.
-            const predecessor = findInstalledPredecessor(entry, installedNow)
-            if (predecessor !== null) {
-              logEvent('warn', 'install-rejected', `${entry.name}: predecessor ${predecessor} is installed — migration required`)
-              sendJson(response, 400, {
-                error: `已安装的「${predecessor}」是这个插件改名前用的名字。直接装会装出两份，可能让下次启动失败；用「迁移到新名字」把它换过去，开关、分组和备注都会保留。 / "${predecessor}" is installed under this plugin's previous package name. Installing it alongside would create two copies and can break the next start — migrate it to the new name instead; switches, groups and notes come along.`,
+            // Rename guard (#1012): the package this entry used to publish
+            // under may still be in the profile, and a rename re-registers the
+            // same loader rows — installing the successor beside it registers
+            // them twice and bricks the next start (#122). The market does not
+            // answer that with "uninstall, then install": when the old copy is
+            // a registry dependency the migration replaces it in place and
+            // carries switches, groups and notes across, so the response names
+            // both ends and the client continues straight into that
+            // transaction. A Git or path copy cannot be moved by that
+            // transaction, so it is named without promising the dialog.
+            const predecessor = await renamePredecessor(entry, installedNow, routesFor(region).npmRegistry)
+            if (predecessor !== null && typeof entry.npm === 'string') {
+              const movable = isRegistryRangeSpec(String(installedNow[predecessor] ?? ''))
+              logEvent('warn', 'install-rejected', `${entry.name}: predecessor ${predecessor} is installed — ${movable ? 'migration replaces it' : 'not a registry dependency, cannot be migrated here'}`)
+              sendJson(response, 409, {
+                error: movable
+                  ? `「${predecessor}」是这个插件改名前用的名字，已经装在 profile 里。装新名字会把同一个插件装成两份、下次启动可能失败；改用迁移把它换过来，开关、分组和备注都会保留。 / "${predecessor}" is already installed under this plugin's former package name. Installing the new name would put two copies of one plugin in the profile and can break the next start — migrate it instead; switches, groups and notes come along.`
+                  : `「${predecessor}」是这个插件改名前用的名字，已经装在 profile 里，而它是从 Git 或本地路径装的。装新名字会把同一个插件装成两份、下次启动可能失败；请先把旧的那份换成 npm 包（「已安装」里会给出可用的移动方式）。 / "${predecessor}" is already installed under this plugin's former package name, and it comes from a Git or local path. Installing the new name would put two copies of one plugin in the profile and can break the next start — move the old copy to the npm package first (the installed list shows what can be moved).`,
+                ...(movable ? { migration: { kind: 'npm-rename', from: predecessor, target: entry.npm } } : {}),
               })
               return
             }

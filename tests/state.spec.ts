@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  readDisabled, readDisabledThemes, readMarketState, recordRenameOffer, writeDisabled, writeDisabledThemes, writeMarketState,
+  readDisabled, readDisabledThemes, readMarketState, writeDisabled, writeDisabledThemes, writeMarketState,
 } from '../src/hot.ts'
 import {
   createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers,
@@ -151,73 +151,6 @@ describe('market state.json (#60)', () => {
       writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], updateExempt: [] })
       expect(readMarketState(dir).updateExempt).toEqual([])
       expect('updateExempt' in readRaw(dir)).toBe(false)
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  /** #1012. The offer is recorded from an update failure and must survive a
-   * later full-state write by a caller that predates the field, so the row
-   * keeps offering the migration after the discovering response is gone. */
-  it('keeps a recorded npm rename offer until the migration clears it', () => {
-    const dir = stateDir()
-    try {
-      writeMarketState(dir, {
-        disabled: new Set(), groups: {}, groupOrder: [],
-        renameOffers: { 'evo-subagent': 'dsh-evo-subagent' },
-      })
-      expect(readMarketState(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-
-      writeMarketState(dir, { disabled: new Set(['a']), groups: {}, groupOrder: [] })
-      expect(readMarketState(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-
-      // The exact shape `refreshMarketState` hands over when the disk has no
-      // offers: an own property holding `undefined`. It means "nothing to
-      // say", not "delete" — treating it as a clear is what let any unrelated
-      // settings write wipe an offer recorded in between.
-      writeMarketState(dir, {
-        disabled: new Set(['b']), groups: {}, groupOrder: [], renameOffers: undefined,
-      })
-      expect(readMarketState(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-
-      writeMarketState(dir, { disabled: new Set(), groups: {}, groupOrder: [], renameOffers: {} })
-      expect(readMarketState(dir).renameOffers).toBeUndefined()
-      expect('renameOffers' in readRaw(dir)).toBe(false)
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('recordRenameOffer persists once and ignores entries that could never migrate', () => {
-    const dir = stateDir()
-    try {
-      recordRenameOffer(dir, 'evo-subagent', 'dsh-evo-subagent')
-      expect(readRaw(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-
-      recordRenameOffer(dir, 'evo-subagent', 'dsh-evo-subagent')
-      expect(readRaw(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-
-      recordRenameOffer(dir, 'dsh-bad name', 'dsh-x')
-      recordRenameOffer(dir, 'dsh-y', 'not a name')
-      recordRenameOffer(dir, 'dsh-same', 'dsh-same')
-      expect(readRaw(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  it('drops a rename offer that does not name a package on both sides', () => {
-    const dir = stateDir()
-    try {
-      writeFileSync(join(dir, '.dsh-market', 'state.json'), JSON.stringify({
-        renameOffers: {
-          'evo-subagent': 'dsh-evo-subagent',
-          'not a name': 'dsh-x',
-          'dsh-y': 42,
-          'dsh-same': 'dsh-same',
-        },
-      }))
-      expect(readMarketState(dir).renameOffers).toEqual({ 'evo-subagent': 'dsh-evo-subagent' })
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

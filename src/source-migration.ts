@@ -134,27 +134,47 @@ export function findCatalogRename<T extends { name: string; npm?: unknown; previ
 }
 
 /**
- * The installed package count that still answers to this entry's former name.
+ * Installed packages that answer to one of this entry's former names (#1012).
  *
  * A renamed package usually re-registers the very same bundle ids, so two
  * package names that were one plugin cannot coexist in a profile: the trial
  * boot rejects duplicate loader ids while the two sit side by side. That makes
  * "install the new name as well" the one obvious move that bricks the next
- * start, which is why the install route refuses it before pnpm runs (#1012).
+ * start, which is why the install route refuses it before pnpm runs.
+ *
+ * A name on this list is a claim, not proof: the caller still compares the
+ * rows both sides declare before it refuses anything, so a stale catalog
+ * field can cost a click at worst and never a wrong refusal.
  */
-export function findInstalledPredecessor<T extends { name: string; previousNpm?: unknown }>(
+export function declaredPredecessors<T extends { name: string; previousNpm?: unknown }>(
   plugin: T,
   installed: Record<string, unknown>,
-): string | null {
+): string[] {
   const previous = Array.isArray(plugin.previousNpm) ? plugin.previousNpm : []
+  const found: string[] = []
   for (const value of previous) {
     if (typeof value !== 'string' || value === '') continue
     const wanted = value.toLowerCase()
     for (const name of Object.keys(installed)) {
-      if (name.toLowerCase() === wanted) return name
+      if (name.toLowerCase() === wanted && !found.includes(name)) found.push(name)
     }
   }
-  return null
+  return found
+}
+
+/**
+ * True when the two sides still register at least one of the same loader rows.
+ *
+ * This is the check that keeps a stale catalog from refusing an install it has
+ * no business refusing: two packages that insert different rows can coexist in
+ * a profile, so a `previousNpm` that points at one of them is a guess, not the
+ * plugin coming back. Only readable, non-empty row sets can prove sameness —
+ * a missing side proves nothing and the caller falls back to the declaration.
+ */
+export function sameLoaderRows(installed: readonly string[], incoming: readonly string[]): boolean {
+  if (installed.length === 0 || incoming.length === 0) return false
+  const present = new Set(installed)
+  return incoming.some(id => present.has(id))
 }
 
 /**

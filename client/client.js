@@ -10503,6 +10503,20 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						}));
 						refreshInstalled();
 					} else {
+						if (body.agentsBusy !== true && body.migration && typeof body.migration === "object") {
+							const { from, target } = body.migration;
+							if (typeof from === "string" && typeof target === "string") {
+								setRecords((list) => drop(list, recordId));
+								setMigrationConfirm({
+									name: from,
+									source: String(installed[from] ?? ""),
+									target,
+									kind: "npm-rename"
+								});
+								setOperationsOpen(true);
+								return;
+							}
+						}
 						if (status === 409) {
 							if (body.agentsBusy === true) {
 								setRecords((list) => patch(list, recordId, {
@@ -10890,17 +10904,6 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							state: "failed",
 							reason: clipped
 						}));
-						const renamedTarget = typeof body.renamedTo === "string" && body.renamedTo !== "" ? body.renamedTo : null;
-						if (renamedTarget !== null) {
-							setInstallError((restore ? t("restoreFail") : t("updateFail")) + ": " + name + " — " + localizeBilingual(clipped, lang));
-							setMigrationConfirm({
-								name,
-								source: String(installed[name] ?? ""),
-								target: renamedTarget,
-								kind: "npm-rename"
-							});
-							return;
-						}
 						setInstallError((restore ? t("restoreFail") : t("updateFail")) + ": " + name + " — " + localizeBilingual(clipped, lang));
 					}
 				}).catch(() => {});

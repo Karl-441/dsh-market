@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-          import { findCatalogRename, findGitToNpmMigration, findInstalledPredecessor, findNpmTargetEntry, isRegistryRangeSpec } from '../src/source-migration.ts'
+          import { declaredPredecessors, findCatalogRename, findGitToNpmMigration, findNpmTargetEntry, isRegistryRangeSpec, sameLoaderRows } from '../src/source-migration.ts'
 
           const plugins = [
             { name: 'dsh-genui', url: 'https://github.com/omdsh-dev/dsh-genui', npm: '@changfenhuang/dsh-genui' },
@@ -108,17 +108,17 @@ import { describe, expect, it } from 'vitest'
             })
           })
 
-          describe('findInstalledPredecessor (#1012 P1)', () => {
-            const entry = { name: 'evo', npm: 'dsh-evo-subagent', previousNpm: ['evo-subagent-old'] }
+          describe('declaredPredecessors (#1012)', () => {
+            const entry = { name: 'evo', npm: 'dsh-evo-subagent', previousNpm: ['evo-subagent-old', 'evo-subagent-older'] }
 
-            it('names the installed package that answers to the former name', () => {
-              expect(findInstalledPredecessor(entry, { 'evo-subagent-old': '^1.1.0' })).toBe('evo-subagent-old')
-              expect(findInstalledPredecessor(entry, { 'EVO-SUBAGENT-OLD': '^1.1.0' })).toBe('EVO-SUBAGENT-OLD')
+            it('lists every declared former name that is installed, as written in the profile', () => {
+              const installed = { 'evo-subagent-old': '^1.1.0', 'EVO-SUBAGENT-OLDER': '^1.0.0', other: '^1.0.0' }
+              expect(declaredPredecessors(entry, installed)).toEqual(['evo-subagent-old', 'EVO-SUBAGENT-OLDER'])
             })
 
-            it('is silent when the former name is not installed', () => {
-              expect(findInstalledPredecessor(entry, { other: '^1.0.0' })).toBeNull()
-              expect(findInstalledPredecessor({ name: 'x', npm: 'x' }, { 'evo-subagent-old': '^1.1.0' })).toBeNull()
+            it('is silent without a declaration or without a match', () => {
+              expect(declaredPredecessors({ name: 'x', npm: 'x' }, { anything: '^1.0.0' })).toEqual([])
+              expect(declaredPredecessors(entry, { other: '^1.0.0' })).toEqual([])
             })
           })
 
@@ -133,6 +133,22 @@ import { describe, expect, it } from 'vitest'
               for (const spec of ['github:o/r', 'git+https://github.com/o/r.git', 'file:../x', 'link:../x', 'workspace:*', 'npm:dsh-genui@1.2.3', 'a/b', '../plugin', '']) {
                 expect(isRegistryRangeSpec(spec)).toBe(false)
               }
+            })
+          })
+
+          describe('sameLoaderRows (#1012)', () => {
+            it('proves sameness from one shared row, in either direction', () => {
+              expect(sameLoaderRows(['a', 'b'], ['b', 'c'])).toBe(true)
+              expect(sameLoaderRows(['b'], ['b'])).toBe(true)
+            })
+
+            it('refuses to call disjoint rows the same plugin', () => {
+              expect(sameLoaderRows(['a'], ['b'])).toBe(false)
+            })
+
+            it('proves nothing from a missing side', () => {
+              expect(sameLoaderRows([], ['b'])).toBe(false)
+              expect(sameLoaderRows(['a'], [])).toBe(false)
             })
           })
 
