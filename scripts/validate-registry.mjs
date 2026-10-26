@@ -276,13 +276,27 @@ async function main() {
     // E13 — previousNpm (#1012): a renamed package's former npm names. Shape
     // only here; the cross-entry rules run after the loop, once every live
     // package name in the catalog is known.
+    //
+    // The field name is matched exactly. `PreviousNpm` is not a typo the gate
+    // may forgive: both this script and the runtime read the exact key, so a
+    // miscased one is silently ignored and the rename simply never appears.
+    for (const key of Object.keys(p)) {
+      if (key !== 'previousNpm' && key.toLowerCase() === 'previousnpm') {
+        fail(errors, p, 'E13', `key "${key}" is not the rename field; spell it "previousNpm" exactly`)
+      }
+    }
     if (p.previousNpm !== undefined) {
       if (!Array.isArray(p.previousNpm) || p.previousNpm.length === 0) {
         fail(errors, p, 'E13', 'previousNpm must be a non-empty array of npm package names when present')
       } else {
         for (const old of p.previousNpm) {
           if (typeof old !== 'string' || !NPM_NAME_RE.test(old)) {
-            fail(errors, p, 'E13', `previousNpm entry ${JSON.stringify(old)} is not a valid npm package name`)
+            // npm names are always lowercase, so a value that would be valid
+            // after lowercasing is a case mistake, not a syntax one (#1012).
+            const miscased = typeof old === 'string' && NPM_NAME_RE.test(old.toLowerCase())
+            fail(errors, p, 'E13', miscased
+              ? `previousNpm entry ${JSON.stringify(old)} must be lowercase`
+              : `previousNpm entry ${JSON.stringify(old)} is not a valid npm package name`)
           }
         }
       }

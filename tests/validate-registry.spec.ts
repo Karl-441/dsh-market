@@ -79,6 +79,20 @@ describe('validate-registry previousNpm (#1012 P1)', () => {
     expect(run.output).toContain('[E13] not-a-list: previousNpm must be a non-empty array')
     expect(run.output).toContain('[E13] bad-name: previousNpm entry "Not A Name" is not a valid npm package name')
   })
+
+  it('refuses a former name that differs only in case', () => {
+    const run = runCatalog([entry('renamed', 'renamed-new', ['Renamed-Old'])])
+    expect(run.status).toBe(1)
+    expect(run.output).toContain('[E13] renamed: previousNpm entry "Renamed-Old" must be lowercase')
+  })
+
+  it('refuses a miscased field name instead of ignoring the declaration', () => {
+    // The runtime reads the exact key, so `PreviousNpm` would validate as an
+    // unknown-but-harmless property and the rename would silently never appear.
+    const run = runCatalog([{ ...entry('renamed', 'renamed-new'), PreviousNpm: ['renamed-old'] }])
+    expect(run.status).toBe(1)
+    expect(run.output).toContain('[E13] renamed: key "PreviousNpm" is not the rename field')
+  })
 })
 
 
