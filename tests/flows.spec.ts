@@ -9000,6 +9000,121 @@ describe('catalog previousNpm (#1012)', () => {
     expect(hot.notes['dsh-renamed-new']).toBe('renamed package')
   })
 
+  it('refuses a rename whose two sides register different rows, and restores the old package', async () => {
+    installPredecessor()
+    // Rollback re-adds the predecessor through the fake npm, so it has to be
+    // installable there — with the patch file that carries its rows.
+    fake.npm['dsh-renamed-old'] = {
+      latest: '0.9.6',
+      versions: {
+        '0.9.6': {
+          manifest: { name: 'dsh-renamed-old', dsh: {}, main: 'index.js' },
+          artifacts: ['index.js', 'cordis.patch.yml'],
+          artifactContents: { 'cordis.patch.yml': '- insert:\n    - id: dsh-renamed-row\n      name: dsh-renamed-old\n' },
+        },
+      },
+    }
+    // The catalog claims dsh-renamed-old became dsh-renamed-new, but the
+    // successor registers a row of its own: not the same plugin.
+    fake.npm['dsh-renamed-new'] = {
+      latest: '1.0.0',
+      versions: {
+        '1.0.0': {
+          manifest: { name: 'dsh-renamed-new', dsh: {}, main: 'index.js' },
+          artifacts: ['index.js', 'cordis.patch.yml'],
+          artifactContents: { 'cordis.patch.yml': '- insert:\n    - id: dsh-other-row\n      name: dsh-renamed-new\n' },
+        },
+      },
+    }
+    hot.disabled.add('dsh-renamed-old')
+
+    const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', {
+      name: 'dsh-renamed-old',
+      kind: 'npm-rename',
+      to: 'dsh-renamed-new',
+    })
+    expect(migrated.status, JSON.stringify(migrated.json)).toBe(409)
+    expect(migrated.json).toMatchObject({ ok: false, rollback: true })
+    // Both sides named, so the user can see WHY it was refused.
+    const error = String(migrated.json.error)
+    expect(error).toContain('dsh-renamed-row')
+    expect(error).toContain('dsh-other-row')
+    expect(error).toContain('不是同一个插件')
+    // …and what the user can do about it: the refusal left them with a working
+    // install, so the copy has to say so instead of dead-ending.
+    expect(error).toContain('原来的版本仍然可用')
+    expect(error).toContain('report that entry')
+
+    // The swap was undone: old package back on its old spec, successor gone,
+    // and the old patch file materialized again.
+    expect(installedSpec('dsh-renamed-old')).toBe('^0.9.6')
+    expect(installedSpec('dsh-renamed-new')).toBeUndefined()
+    expect(existsSync(join(profileDir('web'), 'node_modules', 'dsh-renamed-old', 'cordis.patch.yml'))).toBe(true)
+    // Nothing followed the refused rename into the market's own state.
+    expect(hot.disabled.has('dsh-renamed-old')).toBe(true)
+    expect(hot.disabled.has('dsh-renamed-new')).toBe(false)
+  })
+
+  it('performs the rename when both sides register the same rows', async () => {
+    installPredecessor()
+    // Same insert row on the successor's side: this IS the same plugin, so
+    // the evidence must not block the migration.
+    fake.npm['dsh-renamed-new'] = {
+      latest: '1.0.0',
+      versions: {
+        '1.0.0': {
+          manifest: { name: 'dsh-renamed-new', dsh: {}, main: 'index.js' },
+          artifacts: ['index.js', 'cordis.patch.yml'],
+          artifactContents: { 'cordis.patch.yml': '- insert:\n    - id: dsh-renamed-row\n      name: dsh-renamed-new\n' },
+        },
+      },
+    }
+
+    const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', {
+      name: 'dsh-renamed-old',
+      kind: 'npm-rename',
+      to: 'dsh-renamed-new',
+    })
+    expect(migrated.status, JSON.stringify(migrated.json)).toBe(200)
+    expect(installedSpec('dsh-renamed-old')).toBeUndefined()
+    expect(installedSpec('dsh-renamed-new')).toBe('^1.0.0')
+  })
+
+  it('performs the rename when the predecessor declares no rows at all', async () => {
+    // Silence is not a contradiction: a package that ships no patch file
+    // declares nothing, and nothing cannot disagree with the successor's rows.
+    // Only two sets of DECLARED rows can be disjoint.
+    installPredecessor({ patchIds: [] })
+    fake.npm['dsh-renamed-old'] = {
+      latest: '0.9.6',
+      versions: {
+        '0.9.6': {
+          manifest: { name: 'dsh-renamed-old', dsh: {}, main: 'index.js' },
+          artifacts: ['index.js'],
+        },
+      },
+    }
+    fake.npm['dsh-renamed-new'] = {
+      latest: '1.0.0',
+      versions: {
+        '1.0.0': {
+          manifest: { name: 'dsh-renamed-new', dsh: {}, main: 'index.js' },
+          artifacts: ['index.js', 'cordis.patch.yml'],
+          artifactContents: { 'cordis.patch.yml': '- insert:\n    - id: dsh-other-row\n      name: dsh-renamed-new\n' },
+        },
+      },
+    }
+
+    const migrated = await bed.dispatch('POST', '/dsh-market/migrate-source', {
+      name: 'dsh-renamed-old',
+      kind: 'npm-rename',
+      to: 'dsh-renamed-new',
+    })
+    expect(migrated.status, JSON.stringify(migrated.json)).toBe(200)
+    expect(installedSpec('dsh-renamed-old')).toBeUndefined()
+    expect(installedSpec('dsh-renamed-new')).toBe('^1.0.0')
+  })
+
   it('refuses a rename the catalog does not declare', async () => {
     installPredecessor()
     successorOnNpm()

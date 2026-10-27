@@ -33,7 +33,7 @@ import {
 } from './dsh-cli.ts'
 import { packageOfEntryName } from './entry-identity.ts'
 import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
-import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
+import { addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, shippedInsertedRowIds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
 import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
@@ -4242,6 +4242,12 @@ sendJson(response, 200, { updates })
             const wasLive = verifyActivation(config.profile, name, liveNames(), activeProfileDir, disabled.has(name)).state === 'live'
               && hasHostHalf(config.profile, name, activeProfileDir)
             const oldRows = rowIdsForPackage(host, activeProfileDir, name)
+            // Identity evidence for a rename (#1012), read BEFORE the removal:
+            // once `remove` runs, the installed old package — and with it the
+            // only record of what it registers — is gone.
+            const oldInsertIds = kind === 'npm-rename'
+              ? shippedInsertedRowIds(join(activeProfileDir, 'node_modules', name))
+              : []
             const patchFlags = packagePatchFlags(host, activeProfileDir, [name], readUserPatchState(userPatchPath))
             const wasDisabled = disabled.has(name)
             const manifestBefore = manifestCapture.snapshot
@@ -4267,17 +4273,31 @@ sendJson(response, 200, { updates })
                 : { ok: false, detail: `${restoredEn} was restored without a loadable entry` }
             }
 
-            const failWithRollback = async (detail: string, extra: Record<string, unknown> = {}): Promise<void> => {
+            // `noteZh`/`noteEn` carry the "what you can do next" sentence, and
+            // only the branch that actually restored the old install may say
+            // it: after a failed rollback there is nothing to reassure the
+            // user with, so the note is dropped rather than contradicting the
+            // "could not be verified" fallout.
+            const failWithRollback = async (
+              detail: string,
+              extra: Record<string, unknown> = {},
+              status = 500,
+              noteZh = '',
+              noteEn = '',
+            ): Promise<void> => {
               const rollback = await rollbackMigration()
               logEvent(
                 rollback.ok ? 'warn' : 'error',
                 'source-migration',
                 `${name}: migration failed — ${detail}; ${rollback.ok ? `${restoredEn} restored` : `rollback failed: ${rollback.detail ?? 'unknown'}`}`,
               )
-              sendJson(response, 500, {
+              // A 409 whose rollback failed is not a conflict the user can walk
+              // away from — the install itself is now unverified — so the
+              // status follows the rollback, not the reason we got here.
+              sendJson(response, rollback.ok ? status : 500, {
                 ok: false,
                 error: rollback.ok
-                  ? `${detail}；已恢复${restoredZh}。 / ${detail}; ${restoredEn} was restored.`
+                  ? `${detail}；已恢复${restoredZh}。${noteZh === '' ? '' : ` ${noteZh}`} / ${detail}; ${restoredEn} was restored.${noteEn === '' ? '' : ` ${noteEn}`}`
                   : `${detail}；且${restoredZh}未能验证恢复（${rollback.detail ?? 'unknown'}）。 / ${detail}; restoration of ${restoredEn} could not be verified (${rollback.detail ?? 'unknown'}).`,
                 rollback: rollback.ok,
                 ...extra,
@@ -4303,6 +4323,44 @@ sendJson(response, 200, { updates })
             if (after[targetName] === undefined || (targetName !== name && after[name] !== undefined) || !hasLoadableEntry(activeProfileDir, targetName)) {
               await failWithRollback('npm 目标安装完成后未形成可加载且唯一的依赖。 / The npm target did not produce one loadable replacement dependency.')
               return
+            }
+
+            // The catalog's `previousNpm` is a CLAIM that the two package names
+            // are one plugin, and the transaction above already acted on it by
+            // replacing what the user had. Ask the packages themselves: the
+            // rows each side declares it inserts are registry evidence, and two
+            // packages that register disjoint rows are not the same plugin —
+            // whatever the catalog says. Refuse and put the old one back rather
+            // than leave a stranger's rows running under the old plugin's name
+            // (#1012). Same question, same parser as the install-path gate
+            // (`renamePredecessor`), which compares the installed package's
+            // declared rows against the incoming registry `cordis.patch.yml`;
+            // here both packages are already on disk, so both sides are read
+            // the same way — including the conventional root patch file, which
+            // that gate only knows on the incoming side.
+            //
+            // Both sides must SHOW evidence: a package with no patch file
+            // declares nothing, and silence is not a contradiction.
+            if (kind === 'npm-rename') {
+              const newInsertIds = shippedInsertedRowIds(join(activeProfileDir, 'node_modules', targetName))
+              if (oldInsertIds.length > 0 && newInsertIds.length > 0 && !sameLoaderRows(oldInsertIds, newInsertIds)) {
+                // Both sides are third-party YAML: clip each id so a hostile
+                // patch cannot turn this refusal into a megabyte response.
+                const rows = (ids: string[]): string => {
+                  const clip = (id: string): string => (id.length <= 48 ? id : `${id.slice(0, 48)}…`)
+                  return ids.length <= 3
+                    ? ids.map(clip).join(', ')
+                    : `${ids.slice(0, 3).map(clip).join(', ')}, +${ids.length - 3}`
+                }
+                await failWithRollback(
+                  `目录声明 ${name} 已改名为 ${targetName}，但两边的注册行不同（${name}: ${rows(oldInsertIds)}；${targetName}: ${rows(newInsertIds)}），说明它们不是同一个插件。 / The catalog declares ${name} was renamed to ${targetName}, but the two packages register different plugin rows (${name}: ${rows(oldInsertIds)}; ${targetName}: ${rows(newInsertIds)}), so they are not the same plugin.`,
+                  {},
+                  409,
+                  `原来的版本仍然可用；如果目录写错了，请报告这一条。`,
+                  `The original install is still usable; if the catalog is wrong, report that entry.`,
+                )
+                return
+              }
             }
 
             const stack = readBundleStack(activeProfileDir)

@@ -981,15 +981,62 @@ export function bundlePatchInsertedIds(dir: string): string[] {
  * conventional root cordis.patch.yml a package may ship instead.
  */
 export function bundleOptOutRowIds(dir: string): string[] {
+  return declaredPatchRowIds(dir, 'disabledIds')
+}
+
+/**
+ * Row ids a package's own patch sources declare for one role — the loop the
+ * two readers above and below share.
+ *
+ * They read the same two sources: every declared `dsh.bundle.patch` (one file,
+ * or an ordered list of them, #792) and the conventional root
+ * `cordis.patch.yml` a package may ship instead. Keeping that loop in one place
+ * is the point — `bundlePatchInsertedIds` above is declared-files-only, and a
+ * copy of this scan that forgot the root file is exactly how the two sides of
+ * one question drift apart.
+ *
+ * A source that cannot be read contributes nothing rather than throwing: this
+ * answers "what does the package say it ships", and a file that is not there
+ * says nothing. That is the tolerant half of the family by design — the strict
+ * one (`readBundlePatchRows`) refuses the whole declaration, because the host
+ * loads none of a patch it cannot read completely.
+ */
+function declaredPatchRowIds(dir: string, role: 'insertedIds' | 'disabledIds'): string[] {
   const ids = new Set<string>()
   const read = (file: string): void => {
     try {
-      for (const id of parsePatchRows(readFileSync(file, 'utf8')).disabledIds) ids.add(id)
-    } catch { /* no such patch — nothing shipped off through it */ }
+      for (const id of parsePatchRows(readFileSync(file, 'utf8'))[role]) ids.add(id)
+    } catch { /* no such patch — nothing declared through it */ }
   }
   for (const file of declaredBundlePatchFiles(dir)) read(file)
   read(join(dir, 'cordis.patch.yml'))
   return [...ids]
+}
+
+/**
+ * Row ids the installed copy of a package DECLARES it inserts (#1012).
+ *
+ * The evidence half of `rowIdsForPackage`: the same two patch sources (the
+ * declared `dsh.bundle.patch`, one file or an ordered list, and the
+ * conventional root `cordis.patch.yml`), insert rows only, and — unlike that
+ * reader — no live loader rows.
+ *
+ * Live rows are exactly what this cannot use. A rename transaction asks the
+ * question twice: of the old package just before it is removed (whose rows are
+ * still live, but whose patch files are about to be the only copy left) and of
+ * the new package right after its first install (which has never been booted,
+ * so the loader has never heard of it). Only the package's own declaration can
+ * answer for both.
+ *
+ * That is the same question, and the same parser, as `renamePredecessor` asks
+ * on the install path — an install never boots the package either, so it
+ * compares declarations too and the two refusals agree on what "one plugin"
+ * means (#1012). Where they differ is the root `cordis.patch.yml`: see
+ * `declaredPatchRowIds` for why this reader covers it and that gate's
+ * declared-only reader does not.
+ */
+export function shippedInsertedRowIds(dir: string): string[] {
+  return declaredPatchRowIds(dir, 'insertedIds')
 }
 
 /**

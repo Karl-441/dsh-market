@@ -10,7 +10,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { resolveDshHome } from '../src/home-paths.ts'
 import {
-  addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, readProfileManifestSnapshot, bundlePatchTargets, conflictingEntryIds, declaredBundlePatchFiles, dropFromManifest, entryArtifactExists, generationManagedNames, hasDshManifest, hasLoadableEntry, holdsNativeAddon, isDshProfileName, mergeDuplicateReleaseAgeExcludes, parsePatchRows, pluginSubdirs, profileDir,
+  addProfileBundle, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, readProfileManifestSnapshot, bundlePatchTargets, conflictingEntryIds, declaredBundlePatchFiles, dropFromManifest, entryArtifactExists, generationManagedNames, hasDshManifest, hasLoadableEntry, holdsNativeAddon, isDshProfileName, mergeDuplicateReleaseAgeExcludes, parsePatchRows, pluginSubdirs, profileDir, shippedInsertedRowIds,
   readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledRepoIdentities, readInstalledVersion, readLockCommits,
   removeProfileBundle,
 } from '../src/profile.ts'
@@ -2144,6 +2144,76 @@ describe('bundleOptOutRowIds (#876)', () => {
     try {
       writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'plain' }))
       expect(bundleOptOutRowIds(dir)).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('shippedInsertedRowIds (#1012)', () => {
+  it('unions every declared patch file with the conventional root file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-shipped-'))
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        name: 'dsh-renamed',
+        dsh: { bundle: { patch: ['./a.patch.yml', './b.patch.yml'] } },
+      }))
+      // A declared LIST is composed in order (#792) and the root file is read
+      // even though the package declared patches of its own: the identity
+      // question is "what does this package register", and a package that
+      // ships both registers both. The install-path gate reads the declaration
+      // only, which is why this reader cannot be that one.
+      writeFileSync(join(dir, 'a.patch.yml'), '- insert:\n    - id: row-one\n      name: dsh-renamed\n')
+      writeFileSync(join(dir, 'b.patch.yml'), [
+        '- insert:',
+        '    - id: row-two',
+        '      name: dsh-renamed',
+        '    - id: row-one',
+        '      name: dsh-renamed',
+        '',
+      ].join('\n'))
+      writeFileSync(join(dir, 'cordis.patch.yml'), '- insert:\n    - id: row-three\n      name: dsh-renamed\n')
+      expect([...shippedInsertedRowIds(dir)].sort()).toEqual(['row-one', 'row-three', 'row-two'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves out rows the package only reconfigures (#147)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-shipped-'))
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        name: 'dsh-vision-router',
+        dsh: { bundle: { patch: './cordis.patch.yml' } },
+      }))
+      // `attachment-local` belongs to another package: counting it as this
+      // one's evidence would let a neighbour's row decide what "one plugin"
+      // means, the split #147 exists to keep.
+      writeFileSync(join(dir, 'cordis.patch.yml'), [
+        '- insert:',
+        '    - id: vision-router',
+        '      name: dsh-vision-router',
+        '- id: attachment-local',
+        '  config: { maxImageBytes: 1048576 }',
+        '',
+      ].join('\n'))
+      expect(shippedInsertedRowIds(dir)).toEqual(['vision-router'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('answers with nothing for a package that ships no patch, or one that cannot be read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dshm-shipped-'))
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'plain' }))
+      expect(shippedInsertedRowIds(dir)).toEqual([])
+      // Declared but absent: the package says nothing through a file that is
+      // not there, and silence must not become a contradiction downstream.
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({
+        name: 'plain', dsh: { bundle: { patch: './missing.patch.yml' } },
+      }))
+      expect(shippedInsertedRowIds(dir)).toEqual([])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
