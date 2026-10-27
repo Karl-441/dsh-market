@@ -53,7 +53,7 @@ import { exportMarketLog } from './self-check.ts'
 import type { HostNavigationStore } from './host-navigation.ts'
 import type { SidebarEntry } from './sidebar-entry.ts'
 import {
-  installCommandFor,
+  installCommandFor, hostCompatibilityKey,
   api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, failureText, githubRouteCandidates, groupSwitchState, installedForCatalog, isGenerationSpec, isInstalled, localizeBilingual, localizeBilingualList, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
   formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
 } from './market-data.ts'
@@ -3042,7 +3042,11 @@ export function MarketSection(props: MarketSectionProps) {
         const response = await fetch(api('/dsh-market/discovery-compatibility'), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ packages: chunk }),
+          body: JSON.stringify({
+            packages: chunk.filter(key => !key.startsWith('https://')),
+            ...(chunk.some(key => key.startsWith('https://'))
+              ? { entries: chunk.filter(key => key.startsWith('https://')) } : {}),
+          }),
         })
         const body = await response.json() as {
           hostVersion?: string | null
@@ -3484,17 +3488,17 @@ export function MarketSection(props: MarketSectionProps) {
     usePagination(plugins.length, [q, cat, sortField, sortDir, timeRange, compatibleWithHost], scrollToTop)
   const pagePlugins = plugins.slice((currentPage - 1) * pageSize, currentPage * pageSize)
   const pageHostPackages = [...new Set([...pagePlugins, ...recentPlugins].flatMap(plugin =>
-    typeof plugin.npm === 'string' && plugin.npm !== '' ? [plugin.npm] : []))]
+    hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))]
   const allHostPackages = useMemo(
     () => [...new Set((data?.plugins ?? []).flatMap(plugin =>
-      typeof plugin.npm === 'string' && plugin.npm !== '' ? [plugin.npm] : []))],
+      hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))],
     [data],
   )
   const pageHostPackagesKey = pageHostPackages.join('\u0000')
   const allHostPackagesKey = allHostPackages.join('\u0000')
   useEffect(() => {
     if (tab === 'discover') void loadHostCompatibility(pageHostPackages)
-    // The key is the stable identity of this page's npm package set; the
+    // The key is the stable identity of this page's package/source set; the
     // array itself is recreated as compatibility results arrive.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, pageHostPackagesKey, loadHostCompatibility])
@@ -3561,7 +3565,7 @@ export function MarketSection(props: MarketSectionProps) {
   // already loads compatibility for the current page; without the same
   // fetch here the badge stays on "Reading host requirement…" forever.
   const favoritePageHostPackages = [...new Set(favoritePagePlugins.flatMap(plugin =>
-    typeof plugin.npm === 'string' && plugin.npm !== '' ? [plugin.npm] : []))]
+    hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)!]))]
   const favoritePageHostPackagesKey = favoritePageHostPackages.join('\u0000')
   useEffect(() => {
     if (tab === 'favorites') void loadHostCompatibility(favoritePageHostPackages)
@@ -5811,10 +5815,11 @@ export function MarketSection(props: MarketSectionProps) {
     const record = recordForUrl(records, p.url)
     const blocked = record !== null && (record.state === 'input' || record.state === 'failed')
     const queued = record !== null && record.state === 'queued'
-    const compatibility = typeof p.npm === 'string' ? hostCompatibility[p.npm] : undefined
+    const compatibilityKey = hostCompatibilityKey(p)
+    const compatibility = compatibilityKey === null ? undefined : hostCompatibility[compatibilityKey]
     const hostRequirementLabel = compatibility?.requirement !== null && compatibility?.requirement !== undefined
       ? t('hostRequirement').replace('{0}', compatibility.requirement)
-      : typeof p.npm !== 'string'
+      : compatibilityKey === null
         ? t('hostRequirementUnavailable')
         : compatibility === undefined
           ? t('hostRequirementLoading')

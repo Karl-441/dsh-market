@@ -6579,6 +6579,14 @@ describe('a recognized pnpm failure is shown as its own sentence (#848)', () => 
     expect(failed.status).toBe(502)
     expect(failed.json.ignoredBuilds).toEqual(['dsh-loop'])
     expect(String(failed.json.error)).toContain('放行构建脚本并重试')
+    // #1034: pnpm lists every undecided build in the workspace, so the
+    // sentence must not claim each one came in with this install — an entry
+    // left undecided by an earlier one lands here too, and the reporter read
+    // "this install was blocked by dsh-purge" about a plugin that never
+    // depended on it.
+    expect(String(failed.json.error)).toContain('之前留下的未决定条目')
+    expect(String(failed.json.error)).toContain('an earlier one left undecided')
+    expect(String(failed.json.error)).toContain('allowBuilds')
     // The classifier's own wording for the same failure would be a second
     // voice for one thing.
     expect(String(failed.json.error)).not.toContain('允许构建脚本并重试')
@@ -6834,6 +6842,29 @@ describe('build-script approval flow (#6)', () => {
     // The bare name (what pnpm 10.26+ and 11.0–11.5 match) and the printed
     // key (what 11.6+ matches) — and nothing the request supplied.
     expect(yaml).toContain("'@dsh-external/dsh-super-injector': true")
+    expect(yaml).toContain(printed)
+  })
+
+  it('writes the branch-ref key pnpm prints for a floating git dependency (#1034)', async () => {
+    // A dependency resolved from a BRANCH is keyed by the ref, not a commit.
+    // setAllowBuilds only accepted SHA-shaped archive keys, so the one key
+    // pnpm asked for was filtered out on its way to the file: the profile got
+    // a bare name pnpm does not match for a git source, and "approve build
+    // scripts and retry" failed byte-identically, every time.
+    const dir = profileDir('web')
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> }
+    manifest.dependencies = { ...(manifest.dependencies ?? {}), 'dsh-purge': 'github:YuJunZhiXue/dsh-purge#master' }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+    mkdirSync(join(dir, 'node_modules', 'dsh-purge'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules', 'dsh-purge', 'package.json'), JSON.stringify({ name: 'dsh-purge', version: '1.0.0' }))
+    const printed = 'dsh-purge@https://codeload.github.com/YuJunZhiXue/dsh-purge/tar.gz/refs/heads/master'
+    fake.failNextAddStderrOnce = `[ERR_PNPM_IGNORED_BUILDS]\nIgnored build scripts: ${printed}.\n`
+    const first = await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    expect(first.status).toBe(502)
+
+    const approve = await bed.dispatch('POST', '/dsh-market/approve-builds', { packages: ['dsh-purge'] })
+    expect(approve.status).toBe(200)
+    const yaml = readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8')
     expect(yaml).toContain(printed)
   })
 

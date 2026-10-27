@@ -2491,8 +2491,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* Catalog matching for locally linked / file: installs. Shared by the host
 		* restore route and the Market client so both refuse the same wrong guesses.
 		*/
-		const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-		function validSubpath(subpath) {
+		const REPO_RE$1 = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+		function validSubpath$1(subpath) {
 			if (!/^[A-Za-z0-9_./-]+$/.test(subpath)) return false;
 			return !subpath.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
 		}
@@ -2503,12 +2503,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		*/
 		function catalogMatchKeys(url) {
 			const m = /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\/tree\/[^/]+\/(.+?))?\/?$/.exec(url);
-			if (m === null || !REPO_RE.test(m[1])) return {
+			if (m === null || !REPO_RE$1.test(m[1])) return {
 				path: null,
 				repo: null
 			};
 			const subpath = m[2] ?? null;
-			if (subpath !== null && !validSubpath(subpath)) return {
+			if (subpath !== null && !validSubpath$1(subpath)) return {
 				path: null,
 				repo: null
 			};
@@ -2652,6 +2652,34 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			};
 		}
 		//#endregion
+		//#region src/sources.ts
+		/**
+		* Registry-source knowledge: how a curated registry entry's URL maps to an
+		* installable pnpm target. Pure string logic, no I/O.
+		*/
+		const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+		function validSubpath(subpath) {
+			if (!/^[A-Za-z0-9_./-]+$/.test(subpath)) return false;
+			return !subpath.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
+		}
+		/**
+		* Parse a registry source url: a github repo, optionally with a
+		* `/tree/<branch>/<subpath>` suffix (how the curated list links monorepo
+		* subpackages, e.g. dsh-plugins#theme-gallery).
+		*/
+		function parseSourceUrl(url) {
+			const m = /^https:\/\/github\.com\/([^/]+\/[^/]+?)(?:\/tree\/[^/]+\/(.+?))?\/?$/.exec(url);
+			if (m === null || !REPO_RE.test(m[1])) return null;
+			const subpath = m[2] ?? null;
+			if (subpath !== null) {
+				if (!validSubpath(subpath)) return null;
+			}
+			return {
+				repo: m[1],
+				subpath
+			};
+		}
+		//#endregion
 		//#region src/client/market-data.ts
 		/** One registry entry from /dsh-market/registry. */
 		/**
@@ -2686,6 +2714,11 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				categories.push(value);
 			}
 			return categories;
+		}
+		/** Keep GitHub packages in one repository distinct, independently of their display names. */
+		function hostCompatibilityKey(plugin) {
+			if (typeof plugin.npm === "string" && plugin.npm !== "") return plugin.npm;
+			return parseSourceUrl(plugin.url) === null ? null : plugin.url;
 		}
 		/**
 		* Whether a queued operation still applies — `null` when it does.
@@ -2931,7 +2964,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				const categories = pluginCategories(plugin);
 				if (options.category !== "all" && !categories.includes(options.category)) return [];
 				if (options.sinceDays !== void 0 && !withinDays(plugin.added, options.sinceDays)) return [];
-				if (options.compatibleWithHost === true && plugin.npm != null && options.hostCompatibility?.[plugin.npm]?.status === "incompatible") return [];
+				const compatibilityKey = hostCompatibilityKey(plugin);
+				if (options.compatibleWithHost === true && compatibilityKey !== null && options.hostCompatibility?.[compatibilityKey]?.status === "incompatible") return [];
 				const relevance = query === "" ? 0 : pluginRelevance(plugin, query, tokens, options.lang, options.categories);
 				return relevance === 0 && query !== "" ? [] : [{
 					plugin,
@@ -10515,7 +10549,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						const response = await fetch(api("/dsh-market/discovery-compatibility"), {
 							method: "POST",
 							headers: { "content-type": "application/json" },
-							body: JSON.stringify({ packages: chunk })
+							body: JSON.stringify({
+								packages: chunk.filter((key) => !key.startsWith("https://")),
+								...chunk.some((key) => key.startsWith("https://")) ? { entries: chunk.filter((key) => key.startsWith("https://")) } : {}
+							})
 						});
 						const body = await response.json();
 						if (!response.ok || body.plugins === null || typeof body.plugins !== "object") throw new Error(`HTTP ${String(response.status)}`);
@@ -10934,8 +10971,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				compatibleWithHost
 			], scrollToTop);
 			const pagePlugins = plugins.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-			const pageHostPackages = [...new Set([...pagePlugins, ...recentPlugins].flatMap((plugin) => typeof plugin.npm === "string" && plugin.npm !== "" ? [plugin.npm] : []))];
-			const allHostPackages = (0, react.useMemo)(() => [...new Set((data?.plugins ?? []).flatMap((plugin) => typeof plugin.npm === "string" && plugin.npm !== "" ? [plugin.npm] : []))], [data]);
+			const pageHostPackages = [...new Set([...pagePlugins, ...recentPlugins].flatMap((plugin) => hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)]))];
+			const allHostPackages = (0, react.useMemo)(() => [...new Set((data?.plugins ?? []).flatMap((plugin) => hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)]))], [data]);
 			const pageHostPackagesKey = pageHostPackages.join("\0");
 			const allHostPackagesKey = allHostPackages.join("\0");
 			(0, react.useEffect)(() => {
@@ -11028,7 +11065,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			const favoriteThemePagination = usePagination(favoriteThemes.length, favResetDeps, scrollToTop);
 			const favoritePagePlugins = favoritePlugins.slice((favoritePluginPagination.currentPage - 1) * favoritePluginPagination.pageSize, favoritePluginPagination.currentPage * favoritePluginPagination.pageSize);
 			const favoritePageThemes = favoriteThemes.slice((favoriteThemePagination.currentPage - 1) * favoriteThemePagination.pageSize, favoriteThemePagination.currentPage * favoriteThemePagination.pageSize);
-			const favoritePageHostPackages = [...new Set(favoritePagePlugins.flatMap((plugin) => typeof plugin.npm === "string" && plugin.npm !== "" ? [plugin.npm] : []))];
+			const favoritePageHostPackages = [...new Set(favoritePagePlugins.flatMap((plugin) => hostCompatibilityKey(plugin) === null ? [] : [hostCompatibilityKey(plugin)]))];
 			const favoritePageHostPackagesKey = favoritePageHostPackages.join("\0");
 			(0, react.useEffect)(() => {
 				if (tab === "favorites") loadHostCompatibility(favoritePageHostPackages);
@@ -13161,8 +13198,9 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				const record = recordForUrl(records, p.url);
 				const blocked = record !== null && (record.state === "input" || record.state === "failed");
 				const queued = record !== null && record.state === "queued";
-				const compatibility = typeof p.npm === "string" ? hostCompatibility[p.npm] : void 0;
-				const hostRequirementLabel = compatibility?.requirement !== null && compatibility?.requirement !== void 0 ? t("hostRequirement").replace("{0}", compatibility.requirement) : typeof p.npm !== "string" ? t("hostRequirementUnavailable") : compatibility === void 0 ? t("hostRequirementLoading") : compatibility.basis === "undeclared" ? t("hostRequirementUndeclared") : t("hostRequirementUnavailable");
+				const compatibilityKey = hostCompatibilityKey(p);
+				const compatibility = compatibilityKey === null ? void 0 : hostCompatibility[compatibilityKey];
+				const hostRequirementLabel = compatibility?.requirement !== null && compatibility?.requirement !== void 0 ? t("hostRequirement").replace("{0}", compatibility.requirement) : compatibilityKey === null ? t("hostRequirementUnavailable") : compatibility === void 0 ? t("hostRequirementLoading") : compatibility.basis === "undeclared" ? t("hostRequirementUndeclared") : t("hostRequirementUnavailable");
 				const hostRequirementTitle = compatibility?.declarations.map((declaration) => declaration.kind === "engine" ? `engines.dsh: ${declaration.range}` : `${declaration.package ?? "peer"}: ${declaration.range}`).join("\n") || hostRequirementLabel;
 				return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: blocked ? `${Market_module_css_default.card} ${Market_module_css_default.cardBlocked}` : Market_module_css_default.card,

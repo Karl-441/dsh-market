@@ -963,6 +963,33 @@ describe('setAllowBuilds (#6)', () => {
     expect(setAllowBuilds('web', keys)).toEqual(approved)
   })
 
+  it('accepts the key pnpm writes for a dependency resolved from a BRANCH (#1034)', async () => {
+    // A floating branch dependency is not keyed by a commit: pnpm writes
+    // `…tar.gz/refs/heads/main`, so every SHA-only shape refused the one key
+    // that would have authorized it, and "approve build scripts and retry"
+    // wrote a bare name pnpm does not match.
+    const { setAllowBuilds } = await import('../src/profile.ts')
+    writeProfile({})
+    const keys = [
+      'dsh-purge@https://codeload.github.com/YuJunZhiXue/dsh-purge/tar.gz/refs/heads/master',
+      'p@https://codeload.github.com/o/mono/tar.gz/refs/heads/feature/nested-branch#path:/packages/p',
+      'p@https://codeload.github.com/o/r/tar.gz/refs/tags/v1.2.3',
+      'p@https://bitbucket.org/o/r/get/refs/heads/main.tar.gz',
+    ]
+    expect(setAllowBuilds('web', keys)).toEqual(keys)
+    // The ref is path segments only: no traversal, no empty piece, no
+    // whitespace or separators that would end the value it is written into.
+    const unsafe = [
+      'p@https://codeload.github.com/o/r/tar.gz/refs/heads/../evil',
+      'p@https://codeload.github.com/o/r/tar.gz/refs/heads//x',
+      'p@https://codeload.github.com/o/r/tar.gz/refs/heads',
+      'p@https://codeload.github.com/o/r/tar.gz/refs/heads/main\n  evil: true',
+      'p@https://codeload.github.com/o/r/tar.gz/refs/pulls/1',
+    ]
+    const written = setAllowBuilds('web', unsafe)
+    for (const key of unsafe) expect(written).not.toContain(key)
+  })
+
   it('still rejects unsafe or malformed monorepo build keys', async () => {
     const { setAllowBuilds } = await import('../src/profile.ts')
     writeProfile({})

@@ -5,6 +5,7 @@
 
 import type { DiagnosticReportV1 } from '../diagnostics.ts'
 import { findCatalogEntryForLocal } from '../catalog-local-match.ts'
+import { parseSourceUrl } from '../sources.ts'
 export type { SharedHostPackageDependencyFinding } from '../diagnostics.ts'
 
 /** Localized text keyed by language ('zh' / 'en'). */
@@ -104,7 +105,7 @@ export interface Registry {
   plugins: RegistryPlugin[]
 }
 
-/** Discovery-time verdict derived from a package's public npm manifest. */
+/** Discovery-time verdict derived from a package's public manifest. */
 export interface HostCompatibility {
   status: 'compatible' | 'incompatible' | 'unknown'
   basis: 'manifest' | 'undeclared' | 'unavailable'
@@ -112,8 +113,14 @@ export interface HostCompatibility {
   declarations: Array<{ kind: 'engine' | 'peer'; package?: string; range: string }>
 }
 
-/** npm package name -> discovery-time host verdict. */
+/** npm package name or GitHub catalog URL -> discovery-time host verdict. */
 export type HostCompatibilityMap = Record<string, HostCompatibility>
+
+/** Keep GitHub packages in one repository distinct, independently of their display names. */
+export function hostCompatibilityKey(plugin: Pick<RegistryPlugin, 'npm' | 'url'>): string | null {
+  if (typeof plugin.npm === 'string' && plugin.npm !== '') return plugin.npm
+  return parseSourceUrl(plugin.url) === null ? null : plugin.url
+}
 
 /** Profile dependency map: package name → install spec. */
 export type InstalledMap = Record<string, string>
@@ -668,8 +675,9 @@ export function visiblePlugins(plugins: RegistryPlugin[], options: ListQuery): R
     const categories = pluginCategories(plugin)
     if (options.category !== 'all' && !categories.includes(options.category)) return []
     if (options.sinceDays !== undefined && !withinDays(plugin.added, options.sinceDays)) return []
-    if (options.compatibleWithHost === true && plugin.npm != null
-      && options.hostCompatibility?.[plugin.npm]?.status === 'incompatible') return []
+    const compatibilityKey = hostCompatibilityKey(plugin)
+    if (options.compatibleWithHost === true && compatibilityKey !== null
+      && options.hostCompatibility?.[compatibilityKey]?.status === 'incompatible') return []
     const relevance = query === '' ? 0 : pluginRelevance(plugin, query, tokens, options.lang, options.categories)
     return relevance === 0 && query !== '' ? [] : [{ plugin, relevance, index }]
   })

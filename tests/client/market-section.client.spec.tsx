@@ -1237,6 +1237,32 @@ describe('MarketSection (jsdom)', () => {
     })
   })
 
+  it('reads and displays GitHub host requirements, including incompatible-host filtering', async () => {
+    localStorage.setItem('dshm-host-filter', 'all')
+    const url = 'https://github.com/owner/whale/tree/master/packages/host'
+    const range = '0.2.1-rc.2 || 0.2.1-rc.3'
+    stubFetch({
+      '/dsh-market/registry': {
+        hostVersion: '0.2.1-rc.4',
+        registry: { ...REGISTRY, count: 1, plugins: [{ ...REGISTRY.plugins[0], name: 'WhaleMaid', npm: null, url }] },
+      },
+      '/dsh-market/discovery-compatibility': {
+        hostVersion: '0.2.1-rc.4',
+        plugins: { [url]: { status: 'incompatible', basis: 'manifest', requirement: range,
+          declarations: [{ kind: 'engine', range }] } },
+      },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('WhaleMaid')
+    const badge = await screen.findByText(en.hostRequirement.replace('{0}', range))
+    expect(badge.getAttribute('data-status')).toBe('incompatible')
+    expect(fetchCalls.some(call => call.path === '/dsh-market/discovery-compatibility'
+      && (call.body as { entries?: string[] }).entries?.includes(url))).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: en.filter }))
+    fireEvent.click(screen.getByRole('menuitem', { name: en.hostCompatible.replace('{0}', '0.2.1-rc.4') }))
+    await waitFor(() => expect(screen.queryByText('WhaleMaid')).toBeNull())
+  })
+
   it('labels manifest requirements and filters only confirmed host mismatches', async () => {
     const plugins = [
       { ...REGISTRY.plugins[0], name: 'matches', npm: 'matches', url: 'https://github.com/a/matches' },

@@ -1588,6 +1588,11 @@ export function setAllowBuilds(profile: string, packages: string[], explicitDir?
   const SEG = '[A-Za-z0-9_-][A-Za-z0-9_.-]*'
   const NAME = '[A-Za-z0-9@/_.-]+'
   const SHA = '[0-9a-f]{40}'
+  // A dependency pnpm resolved from a BRANCH keys its decision by the ref,
+  // not by a commit: `name@https://codeload.github.com/o/r/tar.gz/refs/heads/main`
+  // (#1034). The ref is path segments only — no `.`/`..`, no empty piece —
+  // so it cannot walk out of the URL it is written into.
+  const REF = `refs/(?:heads|tags)/${SEG}(?:/${SEG})*`
   // pnpm's exact monorepo key includes the selected directory; dropping it
   // makes approve-and-retry write only a bare name that git builds ignore.
   const DIR = '(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.-]+'
@@ -1612,9 +1617,9 @@ export function setAllowBuilds(profile: string, packages: string[], explicitDir?
   // exact path shape.
   const ARCHIVE_KEY_RE = new RegExp(
     `^${NAME}@https://(?:`
-    + `codeload\\.github\\.com/${SEG}/${SEG}/tar\\.gz/${SHA}`
-    + `|bitbucket\\.org/${SEG}/${SEG}/get/${SHA}\\.tar\\.gz`
-    + `|gitlab\\.com/${SEG}(?:/${SEG})+/-/archive/${SHA}/${SEG}-${SHA}\\.tar\\.gz`
+    + `codeload\\.github\\.com/${SEG}/${SEG}/tar\\.gz/(?:${SHA}|${REF})`
+    + `|bitbucket\\.org/${SEG}/${SEG}/get/(?:${SHA}|${REF})\\.tar\\.gz`
+    + `|gitlab\\.com/${SEG}(?:/${SEG})+/-/archive/(?:${SHA}|${REF})/${SEG}-(?:${SHA}|${REF})\\.tar\\.gz`
     + `)(?:#${SUBPATH})?$`,
   )
   for (const pkg of packages) {
